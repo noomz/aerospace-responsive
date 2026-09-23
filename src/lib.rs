@@ -3,7 +3,9 @@
 
 pub mod aero;
 pub mod config;
+pub mod daemon;
 pub mod display;
+pub mod install;
 pub mod ipc;
 pub mod macos;
 pub mod pass;
@@ -12,6 +14,7 @@ pub mod render;
 pub mod restore;
 pub mod rules;
 pub mod state;
+pub mod watch;
 pub mod worker;
 pub mod world;
 #[cfg(test)]
