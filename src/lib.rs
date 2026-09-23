@@ -6,10 +6,13 @@ pub mod config;
 pub mod display;
 pub mod pass;
 pub mod paths;
+pub mod restore;
 pub mod rules;
+pub mod state;
 pub mod world;
 #[cfg(test)]
 pub mod testutil;
+
 
 /// Timestamped line on stderr; launchd sends stderr to ~/Library/Logs/aerospace-responsive/.
 #[macro_export]
