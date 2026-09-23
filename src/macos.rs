@@ -77,10 +77,12 @@ const DELIVER_IMMEDIATELY: isize = 4;
 type Hook = Box<dyn Fn() + Send + Sync>;
 static DISPLAY_HOOK: OnceLock<Hook> = OnceLock::new();
 static UNLOCK_HOOK: OnceLock<Hook> = OnceLock::new();
-static LAST_GEOMETRY: Mutex<Vec<(u32, i64, i64, i64, i64)>> = Mutex::new(Vec::new());
+/// (display id, origin x, origin y, width, height) per active display.
+pub type Geometry = Vec<(u32, i64, i64, i64, i64)>;
+static LAST_GEOMETRY: Mutex<Geometry> = Mutex::new(Vec::new());
 
 /// Active displays with their bounds, sorted: D17's "count, origin, bounds".
-pub fn geometry_fingerprint() -> Vec<(u32, i64, i64, i64, i64)> {
+pub fn geometry_fingerprint() -> Geometry {
     let mut ids = [0u32; 16];
     let mut n = 0u32;
     if unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut n) } != 0 {

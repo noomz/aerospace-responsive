@@ -71,11 +71,11 @@ pub fn spawn(tx: Sender<Msg>, config: PathBuf, aero_socket: PathBuf) -> std::io:
                 unsafe { libc::close(file_fd) };
                 file_fd = -1;
             }
-            if file_fd < 0 {
-                if let Some(f) = open_evt(&config) {
-                    file_fd = f;
-                    watch(kq, file_fd, FILE_FLAGS);
-                }
+            if file_fd < 0
+                && let Some(f) = open_evt(&config)
+            {
+                file_fd = f;
+                watch(kq, file_fd, FILE_FLAGS);
             }
             if tx.send(Msg::Trigger(Trigger::Config)).is_err() {
                 return;

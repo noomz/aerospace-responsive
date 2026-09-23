@@ -173,10 +173,10 @@ impl Aero for FakeAero {
                 }
                 self.ws[i].monitor = to;
                 self.show(i);
-                if !self.ws.iter().any(|w| w.monitor == from && w.visible) {
-                    if let Some(stub) = self.ws.iter().position(|w| w.monitor == from) {
-                        self.show(stub);
-                    }
+                if !self.ws.iter().any(|w| w.monitor == from && w.visible)
+                    && let Some(stub) = self.ws.iter().position(|w| w.monitor == from)
+                {
+                    self.show(stub);
                 }
                 Ok(())
             }

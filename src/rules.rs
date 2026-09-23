@@ -41,10 +41,10 @@ pub fn matches(p: &Pred, d: &Display, cfg: &Config) -> bool {
 
 /// Why the attached set fails a profile predicate (plan P-5), or `None`.
 pub fn set_mismatch(sp: &SetPred, ds: &[Display], cfg: &Config) -> Option<String> {
-    if let Some(n) = sp.count {
-        if ds.len() != n {
-            return Some(format!("count is {}, wanted {n}", ds.len()));
-        }
+    if let Some(n) = sp.count
+        && ds.len() != n
+    {
+        return Some(format!("count is {}, wanted {n}", ds.len()));
     }
     for d in ds {
         if let Some(why) = mismatch(&sp.all, d, cfg) {

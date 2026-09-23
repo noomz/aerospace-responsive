@@ -60,10 +60,10 @@ pub fn diff(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, dropped: &BTr
             continue;
         }
         let (Some(m), Some(axis)) = (s.monitor_of(&ws), s.root_axis(&ws)) else { continue };
-        if let Some(want) = r.want_for(m) {
-            if want.axis != axis {
-                out.push(format!("workspace {ws} root axis is {axis:?}, wanted {:?}", want.axis));
-            }
+        if let Some(want) = r.want_for(m)
+            && want.axis != axis
+        {
+            out.push(format!("workspace {ws} root axis is {axis:?}, wanted {:?}", want.axis));
         }
     }
     out
