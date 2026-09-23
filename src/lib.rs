@@ -4,9 +4,11 @@
 pub mod aero;
 pub mod config;
 pub mod display;
+pub mod ipc;
 pub mod macos;
 pub mod pass;
 pub mod paths;
+pub mod render;
 pub mod restore;
 pub mod rules;
 pub mod state;
