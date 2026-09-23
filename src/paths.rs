@@ -1,7 +1,7 @@
 //! Every filesystem location the tool uses (plan P-11).
 
 use std::ffi::CStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const LABEL: &str = "com.noomz.aerospace-responsive";
 
@@ -32,8 +32,32 @@ pub fn aerospace_socket() -> PathBuf {
     PathBuf::from(format!("/tmp/bobko.aerospace-{}.sock", user_name()))
 }
 
-pub fn aerospace_config() -> PathBuf {
-    home().join(".aerospace.toml")
+/// Where AeroSpace looks for its config, in its own order
+/// (ConfigFile.swift:4-14): the dotfile, then `$XDG_CONFIG_HOME/aerospace/aerospace.toml`.
+pub fn aerospace_config_candidates() -> Vec<PathBuf> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".config"));
+    vec![home().join(".aerospace.toml"), xdg.join("aerospace").join("aerospace.toml")]
+}
+
+/// The config AeroSpace is actually reading. AeroSpace itself refuses to start when both
+/// candidates exist, so having two is an error here too rather than a guess.
+pub fn aerospace_config() -> Result<PathBuf, String> {
+    resolve_config(aerospace_config_candidates(), |p| p.exists())
+}
+
+fn resolve_config(candidates: Vec<PathBuf>, exists: impl Fn(&Path) -> bool) -> Result<PathBuf, String> {
+    let found: Vec<PathBuf> = candidates.iter().filter(|p| exists(p)).cloned().collect();
+    match found.len() {
+        1 => Ok(found.into_iter().next().expect("exactly one")),
+        0 => Err(format!(
+            "no AeroSpace config found; looked for {}",
+            candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" and ")
+        )),
+        _ => Err(format!(
+            "AeroSpace has two configs and refuses to start with both: {}",
+            found.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" and ")
+        )),
+    }
 }
 
 pub fn launch_agent() -> PathBuf {
@@ -48,5 +72,30 @@ pub fn user_name() -> String {
             return std::env::var("USER").unwrap_or_else(|_| "unknown".into());
         }
         CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn resolves_the_single_existing_aerospace_config() {
+        let c = paths(&["/home/me/.aerospace.toml", "/home/me/.config/aerospace/aerospace.toml"]);
+        let only_xdg = resolve_config(c.clone(), |p| p.ends_with("aerospace/aerospace.toml")).unwrap();
+        assert_eq!(only_xdg, PathBuf::from("/home/me/.config/aerospace/aerospace.toml"));
+        let only_dotfile = resolve_config(c.clone(), |p| p.ends_with(".aerospace.toml")).unwrap();
+        assert_eq!(only_dotfile, PathBuf::from("/home/me/.aerospace.toml"));
+    }
+
+    #[test]
+    fn both_or_neither_is_an_error() {
+        let c = paths(&["/home/me/.aerospace.toml", "/home/me/.config/aerospace/aerospace.toml"]);
+        assert!(resolve_config(c.clone(), |_| true).unwrap_err().contains("two configs"));
+        assert!(resolve_config(c, |_| false).unwrap_err().contains("no AeroSpace config found"));
     }
 }

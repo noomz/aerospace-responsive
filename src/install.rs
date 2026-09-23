@@ -227,7 +227,8 @@ fn write_with_backup(path: &Path, old: &str, new: &str, question: &str, changes:
         println!("config: skipped");
         return Ok(None);
     }
-    let backup = path.with_file_name(format!(".aerospace.toml.bak-aerospace-responsive-{}", stamp()));
+    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let backup = path.with_file_name(format!(".{name}.bak-aerospace-responsive-{}", stamp()));
     std::fs::copy(path, &backup).with_context(|| format!("cannot back up {}", path.display()))?;
     replace_file(path, new)?;
     println!("config: written (backup {})", backup.display());
@@ -257,7 +258,7 @@ fn replace_file(path: &Path, new: &str) -> Result<()> {
 
 fn config_step(opts: &Opts) -> Result<()> {
     let tool = config::load(&paths::config_file()).context("install needs the tool config first")?.config;
-    let path = paths::aerospace_config();
+    let path = paths::aerospace_config().map_err(anyhow::Error::msg)?;
     let text = std::fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
     let poke = poke_command(&exe()?);
     let edit = edit_aerospace_config(&text, &tool.managed_workspaces(), &poke)?;
@@ -283,7 +284,7 @@ fn config_step(opts: &Opts) -> Result<()> {
 
 fn unconfig_step(opts: &Opts) -> Result<()> {
     let mut rec = InstallRecord::load();
-    let path = paths::aerospace_config();
+    let path = paths::aerospace_config().map_err(anyhow::Error::msg)?;
     let text = std::fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
     let edit = unedit_aerospace_config(&text, &rec.added_persistent, rec.poke.as_deref())?;
     if edit.changes.is_empty() {
