@@ -12,6 +12,7 @@ pub mod render;
 pub mod restore;
 pub mod rules;
 pub mod state;
+pub mod worker;
 pub mod world;
 #[cfg(test)]
 pub mod testutil;
