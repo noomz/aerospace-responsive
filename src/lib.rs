@@ -1,6 +1,7 @@
 //! aerospace-responsive: reshape AeroSpace workspace placement and root layout when the
 //! attached display set changes. Design record: .scratch/responsive-layout/map.md (D1-D26).
 
+pub mod aero;
 pub mod config;
 pub mod display;
 pub mod paths;
