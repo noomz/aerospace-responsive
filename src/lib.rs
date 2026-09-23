@@ -5,6 +5,7 @@ pub mod config;
 pub mod display;
 pub mod paths;
 pub mod rules;
+pub mod world;
 #[cfg(test)]
 pub mod testutil;
 
