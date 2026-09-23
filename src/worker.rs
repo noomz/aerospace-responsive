@@ -243,13 +243,15 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         if rep.aborted || rep.empty_snapshot {
             let why = if rep.aborted { "aborted by a display change" } else { "list-windows came back empty" };
             if rep.empty_snapshot && p.repass {
+                self.restore = None; // the disturbance is over; do not replay it later
                 self.record(p.trigger, why.into());
                 return reply_all(p.waiters, Response::err(why));
             }
             crate::log!("pass {why}; restarting through the debounce");
-            // An empty read is a retry of the same run; an abort restarts a full reconcile,
+            // An empty read is a retry of the same run, and ticket 12 allows exactly one (the
+            // second lands in the give-up return above). An abort restarts a full reconcile,
             // which ticket 03 says owns the next run — so it gets its budget back.
-            let repass = rep.empty_snapshot && p.repass;
+            let repass = rep.empty_snapshot;
             self.pending = Some(Pending { due: Instant::now() + self.debounce, repass, ..p });
             return;
         }
@@ -770,6 +772,21 @@ mod tests {
 
         w.tick(later()); // the re-pass is a normal full pass and fixes the drift
         assert!(w.aero.log[n..].iter().any(|c| matches!(c, Cmd::Layout { ws, axis } if ws == "1" && *axis == Axis::V)));
+    }
+
+    #[test]
+    fn a_persistently_empty_read_retries_once_then_gives_up() {
+        // Ticket 12: an empty list-windows right at wake is a retry, not a state to act on —
+        // and exactly one retry, or a genuinely empty model would re-arm forever.
+        let mut fake = docked();
+        fake.ws.iter_mut().for_each(|w| w.windows.clear());
+        let (mut w, _d) = worker(fake);
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert!(w.pending.as_ref().is_some_and(|p| p.repass), "the first empty read retries");
+        w.tick(later());
+        assert!(w.pending.is_none(), "the second gives up instead of re-arming");
+        assert!(w.aero.log.is_empty(), "an empty model is never acted on");
     }
 
     #[test]

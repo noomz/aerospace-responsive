@@ -229,12 +229,30 @@ fn write_with_backup(path: &Path, old: &str, new: &str, question: &str, changes:
     }
     let backup = path.with_file_name(format!(".aerospace.toml.bak-aerospace-responsive-{}", stamp()));
     std::fs::copy(path, &backup).with_context(|| format!("cannot back up {}", path.display()))?;
-    // Write beside the file and rename: a crash mid-write must never truncate the live config.
-    let tmp = path.with_file_name(format!(".aerospace.toml.aerospace-responsive-tmp-{}", stamp()));
-    std::fs::write(&tmp, new)?;
-    std::fs::rename(&tmp, path)?;
+    replace_file(path, new)?;
     println!("config: written (backup {})", backup.display());
     Ok(Some(backup))
+}
+
+/// Replace a file's contents atomically: write a sibling temp file, carry the original's
+/// permissions, then rename over it. Symlinks are resolved first, so a dotfiles symlink keeps
+/// pointing at its target instead of being replaced by a regular file.
+fn replace_file(path: &Path, new: &str) -> Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let tmp = target.with_file_name(format!(
+        ".{}.aerospace-responsive-tmp-{}",
+        target.file_name().unwrap_or_default().to_string_lossy(),
+        stamp()
+    ));
+    std::fs::write(&tmp, new)?;
+    if let Ok(meta) = std::fs::metadata(&target) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("cannot replace {}", target.display()));
+    }
+    Ok(())
 }
 
 fn config_step(opts: &Opts) -> Result<()> {
@@ -538,6 +556,25 @@ inner.horizontal = 8   # tight
         let back = unedit_aerospace_config(&text, &[], Some(POKE)).unwrap();
         let left = strings(&back.new_text, "after-startup-command");
         assert_eq!(left, ["exec-and-forget /Users/me/bin/aerospace-responsive-wrapper.sh reconcile"]);
+    }
+
+    #[test]
+    fn replace_file_writes_through_a_symlink_and_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        let link = dir.path().join("link.toml");
+        std::fs::write(&real, "old\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        replace_file(&link, "new\n").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the symlink must survive");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new\n");
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o640);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().contains("tmp")).collect();
+        assert!(leftovers.is_empty(), "no temp file left behind");
     }
 
     #[test]
