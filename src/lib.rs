@@ -4,6 +4,7 @@
 pub mod config;
 pub mod display;
 pub mod paths;
+pub mod rules;
 #[cfg(test)]
 pub mod testutil;
 
