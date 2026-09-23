@@ -70,6 +70,8 @@ pub struct FakeAero {
     pub log: Vec<Cmd>,
     pub refuse: BTreeSet<String>,
     pub ignore_layout: bool,
+    /// Make `windows()` fail, as a socket blip does mid-pass.
+    pub fail_windows: bool,
 }
 
 impl FakeAero {
@@ -102,6 +104,7 @@ impl FakeAero {
             log: vec![],
             refuse: BTreeSet::new(),
             ignore_layout: false,
+            fail_windows: false,
         }
     }
 
@@ -144,6 +147,9 @@ impl Aero for FakeAero {
     }
 
     fn windows(&mut self) -> anyhow::Result<Snapshot> {
+        if self.fail_windows {
+            anyhow::bail!("list-windows: connection refused");
+        }
         let mut windows = vec![];
         for w in &self.ws {
             let layout = if w.root == Axis::H { "h_tiles" } else { "v_tiles" };

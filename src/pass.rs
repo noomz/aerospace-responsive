@@ -8,7 +8,7 @@ use crate::rules::Resolved;
 use crate::world::Snapshot;
 use anyhow::Result;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Step 2: non-empty opt-in workspaces that are not on their target. Empty ones are absent
@@ -108,6 +108,9 @@ pub struct PassReport {
     pub empty_snapshot: bool,
     pub mismatches: Vec<String>,
     pub nonempty: BTreeSet<String>,
+    /// What this pass left visible per monitor. Ticket 13 S3.3: a monitor is restored only
+    /// while it still shows what the pass put there — anything else means the user acted.
+    pub left_visible: BTreeMap<u32, String>,
 }
 
 pub fn run_pass(aero: &mut dyn Aero, r: &Resolved, ds: &[Display], pinned: &BTreeSet<String>, abort: &AtomicBool) -> Result<PassReport> {
@@ -151,6 +154,9 @@ pub fn run_pass(aero: &mut dyn Aero, r: &Resolved, ds: &[Display], pinned: &BTre
     let s2 = aero.windows()?; // 5. POST-PASS DIFF
     rep.mismatches = diff(r, &s2, pinned, &dropped);
     rep.nonempty = s2.nonempty();
+    if let Ok(rows) = aero.workspaces() {
+        rep.left_visible = rows.iter().filter(|r| r.visible).map(|r| (r.monitor, r.workspace.clone())).collect();
+    }
     Ok(rep)
 }
 

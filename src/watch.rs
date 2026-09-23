@@ -38,8 +38,19 @@ pub fn spawn(tx: Sender<Msg>, config: PathBuf, aero_socket: PathBuf) -> std::io:
     if kq < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let dir_fd = open_evt(&config_dir).ok_or_else(std::io::Error::last_os_error)?;
-    let sock_dir_fd = open_evt(&sock_dir).ok_or_else(std::io::Error::last_os_error)?;
+    let close = |fds: &[RawFd]| {
+        fds.iter().for_each(|fd| {
+            unsafe { libc::close(*fd) };
+        })
+    };
+    let Some(dir_fd) = open_evt(&config_dir) else {
+        close(&[kq]);
+        return Err(std::io::Error::last_os_error());
+    };
+    let Some(sock_dir_fd) = open_evt(&sock_dir) else {
+        close(&[kq, dir_fd]);
+        return Err(std::io::Error::last_os_error());
+    };
     watch(kq, dir_fd, libc::NOTE_WRITE);
     watch(kq, sock_dir_fd, libc::NOTE_WRITE);
     let mut file_fd = open_evt(&config).unwrap_or(-1);

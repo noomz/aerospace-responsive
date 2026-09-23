@@ -73,8 +73,9 @@ pub fn edit_aerospace_config(text: &str, managed: &BTreeSet<String>, poke: &str)
 
 /// Reverse of `edit_aerospace_config` (P-8): drop the names install added and the poke.
 /// The force-assignment table is not restored (ticket 08 C4).
-pub fn unedit_aerospace_config(text: &str, added: &[String]) -> Result<Edit> {
+pub fn unedit_aerospace_config(text: &str, added: &[String], poke: Option<&str>) -> Result<Edit> {
     let mut doc: DocumentMut = text.parse().context("~/.aerospace.toml is not valid TOML")?;
+    let round_trips = doc.to_string() == text;
     let mut changes = vec![];
     if let Some(arr) = doc.get_mut("persistent-workspaces").and_then(|i| i.as_array_mut()) {
         let before = arr.len();
@@ -85,13 +86,22 @@ pub fn unedit_aerospace_config(text: &str, added: &[String]) -> Result<Edit> {
     }
     if let Some(arr) = doc.get_mut("after-startup-command").and_then(|i| i.as_array_mut()) {
         let before = arr.len();
-        arr.retain(|v| !v.as_str().is_some_and(is_poke));
+        arr.retain(|v| !v.as_str().is_some_and(|s| poke.map_or_else(|| is_poke(s), |p| s == p)));
         if arr.len() != before {
             changes.push("after-startup-command -= the aerospace-responsive poke".into());
         }
     }
-    let new_text = if changes.is_empty() { text.to_string() } else { doc.to_string() };
-    Ok(Edit { new_text, changes, added: vec![] })
+    if changes.is_empty() {
+        return Ok(Edit { new_text: text.to_string(), changes, added: vec![] });
+    }
+    if !round_trips {
+        bail!(
+            "~/.aerospace.toml does not round-trip through the format-preserving editor; nothing was written.\n\
+             Undo these by hand:\n  - {}",
+            changes.join("\n  - ")
+        );
+    }
+    Ok(Edit { new_text: doc.to_string(), changes, added: vec![] })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -124,6 +134,10 @@ pub fn selected(opts: &Opts, all: &[Step]) -> Vec<Step> {
 struct InstallRecord {
     #[serde(default)]
     added_persistent: Vec<String>,
+    /// The exact `after-startup-command` entry install added, so uninstall removes that line
+    /// and never a user-authored one that merely looks similar (P-8).
+    #[serde(default)]
+    poke: Option<String>,
     #[serde(default)]
     backups: Vec<PathBuf>,
 }
@@ -148,8 +162,10 @@ pub fn install(opts: &Opts) -> Result<i32> {
             Step::Config => config_step(opts)?,
             Step::Launchd => launchd_step(opts)?,
             Step::Reload => {
-                let managed = config::load(&paths::config_file())?.config.managed_workspaces();
-                reload_step(opts, Some(&managed))?
+                // Verification is a bonus: without a readable tool config there is simply
+                // nothing to verify, which must not fail a run that skipped the config step.
+                let managed = config::load(&paths::config_file()).ok().map(|l| l.config.managed_workspaces());
+                reload_step(opts, managed.as_ref())?
             }
             Step::Reconcile => reconcile_step(opts)?,
         }
@@ -213,7 +229,10 @@ fn write_with_backup(path: &Path, old: &str, new: &str, question: &str, changes:
     }
     let backup = path.with_file_name(format!(".aerospace.toml.bak-aerospace-responsive-{}", stamp()));
     std::fs::copy(path, &backup).with_context(|| format!("cannot back up {}", path.display()))?;
-    std::fs::write(path, new)?;
+    // Write beside the file and rename: a crash mid-write must never truncate the live config.
+    let tmp = path.with_file_name(format!(".aerospace.toml.aerospace-responsive-tmp-{}", stamp()));
+    std::fs::write(&tmp, new)?;
+    std::fs::rename(&tmp, path)?;
     println!("config: written (backup {})", backup.display());
     Ok(Some(backup))
 }
@@ -222,7 +241,8 @@ fn config_step(opts: &Opts) -> Result<()> {
     let tool = config::load(&paths::config_file()).context("install needs the tool config first")?.config;
     let path = paths::aerospace_config();
     let text = std::fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
-    let edit = edit_aerospace_config(&text, &tool.managed_workspaces(), &poke_command(&exe()?))?;
+    let poke = poke_command(&exe()?);
+    let edit = edit_aerospace_config(&text, &tool.managed_workspaces(), &poke)?;
     if edit.changes.is_empty() {
         println!("config: nothing to do");
         return Ok(());
@@ -234,6 +254,9 @@ fn config_step(opts: &Opts) -> Result<()> {
                 rec.added_persistent.push(w);
             }
         }
+        if edit.changes.iter().any(|c| c.starts_with("after-startup-command +=")) {
+            rec.poke = Some(poke);
+        }
         rec.backups.push(backup);
         rec.save()?;
     }
@@ -244,13 +267,14 @@ fn unconfig_step(opts: &Opts) -> Result<()> {
     let mut rec = InstallRecord::load();
     let path = paths::aerospace_config();
     let text = std::fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
-    let edit = unedit_aerospace_config(&text, &rec.added_persistent)?;
+    let edit = unedit_aerospace_config(&text, &rec.added_persistent, rec.poke.as_deref())?;
     if edit.changes.is_empty() {
         println!("config: nothing to undo");
         return Ok(());
     }
     if let Some(backup) = write_with_backup(&path, &text, &edit.new_text, "config: undo these changes?", &edit.changes, opts)? {
         rec.added_persistent.clear();
+        rec.poke = None;
         rec.backups.push(backup);
         rec.save()?;
     }
@@ -499,11 +523,21 @@ inner.horizontal = 8   # tight
     #[test]
     fn unedit_removes_exactly_what_install_added() {
         let installed = edit_aerospace_config(LIVE_LIKE, &managed(), POKE).unwrap();
-        let back = unedit_aerospace_config(&installed.new_text, &installed.added).unwrap();
+        let back = unedit_aerospace_config(&installed.new_text, &installed.added, Some(POKE)).unwrap();
         assert_eq!(strings(&back.new_text, "persistent-workspaces"), ["1", "2", "T", "U"]);
         assert_eq!(strings(&back.new_text, "after-startup-command").len(), 2);
         assert!(!back.new_text.contains("force-assignment"), "C4: never restored");
-        assert!(unedit_aerospace_config(&back.new_text, &installed.added).unwrap().changes.is_empty());
+        assert!(unedit_aerospace_config(&back.new_text, &installed.added, Some(POKE)).unwrap().changes.is_empty());
+    }
+
+    #[test]
+    fn uninstall_removes_only_the_line_install_wrote() {
+        let text = format!(
+            "after-startup-command = [\n  'exec-and-forget /Users/me/bin/aerospace-responsive-wrapper.sh reconcile',\n  '{POKE}',\n]\n"
+        );
+        let back = unedit_aerospace_config(&text, &[], Some(POKE)).unwrap();
+        let left = strings(&back.new_text, "after-startup-command");
+        assert_eq!(left, ["exec-and-forget /Users/me/bin/aerospace-responsive-wrapper.sh reconcile"]);
     }
 
     #[test]

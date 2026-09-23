@@ -63,6 +63,7 @@ unsafe extern "C" {
         behavior: isize,
     );
     fn CFStringCreateWithCString(alloc: *const c_void, s: *const c_char, encoding: u32) -> *const c_void;
+    fn CFRelease(cf: *const c_void);
 }
 
 unsafe extern "C" {
@@ -77,8 +78,10 @@ const DELIVER_IMMEDIATELY: isize = 4;
 type Hook = Box<dyn Fn() + Send + Sync>;
 static DISPLAY_HOOK: OnceLock<Hook> = OnceLock::new();
 static UNLOCK_HOOK: OnceLock<Hook> = OnceLock::new();
-/// (display id, origin x, origin y, width, height) per active display.
-pub type Geometry = Vec<(u32, i64, i64, i64, i64)>;
+/// (display id, origin x, origin y, width, height, rotation degrees) per active display.
+/// Rotation is part of the fingerprint so a 180° flip — which changes neither origin nor
+/// bounds — still counts as a topology change (D4, ticket 07).
+pub type Geometry = Vec<(u32, i64, i64, i64, i64, i64)>;
 static LAST_GEOMETRY: Mutex<Geometry> = Mutex::new(Vec::new());
 
 /// Active displays with their bounds, sorted: D17's "count, origin, bounds".
@@ -92,7 +95,8 @@ pub fn geometry_fingerprint() -> Geometry {
         .iter()
         .map(|&id| {
             let b = unsafe { CGDisplayBounds(id) };
-            (id, b.origin.x as i64, b.origin.y as i64, b.size.width as i64, b.size.height as i64)
+            let rotation = unsafe { CGDisplayRotation(id) } as i64;
+            (id, b.origin.x as i64, b.origin.y as i64, b.size.width as i64, b.size.height as i64, rotation)
         })
         .collect();
     out.sort();
@@ -105,11 +109,13 @@ extern "C" fn on_reconfigure(_display: u32, flags: u32, _user: *mut c_void) {
     }
     // HDR, Night Shift, brightness: callbacks with no topology change are ignored (D17).
     let now = geometry_fingerprint();
-    let mut last = LAST_GEOMETRY.lock().unwrap_or_else(|e| e.into_inner());
-    if *last == now {
-        return;
-    }
-    *last = now;
+    {
+        let mut last = LAST_GEOMETRY.lock().unwrap_or_else(|e| e.into_inner());
+        if *last == now {
+            return;
+        }
+        *last = now;
+    } // the lock is never held across the hook
     if let Some(hook) = DISPLAY_HOOK.get() {
         hook();
     }
@@ -144,6 +150,7 @@ pub fn observe_unlock(hook: impl Fn() + Send + Sync + 'static) {
             std::ptr::null(),
             DELIVER_IMMEDIATELY,
         );
+        CFRelease(name); // the centre retains the name
     }
 }
 

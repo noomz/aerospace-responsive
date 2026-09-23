@@ -218,7 +218,15 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         match pass::run_pass(&mut self.aero, &r, &ds, &pinned, &self.abort) {
             Ok(rep) => self.after_pass(rep, p),
             Err(e) => {
+                // The pass may have moved workspaces before dying, so the layout phase and the
+                // post-pass diff never ran. Drop the stale visibility baseline (it belongs to a
+                // disturbance that is over), warn, and give it the one budgeted retry.
                 let msg = format!("pass failed: {e:#}");
+                self.restore = None;
+                self.warn(Class::Pass, "pass-failed", &msg);
+                if !p.repass {
+                    self.arm(Trigger::Repass, true, None);
+                }
                 self.record(p.trigger, msg.clone());
                 reply_all(p.waiters, Response::err(msg));
             }
@@ -239,7 +247,9 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 return reply_all(p.waiters, Response::err(why));
             }
             crate::log!("pass {why}; restarting through the debounce");
-            let repass = p.repass || rep.empty_snapshot;
+            // An empty read is a retry of the same run; an abort restarts a full reconcile,
+            // which ticket 03 says owns the next run — so it gets its budget back.
+            let repass = rep.empty_snapshot && p.repass;
             self.pending = Some(Pending { due: Instant::now() + self.debounce, repass, ..p });
             return;
         }
@@ -254,6 +264,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         }
         if let Some(ctx) = &mut self.restore {
             ctx.moves.extend(rep.moves.iter().cloned());
+            ctx.left_visible = rep.left_visible.clone();
         }
         if !rep.mismatches.is_empty() && !p.repass {
             crate::log!("post-pass diff: {}; one re-pass", rep.mismatches.join("; "));
@@ -741,14 +752,38 @@ mod tests {
     }
 
     #[test]
-    fn unlock_is_verify_only() {
+    fn unlock_verifies_and_re_passes_instead_of_acting_itself() {
+        // D23: unlock runs the post-pass diff and, on a mismatch, ONE budgeted re-pass —
+        // it never issues commands of its own. Drift the model so a full pass would act.
         let (mut w, _d) = worker(docked());
         w.handle(Msg::Trigger(Trigger::Display));
         w.tick(later());
         let n = w.aero.log.len();
+        let i = w.aero.ws.iter().position(|x| x.name == "1").unwrap();
+        w.aero.ws[i].root = Axis::H; // something re-laid 1 while the screen was locked
+
         w.handle(Msg::Trigger(Trigger::Unlock));
         w.tick(later());
-        assert_eq!(w.aero.log.len(), n, "a matching model issues nothing");
+        assert_eq!(w.aero.log.len(), n, "the verify pass itself issues nothing");
+        let pending = w.pending.as_ref().expect("a mismatch arms the budgeted re-pass");
+        assert!(pending.full && pending.repass);
+
+        w.tick(later()); // the re-pass is a normal full pass and fixes the drift
+        assert!(w.aero.log[n..].iter().any(|c| matches!(c, Cmd::Layout { ws, axis } if ws == "1" && *axis == Axis::V)));
+    }
+
+    #[test]
+    fn a_failed_pass_warns_and_retries_once() {
+        let (mut w, _d) = worker(docked());
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        w.restore = None;
+        w.aero.fail_windows = true; // AeroSpace blips mid-pass
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert!(w.warnings.list().iter().any(|x| x.key == "pass-failed"));
+        assert!(w.pending.as_ref().is_some_and(|p| p.repass), "one budgeted retry");
+        assert!(w.restore.is_none(), "a stale visibility baseline must not survive");
     }
 
     #[test]
