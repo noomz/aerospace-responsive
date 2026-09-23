@@ -1,0 +1,22 @@
+[package]
+name = "aerospace-responsive"
+version = "0.1.0"
+edition = "2024"
+description = "Reshape AeroSpace workspace placement and layout when displays change"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+humantime = "2"
+libc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+toml = "1"
+toml_edit = "0.25"
+
+[dev-dependencies]
+tempfile = "3"
