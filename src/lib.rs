@@ -4,6 +4,7 @@
 pub mod aero;
 pub mod config;
 pub mod display;
+pub mod macos;
 pub mod pass;
 pub mod paths;
 pub mod restore;
