@@ -1,0 +1,68 @@
+# aerospace-responsive.toml
+# Schema: ticket 06. Placement rules translate aerospace-auto-secondary.sh (ticket 08 C5).
+# Copy to ~/.config/aerospace-responsive/aerospace-responsive.toml
+
+[settings]
+warn-on-no-match = true   # 01 R4: warn when a rule matches no attached monitor
+
+  [settings.debounce]
+  trailing-ms = 1000      # floor = AeroSpace's screenSleepWakeSettleDelay; lower values are clamped
+
+# ---------- monitor labels: optional escape hatch (01 R3) ----------
+# A @label reference with no block here is a load error (06 S4).
+
+[[monitor]]
+label = "portrait-lenovo"
+match = { name = "LEN T23i-10" }
+
+[[monitor]]
+label = "spare-lenovo"
+match = { name = "LEN T2364pA" }   # owned, usually unplugged: info, not an error
+
+# ---------- layout: monitor -> root orientation (+ flatten). First match wins (02 M3). ----------
+# No match = orientation from aspect ratio, never flatten (02 M5).
+
+[[layout]]
+when        = { portrait = true }
+orientation = "v"
+flatten     = true      # -> v[1|2|3] (ticket 05)
+
+[[layout]]
+when        = { builtin = true }
+orientation = "h"
+flatten     = false
+
+# ---------- placement: workspace -> monitor. First SATISFIABLE match wins (06 S2). ----------
+# Ties break by monitor-id = origin order (01 R6). Nothing satisfiable = leave it, warn (06 S3).
+
+[[placement]]
+workspaces = ["1"]
+monitor    = { portrait = true, external = true }
+
+[[placement]]
+workspaces = ["1"]
+monitor    = { external = true }
+
+[[placement]]
+workspaces = ["2", "3", "C"]
+monitor    = { landscape = true, external = true }
+
+[[placement]]
+workspaces = ["2", "3", "C"]
+monitor    = { external = true }
+
+[[placement]]
+workspaces = ["T"]
+monitor    = { main = true }
+
+# ---------- profiles: predicate over the attached SET (02 M1) ----------
+# Profile rules are consulted before the rules above (02 M2, plan P-4).
+
+[[profile]]
+name = "desk"
+when = { includes = [{ label = "portrait-lenovo" }, { builtin = true }], count = 2 }
+
+[[profile]]
+name        = "laptop-only"
+when        = { count = 1, builtin = true }
+description = "defaults are correct here; the profile exists to say so deliberately"
