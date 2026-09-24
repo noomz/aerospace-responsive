@@ -55,6 +55,11 @@ impl fmt::Display for Cmd {
 /// unique and not a positional " (n)" disambiguation, else the monitor-id of this pass.
 pub fn monitor_target(ds: &[Display], id: u32) -> String {
     let Some(d) = ds.iter().find(|d| d.aero_id == id) else { return id.to_string() };
+    // Some displays report no name at all (seen on a real HDMI panel), and `^$` is not a
+    // monitor pattern worth betting a move on.
+    if d.aero_name.trim().is_empty() {
+        return id.to_string();
+    }
     let unique = ds.iter().filter(|o| o.aero_name == d.aero_name).count() == 1;
     let suffixed = d
         .aero_name
@@ -138,6 +143,10 @@ mod tests {
         let mut lone = len_landscape(2);
         lone.aero_name = "LEN T23i-10".into();
         assert_eq!(monitor_target(&[builtin(1), lone], 2), "^LEN T23i-10$");
+        // A nameless display (real: an HDMI panel with no EDID name) must go by id.
+        let mut nameless = len_landscape(3);
+        nameless.aero_name = String::new();
+        assert_eq!(monitor_target(&[builtin(1), nameless], 3), "3");
     }
 
     #[test]
