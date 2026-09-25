@@ -42,6 +42,15 @@ pub fn len_landscape(aero_id: u32) -> Display {
     }
 }
 
+/// An external landscape MAIN display (office), 2560x1440 pt at 2x.
+pub fn studio(aero_id: u32) -> Display {
+    Display {
+        aero_id,
+        aero_name: "Studio Display".into(),
+        screen: screen(7, "Studio Display", Rect { x: 1728.0, y: 0.0, w: 2560.0, h: 1440.0 }, (5120, 2880), 0.0, true, false),
+    }
+}
+
 /// portrait (monitor 1, leftmost) | built-in (2) | landscape (3), as attached today.
 pub fn desk3() -> Vec<Display> {
     vec![len_portrait(1), builtin(2), len_landscape(3)]

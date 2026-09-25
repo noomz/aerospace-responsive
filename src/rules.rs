@@ -5,7 +5,8 @@ use crate::config::{Axis, Config, LayoutRule, MonitorSpec, PlacementRule, Pred, 
 use crate::display::Display;
 use serde::Serialize;
 
-/// Why `p` rejects `d`, or `None` when every present field holds.
+/// Why `p` rejects `d`, or `None` when every present field holds. Ignores `nth`: that is an
+/// ordinal over the set of matches, applied by `select`.
 pub fn mismatch(p: &Pred, d: &Display, cfg: &Config) -> Option<String> {
     if let Some(label) = &p.label {
         let inner = cfg.label(label).expect("labels are validated at load");
@@ -254,6 +255,18 @@ fn select(spec: &MonitorSpec, ds: &[Display], cfg: &Config) -> Result<u32, Strin
                     Some(w) => whys.push(format!("{}: {w}", d.aero_name)),
                 }
             }
+            if let Some(n) = p.nth {
+                hits.sort_unstable(); // the ordinal is in monitor-id order, whatever order `ds` is in
+                return (n as usize).checked_sub(1).and_then(|i| hits.get(i)).copied().ok_or_else(|| {
+                    if ds.is_empty() {
+                        "no monitor attached".into()
+                    } else if whys.is_empty() {
+                        format!("nth is {n}, only {} match", hits.len())
+                    } else {
+                        format!("nth is {n}, only {} match ({})", hits.len(), whys.join("; "))
+                    }
+                });
+            }
             hits.into_iter().min().ok_or_else(|| if whys.is_empty() { "no monitor attached".into() } else { whys.join("; ") })
         }
         MonitorSpec::Rank(rank) => ds
@@ -292,7 +305,7 @@ fn decide_placement(cfg: &Config, ds: &[Display], ws: String, rules: &[(String, 
 mod tests {
     use super::*;
     use crate::config::{Axis, parse};
-    use crate::testutil::{builtin, desk3, len_landscape, len_portrait};
+    use crate::testutil::{builtin, desk3, len_landscape, len_portrait, studio};
 
     fn example() -> Config {
         parse(include_str!("../aerospace-responsive.example.toml")).unwrap().config
@@ -406,5 +419,74 @@ mod tests {
         let r = resolve(&cfg, &desk3(), None);
         assert!(r.no_match.is_empty());
         assert_eq!(r.info, ["layout[0]: monitor @spare is not attached"]);
+    }
+
+    const NTH: &str = "[[placement]]\nworkspaces = [\"T\"]\nmonitor = { main = true }\n\
+        [[placement]]\nworkspaces = [\"1\"]\nmonitor = { main = false, nth = 1 }\n\
+        [[placement]]\nworkspaces = [\"2\", \"3\", \"C\", \"S\"]\nmonitor = { main = false, nth = 2 }\n\
+        [[placement]]\nworkspaces = [\"2\", \"3\", \"C\", \"S\"]\nmonitor = { main = false, nth = 1 }\n";
+
+    fn targets(ds: &[Display]) -> Vec<(String, Option<u32>)> {
+        let r = resolve(&parse(NTH).unwrap().config, ds, None);
+        r.placement.iter().map(|p| (p.workspace.clone(), p.target)).collect()
+    }
+
+    fn want(pairs: &[(&str, Option<u32>)]) -> Vec<(String, Option<u32>)> {
+        let mut v: Vec<_> = pairs.iter().map(|(w, t)| (w.to_string(), *t)).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn nth_home_desk() {
+        let got = targets(&desk3());
+        assert_eq!(got, want(&[("1", Some(1)), ("2", Some(3)), ("3", Some(3)), ("C", Some(3)), ("S", Some(3)), ("T", Some(2))]));
+    }
+
+    #[test]
+    fn nth_office_falls_back_to_the_first_secondary() {
+        let mut b = builtin(1);
+        b.screen.main = false;
+        let got = targets(&[b, studio(2)]);
+        assert_eq!(got, want(&[("1", Some(1)), ("2", Some(1)), ("3", Some(1)), ("C", Some(1)), ("S", Some(1)), ("T", Some(2))]));
+    }
+
+    #[test]
+    fn nth_two_landscape_secondaries() {
+        let got = targets(&[len_landscape(1), builtin(2), len_landscape(3)]);
+        assert_eq!(got, want(&[("1", Some(1)), ("2", Some(3)), ("3", Some(3)), ("C", Some(3)), ("S", Some(3)), ("T", Some(2))]));
+    }
+
+    #[test]
+    fn nth_laptop_only_is_unsatisfiable_and_explained() {
+        let r = resolve(&parse(NTH).unwrap().config, &[builtin(1)], None);
+        assert_eq!(r.target_for("T"), Some(1));
+        for ws in ["1", "2", "3", "C", "S"] {
+            assert_eq!(r.target_for(ws), None, "{ws}");
+        }
+        let p = r.placement.iter().find(|p| p.workspace == "2").unwrap();
+        assert_eq!(p.considered[0].rule, "placement[2]");
+        assert!(p.considered[0].outcome.contains("nth is 2, only 0 match"), "{}", p.considered[0].outcome);
+        let text = crate::render::explain(&r);
+        assert!(text.contains("nth is 2, only 0 match"), "{text}");
+    }
+
+    #[test]
+    fn nth_composes_with_other_fields() {
+        let cfg = example();
+        let spec = |nth| MonitorSpec::Pred(Pred { main: Some(false), portrait: Some(true), nth: Some(nth), ..Pred::default() });
+        assert_eq!(select(&spec(1), &desk3(), &cfg), Ok(1));
+        let err = select(&spec(2), &desk3(), &cfg).unwrap_err();
+        assert!(err.contains("nth is 2, only 1 match"), "{err}");
+        assert!(err.contains("portrait is false, wanted true"), "{err}");
+    }
+
+    #[test]
+    fn nth_counts_in_monitor_id_order_whatever_the_slice_order() {
+        let cfg = example();
+        let ds = [len_landscape(3), len_portrait(1), len_landscape(2), builtin(4)];
+        let spec = MonitorSpec::Pred(Pred { main: Some(false), nth: Some(2), ..Pred::default() });
+        assert_eq!(select(&spec, &ds, &cfg), Ok(2));
+        assert_eq!(select(&spec, &[], &cfg), Err("no monitor attached".into()));
     }
 }
