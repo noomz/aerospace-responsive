@@ -48,6 +48,13 @@ from aspect ratio and **never** flatten. Placement rules: first *satisfiable* ma
 reads as a preference chain; nothing satisfiable leaves the workspace where it is and warns.
 Profiles (predicates over the attached set) are consulted before the base rules.
 
+Predicate fields (every present field must hold): `name`, `label` (a `[[monitor]]` block),
+`builtin`, `external`, `portrait`, `landscape`, `main`, `vendor`, `model`, `serial`, and — in a
+`[[placement]]` `monitor` only — `nth`: the 1-based ordinal, in monitor-id order, among the
+monitors matching the other fields. `{ main = false, nth = 2 }` is the second non-main monitor;
+fewer matches make the rule unsatisfiable (`explain` says `nth is 2, only 1 match`). `nth = 0`, or
+`nth` in `[[layout]]`, `[[monitor]]` or a profile `when`, is a load error.
+
 ## Rollback
 
 ```sh

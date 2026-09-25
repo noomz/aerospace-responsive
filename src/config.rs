@@ -83,6 +83,10 @@ pub struct Pred {
     pub model: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serial: Option<u32>,
+    /// 1-based ordinal, in monitor-id order, among the monitors matching the other fields.
+    /// A set-level property: only valid in a `[[placement]]` monitor (validated at load).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nth: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -221,19 +225,35 @@ fn validate(c: &Config) -> Result<()> {
             bail!("duplicate [[monitor]] label {:?}", m.label);
         }
     }
+    for m in &c.monitor {
+        if m.matches.nth.is_some() {
+            bail!("[[monitor]] {:?}: nth is only valid in [[placement]] monitor", m.label);
+        }
+    }
     let check = |p: &Pred, at: &str| -> Result<()> {
         match &p.label {
             Some(l) if !labels.contains(l.as_str()) => bail!("{at}: label {l:?} has no [[monitor]] block"),
             _ => Ok(()),
         }
     };
+    // Per-monitor predicates: an ordinal over a set of matches means nothing here.
+    let check_per_monitor = |p: &Pred, at: &str| -> Result<()> {
+        if p.nth.is_some() {
+            bail!("{at}: nth is only valid in [[placement]] monitor");
+        }
+        check(p, at)
+    };
     let check_rules = |layout: &[LayoutRule], placement: &[PlacementRule], at: &str| -> Result<()> {
         for (i, r) in layout.iter().enumerate() {
-            check(&r.when, &format!("{at}layout[{i}]"))?;
+            check_per_monitor(&r.when, &format!("{at}layout[{i}]"))?;
         }
         for (i, r) in placement.iter().enumerate() {
             if let MonitorSpec::Pred(p) = &r.monitor {
-                check(p, &format!("{at}placement[{i}]"))?;
+                let at = format!("{at}placement[{i}]");
+                if p.nth == Some(0) {
+                    bail!("{at}: nth = 0 is invalid; nth is 1-based");
+                }
+                check(p, &at)?;
             }
         }
         Ok(())
@@ -245,9 +265,9 @@ fn validate(c: &Config) -> Result<()> {
             bail!("duplicate profile name {:?}", p.name);
         }
         let at = format!("profile {:?} ", p.name);
-        check(&p.when.all, &format!("{at}when"))?;
+        check_per_monitor(&p.when.all, &format!("{at}when"))?;
         for inc in &p.when.includes {
-            check(inc, &format!("{at}when.includes"))?;
+            check_per_monitor(inc, &format!("{at}when.includes"))?;
         }
         check_rules(&p.layout, &p.placement, &at)?;
     }
@@ -312,6 +332,25 @@ mod tests {
     fn label_block_cannot_reference_a_label() {
         let err = parse("[[monitor]]\nlabel = \"a\"\nmatch = { label = \"a\" }\n").unwrap_err();
         assert!(format!("{err:#}").contains("cannot reference another label"));
+    }
+
+    #[test]
+    fn nth_zero_is_a_load_error() {
+        let err = parse("[[placement]]\nworkspaces = [\"X\"]\nmonitor = { main = false, nth = 0 }\n").unwrap_err();
+        assert!(format!("{err:#}").contains("1-based"), "{err:#}");
+    }
+
+    #[test]
+    fn nth_outside_placement_is_a_load_error() {
+        let only = "nth is only valid in [[placement]] monitor";
+        let layout = parse("[[layout]]\nwhen = { portrait = true, nth = 1 }\norientation = \"v\"\nflatten = true\n").unwrap_err();
+        assert!(format!("{layout:#}").contains(only), "{layout:#}");
+        let label = parse("[[monitor]]\nlabel = \"a\"\nmatch = { builtin = false, nth = 1 }\n").unwrap_err();
+        assert!(format!("{label:#}").contains(only), "{label:#}");
+        let includes = parse("[[profile]]\nname = \"p\"\nwhen = { includes = [{ nth = 2 }] }\n").unwrap_err();
+        assert!(format!("{includes:#}").contains(only), "{includes:#}");
+        let all = parse("[[profile]]\nname = \"p\"\nwhen = { nth = 1 }\n").unwrap_err();
+        assert!(format!("{all:#}").contains(only), "{all:#}");
     }
 
     #[test]

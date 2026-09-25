@@ -34,6 +34,8 @@ flatten     = false
 
 # ---------- placement: workspace -> monitor. First SATISFIABLE match wins (06 S2). ----------
 # Ties break by monitor-id = origin order (01 R6). Nothing satisfiable = leave it, warn (06 S3).
+# `nth` picks the Nth match (1-based, monitor-id order) instead of the lowest id, e.g.
+#   monitor = { main = false, nth = 2 }   # the second non-main monitor; unsatisfiable if fewer
 
 [[placement]]
 workspaces = ["1"]
