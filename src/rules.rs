@@ -255,9 +255,17 @@ fn select(spec: &MonitorSpec, ds: &[Display], cfg: &Config) -> Result<u32, Strin
                     Some(w) => whys.push(format!("{}: {w}", d.aero_name)),
                 }
             }
-            // `ds` is in monitor-id order, so `hits` is too.
             if let Some(n) = p.nth {
-                return (n as usize).checked_sub(1).and_then(|i| hits.get(i)).copied().ok_or_else(|| format!("nth is {n}, only {} match", hits.len()));
+                hits.sort_unstable(); // the ordinal is in monitor-id order, whatever order `ds` is in
+                return (n as usize).checked_sub(1).and_then(|i| hits.get(i)).copied().ok_or_else(|| {
+                    if ds.is_empty() {
+                        "no monitor attached".into()
+                    } else if whys.is_empty() {
+                        format!("nth is {n}, only {} match", hits.len())
+                    } else {
+                        format!("nth is {n}, only {} match ({})", hits.len(), whys.join("; "))
+                    }
+                });
             }
             hits.into_iter().min().ok_or_else(|| if whys.is_empty() { "no monitor attached".into() } else { whys.join("; ") })
         }
@@ -468,6 +476,17 @@ mod tests {
         let cfg = example();
         let spec = |nth| MonitorSpec::Pred(Pred { main: Some(false), portrait: Some(true), nth: Some(nth), ..Pred::default() });
         assert_eq!(select(&spec(1), &desk3(), &cfg), Ok(1));
-        assert_eq!(select(&spec(2), &desk3(), &cfg), Err("nth is 2, only 1 match".into()));
+        let err = select(&spec(2), &desk3(), &cfg).unwrap_err();
+        assert!(err.contains("nth is 2, only 1 match"), "{err}");
+        assert!(err.contains("portrait is false, wanted true"), "{err}");
+    }
+
+    #[test]
+    fn nth_counts_in_monitor_id_order_whatever_the_slice_order() {
+        let cfg = example();
+        let ds = [len_landscape(3), len_portrait(1), len_landscape(2), builtin(4)];
+        let spec = MonitorSpec::Pred(Pred { main: Some(false), nth: Some(2), ..Pred::default() });
+        assert_eq!(select(&spec, &ds, &cfg), Ok(2));
+        assert_eq!(select(&spec, &[], &cfg), Err("no monitor attached".into()));
     }
 }
