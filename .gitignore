@@ -1,5 +1,6 @@
 /target
 /.omc/
 /.superpowers/
-/.scratch/**/.omc/
-/.scratch/cutover/run/
+/.scratch/
+/docs/cutover.md
+/docs/superpowers/

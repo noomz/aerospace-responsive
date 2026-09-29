@@ -5,14 +5,18 @@ workspaces to the monitors your rules name, and sets each workspace's root orien
 flattening it) from the monitor it lands on. A resident daemon reacts to CoreGraphics display
 reconfiguration — no polling — and every command is a client of that one daemon.
 
-Design record: `.scratch/responsive-layout/map.md` (decisions D1-D26).
+## Requirements
+
+- macOS
+- [AeroSpace](https://github.com/nikitabobko/AeroSpace) 0.21.0-Beta or later (for `layout --root`)
 
 ## Install
 
 ```sh
-cargo install --path .
+cargo install aerospace-responsive
 mkdir -p ~/.config/aerospace-responsive
-cp aerospace-responsive.example.toml ~/.config/aerospace-responsive/aerospace-responsive.toml
+curl -fsSL https://raw.githubusercontent.com/noomz/aerospace-responsive/main/aerospace-responsive.example.toml \
+  -o ~/.config/aerospace-responsive/aerospace-responsive.toml
 # edit it for your monitors first
 aerospace-responsive install            # asks before each step; --yes, --only, --skip for scripts
 ```
@@ -66,3 +70,12 @@ aerospace-responsive uninstall --yes
 - Read an empty workspace's root layout (that would create and freeze it).
 - Flatten unless your rule says so **and** the root axis is about to change.
 - Poll. Or touch a pinned workspace's layout.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT)
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+this crate by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions.

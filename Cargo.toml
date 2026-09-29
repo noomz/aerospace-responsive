@@ -3,6 +3,16 @@ name = "aerospace-responsive"
 version = "0.1.0"
 edition = "2024"
 description = "Reshape AeroSpace workspace placement and layout when displays change"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/noomz/aerospace-responsive"
+readme = "README.md"
+keywords = ["aerospace", "macos", "window-manager", "tiling", "multi-monitor"]
+categories = ["command-line-utilities"]
+include = ["/src", "/examples", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE", "/aerospace-responsive.example.toml"]
+
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
 
 [dependencies]
 anyhow = "1"
