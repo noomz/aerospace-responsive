@@ -2,9 +2,12 @@
 //! within each entry's tile limit, tile; every other window arriving tiled gets the else-action.
 //! Pure: the worker feeds it window reads and executes what it returns.
 
+use crate::aero::Cmd;
 use crate::config::{Config, ElseAction, Entry, Profile, TilingBlock};
+use crate::state::{Floated, RuleRecord, TilingMemory};
+use crate::world::WinInfo;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One field's cascaded value and the block it came from (`top-level #1`, `profile desk3 #1`).
 pub type Sourced<T> = (T, String);
@@ -63,6 +66,196 @@ pub fn effective(cfg: &Config, profile: Option<&Profile>) -> Vec<Rule> {
             Some(Rule { workspace: ws, else_action, else_action_source, tiling_allowlist, tiling_allowlist_source })
         })
         .collect()
+}
+
+/// Why the rule floats a window (the closed set `explain` prints). Entries are 1-based.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum Why {
+    NotAllowlisted,
+    Full { entry: usize },
+    CarveOut { entry: usize },
+}
+
+impl std::fmt::Display for Why {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Why::NotAllowlisted => write!(f, "not allowlisted"),
+            Why::Full { entry } => write!(f, "entry {entry} full"),
+            Why::CarveOut { entry } => write!(f, "entry {entry} carve-out"),
+        }
+    }
+}
+
+/// The entry that governs `w`: the first it matches now, by current title (V2, V4).
+pub fn first_match(rule: &Rule, w: &WinInfo) -> Option<usize> {
+    rule.tiling_allowlist.iter().position(|e| e.app == w.app && e.title.as_ref().is_none_or(|t| t.is_match(&w.title)))
+}
+
+/// Entry `i`'s windows tiled on the rule's workspace now, whoever tiled them, `except` one (V3).
+pub fn tiled_in(rule: &Rule, i: usize, windows: &[WinInfo], except: u32) -> usize {
+    windows.iter().filter(|w| w.workspace == rule.workspace && w.id != except && w.tiled() && first_match(rule, w) == Some(i)).count()
+}
+
+/// Would `w` tile here if it arrived tiled now? `Ok(entry index)` or why not (V2, V3).
+pub fn admit(rule: &Rule, w: &WinInfo, windows: &[WinInfo]) -> Result<usize, Why> {
+    let i = first_match(rule, w).ok_or(Why::NotAllowlisted)?;
+    match rule.tiling_allowlist[i].max_tiled {
+        Some(0) => Err(Why::CarveOut { entry: i + 1 }),
+        Some(n) if tiled_in(rule, i, windows, w.id) >= n as usize => Err(Why::Full { entry: i + 1 }),
+        _ => Ok(i),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Arrival {
+    /// Arrived not tiled (dialog, sticky, floated by a callback or by you): never touched (V1).
+    Ignore,
+    Admit,
+    /// Else-action; the window becomes rule-floated.
+    Float(Why),
+}
+
+/// V1, V2: the rule acts only on a window arriving tiled. `windows` = the whole read.
+pub fn arrival(rule: &Rule, w: &WinInfo, windows: &[WinInfo]) -> Arrival {
+    if !w.tiled() {
+        return Arrival::Ignore;
+    }
+    match admit(rule, w, windows) {
+        Ok(_) => Arrival::Admit,
+        Err(why) => Arrival::Float(why),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Leave {
+    /// You changed its state since the rule floated it (tiled it, made it sticky, ...): the
+    /// rule's float is gone, so is its memory (V6).
+    Drop,
+    Retile,
+    /// Still floating, now rule-floated on its destination.
+    StayFloated(Why),
+}
+
+/// V5: a rule-floated window left; its destination (`w.workspace`, rule `dest`) decides.
+pub fn leave(w: &WinInfo, dest: Option<&Rule>, windows: &[WinInfo]) -> Leave {
+    if !w.floating() {
+        return Leave::Drop;
+    }
+    match dest.map(|r| admit(r, w, windows)) {
+        None | Some(Ok(_)) => Leave::Retile,
+        Some(Err(why)) => Leave::StayFloated(why),
+    }
+}
+
+/// Why a workspace converges (V7). `Changed` carries `field (source)` strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum Reason {
+    FirstRun,
+    Changed { fields: Vec<String> },
+    Removed,
+}
+
+/// V7, V8: converge only when the record is missing, differs, or has lost its rule.
+pub fn pending(rule: Option<&Rule>, record: Option<&RuleRecord>) -> Option<Reason> {
+    match (rule, record) {
+        (Some(_), None) => Some(Reason::FirstRun),
+        (Some(r), Some(rec)) => {
+            let changed = rec.changed(r);
+            (!changed.is_empty()).then(|| Reason::Changed {
+                fields: changed
+                    .into_iter()
+                    .map(|f| format!("{f} ({})", if f == "else-action" { &r.else_action_source } else { &r.tiling_allowlist_source }))
+                    .collect(),
+            })
+        }
+        (None, Some(_)) => Some(Reason::Removed),
+        (None, None) => None,
+    }
+}
+
+/// One workspace's converge: commands in order, then the memory and record it leaves.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Plan {
+    pub workspace: String,
+    pub reason: Reason,
+    /// Each command with the window's bundle id, so memory can follow command by command.
+    pub steps: Vec<(Cmd, String)>,
+    pub floated_after: BTreeSet<Floated>,
+    pub record_after: Option<RuleRecord>,
+}
+
+/// Every workspace with a rule or a record whose converge is pending, in name order.
+pub fn plan_converge(rules: &[Rule], mem: &TilingMemory, windows: &[WinInfo]) -> Vec<Plan> {
+    let names: BTreeSet<&String> = rules.iter().map(|r| &r.workspace).chain(mem.records.keys()).collect();
+    let empty = BTreeSet::new();
+    let mut out = vec![];
+    for ws in names {
+        let rule = rules.iter().find(|r| &r.workspace == ws);
+        let Some(reason) = pending(rule, mem.records.get(ws)) else { continue };
+        let floated = mem.rule_floated.get(ws).unwrap_or(&empty);
+        let was_floated = |w: &WinInfo| floated.contains(&Floated { window_id: w.id, app: w.app.clone() });
+        let here = windows.iter().filter(|w| &w.workspace == ws);
+        let mut plan = Plan { workspace: ws.clone(), reason, steps: vec![], floated_after: BTreeSet::new(), record_after: rule.map(RuleRecord::of) };
+        match rule {
+            // Removal: the rule's own floats re-tile, nothing else changes.
+            None => {
+                for w in here.filter(|w| w.floating() && was_floated(w)) {
+                    plan.steps.push((Cmd::Tile { id: w.id }, w.app.clone()));
+                }
+            }
+            // Every tiled or rule-floated window is an arrival; the lowest id keeps a slot.
+            Some(r) => {
+                let mut cands: Vec<&WinInfo> = here.filter(|w| w.tiled() || (w.floating() && was_floated(w))).collect();
+                cands.sort_by_key(|w| w.id);
+                let mut used = vec![0usize; r.tiling_allowlist.len()];
+                for w in cands {
+                    let tile = first_match(r, w).is_some_and(|i| {
+                        let room = r.tiling_allowlist[i].max_tiled.is_none_or(|n| used[i] < n as usize);
+                        used[i] += room as usize;
+                        room
+                    });
+                    match (tile, w.tiled()) {
+                        (true, false) => plan.steps.push((Cmd::Tile { id: w.id }, w.app.clone())),
+                        (false, true) => plan.steps.push((Cmd::Float { id: w.id }, w.app.clone())),
+                        _ => {}
+                    }
+                    if !tile {
+                        plan.floated_after.insert(Floated { window_id: w.id, app: w.app.clone() });
+                    }
+                }
+            }
+        }
+        out.push(plan);
+    }
+    out
+}
+
+/// Memory follows one executed converge command.
+pub fn note(mem: &mut TilingMemory, ws: &str, cmd: &Cmd, app: &str) {
+    match cmd {
+        Cmd::Float { id } => mem.insert(ws, *id, app),
+        Cmd::Tile { id } => {
+            mem.remove(*id);
+        }
+        _ => {}
+    }
+}
+
+/// A workspace's converge completed: its memory and record become the plan's (V8).
+pub fn commit(mem: &mut TilingMemory, plan: &Plan) {
+    for f in &plan.floated_after {
+        mem.remove(f.window_id);
+    }
+    mem.rule_floated.remove(&plan.workspace);
+    if !plan.floated_after.is_empty() {
+        mem.rule_floated.insert(plan.workspace.clone(), plan.floated_after.clone());
+    }
+    match &plan.record_after {
+        Some(r) => mem.records.insert(plan.workspace.clone(), r.clone()),
+        None => mem.records.remove(&plan.workspace),
+    };
 }
 
 #[cfg(test)]
@@ -124,5 +317,152 @@ tiling-allowlist = [
         let title = t.title.as_ref().unwrap();
         assert!(title.is_match("kitty settings (1)"));
         assert!(!title.is_match("noomz: ~"));
+    }
+
+    const KITTY: &str = "net.kovidgoyal.kitty";
+
+    /// kitty-on-T from I.cfg: kitty "Settings" carved out, one other kitty may tile.
+    fn kitty_rule() -> Rule {
+        let cfg = parse(
+            "[[exclusive-tiling]]\nworkspaces = [\"T\"]\ntiling-allowlist = [\n\
+             { app = \"net.kovidgoyal.kitty\", title = \"Settings\", max-tiled = 0 },\n\
+             { app = \"net.kovidgoyal.kitty\", max-tiled = 1 },\n\
+             { app = \"com.apple.TextEdit\" },\n]\n",
+        )
+        .unwrap()
+        .config;
+        effective(&cfg, None).remove(0)
+    }
+
+    fn win(id: u32, ws: &str, app: &str, title: &str, layout: &str) -> WinInfo {
+        WinInfo { id, workspace: ws.into(), app: app.into(), title: title.into(), layout: layout.into() }
+    }
+
+    #[test]
+    fn arrival_matrix() {
+        let r = kitty_rule();
+        let tiled = |id, app: &str, title: &str| win(id, "T", app, title, "h_tiles");
+        // Not allowlisted, arriving tiled: else-action.
+        assert_eq!(arrival(&r, &tiled(1, "com.apple.Safari", "GitHub"), &[]), Arrival::Float(Why::NotAllowlisted));
+        // Allowlisted with room: nothing.
+        let k = tiled(2, KITTY, "noomz: ~");
+        assert_eq!(arrival(&r, &k, std::slice::from_ref(&k)), Arrival::Admit);
+        // Arriving floating, sticky or minimized: untouched, allowlisted or not (V1).
+        for layout in ["floating", "sticky", "macos_native_minimized"] {
+            assert_eq!(arrival(&r, &win(3, "T", "com.apple.Safari", "", layout), &[]), Arrival::Ignore);
+            assert_eq!(arrival(&r, &win(4, "T", KITTY, "x", layout), &[]), Arrival::Ignore);
+        }
+    }
+
+    #[test]
+    fn first_match_governs_carve_out_and_limit() {
+        let r = kitty_rule();
+        let settings = win(5, "T", KITTY, "kitty SETTINGS", "h_tiles");
+        assert_eq!(first_match(&r, &settings), Some(0), "title matches case-insensitively, first entry wins");
+        assert_eq!(arrival(&r, &settings, &[]), Arrival::Float(Why::CarveOut { entry: 1 }));
+        let a = win(6, "T", KITTY, "noomz: ~", "h_tiles");
+        let b = win(7, "T", KITTY, "noomz: htop", "h_tiles");
+        let all = [a.clone(), b.clone()];
+        assert_eq!(arrival(&r, &b, &all), Arrival::Float(Why::Full { entry: 2 }), "a holds the one slot");
+        // The limit counts tiled windows only, and on this workspace only.
+        let gone = [win(6, "T", KITTY, "noomz: ~", "floating"), b.clone(), win(8, "X", KITTY, "", "h_tiles")];
+        assert_eq!(arrival(&r, &b, &gone), Arrival::Admit);
+        // Unlimited entry.
+        let edits: Vec<WinInfo> = (10..14).map(|i| win(i, "T", "com.apple.TextEdit", "", "h_tiles")).collect();
+        assert_eq!(arrival(&r, &edits[3], &edits), Arrival::Admit);
+    }
+
+    #[test]
+    fn no_promotion_when_a_slot_frees() {
+        // A rule-floated kitty stays floating when the tiled one closes: arrivals are the only
+        // trigger, and a close is not an arrival. Converge is not run on a plain change.
+        let r = kitty_rule();
+        let mut mem = TilingMemory::default();
+        mem.records.insert("T".into(), RuleRecord::of(&r));
+        mem.insert("T", 7, KITTY);
+        let after_close = [win(7, "T", KITTY, "noomz: htop", "floating")];
+        assert!(plan_converge(std::slice::from_ref(&r), &mem, &after_close).is_empty());
+    }
+
+    #[test]
+    fn leave_lets_the_destination_decide() {
+        let r = kitty_rule();
+        let x = Rule { workspace: "X".into(), ..r.clone() };
+        let safari = win(1, "X", "com.apple.Safari", "", "floating");
+        assert_eq!(leave(&win(1, "Y", "com.apple.Safari", "", "floating"), None, &[]), Leave::Retile, "no rule there");
+        assert_eq!(leave(&safari, Some(&x), &[]), Leave::StayFloated(Why::NotAllowlisted));
+        let k = win(2, "X", KITTY, "noomz: ~", "floating");
+        assert_eq!(leave(&k, Some(&x), &[]), Leave::Retile, "admitted with room");
+        let full = [k.clone(), win(3, "X", KITTY, "vim", "h_tiles")];
+        assert_eq!(leave(&k, Some(&x), &full), Leave::StayFloated(Why::Full { entry: 2 }));
+        // Tiled by you before it left: the rule's float is gone (V6).
+        assert_eq!(leave(&win(2, "X", KITTY, "", "h_tiles"), Some(&x), &[]), Leave::Drop);
+    }
+
+    #[test]
+    fn converge_first_run_lowest_id_keeps_the_slot() {
+        let r = kitty_rule();
+        let ws = [
+            win(40, "T", KITTY, "b", "h_tiles"),
+            win(30, "T", KITTY, "a", "h_tiles"),
+            win(50, "T", "com.apple.Finder", "Downloads", "h_tiles"),
+            win(60, "T", "com.apple.Preview", "x.pdf", "floating"),
+            win(70, "X", "com.apple.Finder", "", "h_tiles"),
+        ];
+        let plans = plan_converge(std::slice::from_ref(&r), &TilingMemory::default(), &ws);
+        assert_eq!(plans.len(), 1);
+        let p = &plans[0];
+        assert_eq!(p.reason, Reason::FirstRun);
+        let cmds: Vec<&Cmd> = p.steps.iter().map(|(c, _)| c).collect();
+        assert_eq!(cmds, [&Cmd::Float { id: 40 }, &Cmd::Float { id: 50 }], "30 keeps the kitty slot; your float 60 is ignored");
+        let ids: Vec<u32> = p.floated_after.iter().map(|f| f.window_id).collect();
+        assert_eq!(ids, [40, 50]);
+        let mut mem = TilingMemory::default();
+        commit(&mut mem, p);
+        assert_eq!(mem.records.get("T"), Some(&RuleRecord::of(&r)));
+        assert!(plan_converge(std::slice::from_ref(&r), &mem, &ws).is_empty(), "equal record: nothing");
+    }
+
+    #[test]
+    fn converge_on_edit_retiles_admitted_and_floats_disallowed() {
+        let old = kitty_rule();
+        let mut mem = TilingMemory::default();
+        mem.records.insert("T".into(), RuleRecord::of(&old));
+        mem.insert("T", 20, "com.apple.Safari");
+        // The edit admits Safari and drops TextEdit.
+        let cfg = parse(
+            "[[exclusive-tiling]]\nworkspaces = [\"T\"]\ntiling-allowlist = [{ app = \"com.apple.Safari\" }]\n",
+        )
+        .unwrap()
+        .config;
+        let new = effective(&cfg, None);
+        let ws = [win(20, "T", "com.apple.Safari", "", "floating"), win(21, "T", "com.apple.TextEdit", "hand-tiled", "h_tiles")];
+        let p = &plan_converge(&new, &mem, &ws)[0];
+        assert_eq!(p.reason, Reason::Changed { fields: vec!["tiling-allowlist (top-level #1)".into()] });
+        let cmds: Vec<&Cmd> = p.steps.iter().map(|(c, _)| c).collect();
+        assert_eq!(cmds, [&Cmd::Tile { id: 20 }, &Cmd::Float { id: 21 }]);
+    }
+
+    #[test]
+    fn converge_on_removal_retiles_only_its_own_floats() {
+        let r = kitty_rule();
+        let mut mem = TilingMemory::default();
+        mem.records.insert("T".into(), RuleRecord::of(&r));
+        mem.insert("T", 20, "com.apple.Safari");
+        let ws = [win(20, "T", "com.apple.Safari", "", "floating"), win(21, "T", "com.apple.Preview", "", "floating")];
+        let p = &plan_converge(&[], &mem, &ws)[0];
+        assert_eq!(p.reason, Reason::Removed);
+        assert_eq!(p.steps, [(Cmd::Tile { id: 20 }, "com.apple.Safari".to_string())]);
+        commit(&mut mem, p);
+        assert_eq!(mem, TilingMemory::default(), "record and memory dropped");
+    }
+
+    #[test]
+    fn memory_follows_each_command() {
+        let mut mem = TilingMemory::default();
+        note(&mut mem, "T", &Cmd::Float { id: 1 }, "a");
+        assert_eq!(mem.floated_on(1, "a"), Some("T"));
+        note(&mut mem, "T", &Cmd::Tile { id: 1 }, "a");
+        assert!(mem.rule_floated.is_empty());
     }
 }
