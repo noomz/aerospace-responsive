@@ -14,6 +14,7 @@ pub mod render;
 pub mod restore;
 pub mod rules;
 pub mod state;
+pub mod tiling;
 pub mod watch;
 pub mod worker;
 pub mod world;

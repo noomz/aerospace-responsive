@@ -3,6 +3,8 @@
 //! converges, backs up only when it changes something, and deletes nothing.
 
 use crate::aero::{Aero, CliAero};
+use crate::render::TilingStatus;
+use crate::worker::INERT_HINT;
 use crate::{config, ipc, paths};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -449,27 +451,80 @@ fn reload_step(opts: &Opts, expect: Option<&BTreeSet<String>>) -> Result<()> {
     Ok(())
 }
 
+/// The reconcile step's confirm detail: a first pass also converges exclusive tiling.
+pub fn reconcile_detail(has_rule: bool) -> String {
+    let also = if has_rule { ", and floats windows your exclusive-tiling rules don't admit" } else { "" };
+    format!("reconcile: the daemon runs one pass (this moves workspaces{also})")
+}
+
+/// What install prints about exclusive tiling after the pass: `status`'s line, or the inert
+/// reason plus the hint. Inert warns, never fails install (V19, I.cli.install).
+pub fn tiling_lines(t: Option<&TilingStatus>) -> Vec<String> {
+    match t {
+        None => vec![],
+        Some(t) if t.state == "inert" => vec![
+            format!("exclusive tiling: inert: {}", t.inert.as_deref().unwrap_or("not subscribed to window events")),
+            format!("  hint: {INERT_HINT}"),
+        ],
+        Some(t) => vec![t.line()],
+    }
+}
+
 fn reconcile_step(opts: &Opts) -> Result<()> {
-    if !confirm(opts, "reconcile: run a first pass now?", "reconcile: the daemon runs one pass (this moves workspaces)")? {
+    let has_rule = config::load(&paths::config_file()).is_ok_and(|l| l.config.has_exclusive_tiling());
+    if !confirm(opts, "reconcile: run a first pass now?", &reconcile_detail(has_rule))? {
         println!("reconcile: skipped");
         return Ok(());
     }
-    match ipc::call(&paths::daemon_socket(), &ipc::Request::Reconcile { dry_run: false, config: None }) {
+    let sock = paths::daemon_socket();
+    match ipc::call(&sock, &ipc::Request::Reconcile { dry_run: false, config: None }) {
         Ok(r) => {
             print!("reconcile: {}", r.text);
             if r.exit != 0 {
                 bail!("the pass did not succeed; see `aerospace-responsive status`");
             }
-            Ok(())
         }
         Err(ipc::CallError::NoDaemon) => bail!("daemon not running (run the launchd step first)"),
-        Err(ipc::CallError::Io(e)) => Err(e.into()),
+        Err(ipc::CallError::Io(e)) => return Err(e.into()),
     }
+    // Status exits 4 while the inert warning is pending: that is information, not failure.
+    if let Ok(st) = ipc::call(&sock, &ipc::Request::Status) {
+        let t: Option<TilingStatus> = serde_json::from_value(st.json["exclusive_tiling"].clone()).ok().flatten();
+        for line in tiling_lines(t.as_ref()) {
+            println!("{line}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconcile_step_mentions_exclusive_tiling_only_with_a_rule() {
+        assert_eq!(reconcile_detail(false), "reconcile: the daemon runs one pass (this moves workspaces)");
+        assert!(reconcile_detail(true).ends_with("(this moves workspaces, and floats windows your exclusive-tiling rules don't admit)"));
+    }
+
+    #[test]
+    fn exclusive_tiling_never_edits_aerospace_toml() {
+        // V19: the rule needs no AeroSpace config; its workspaces are not placement's.
+        let cfg = config::parse("[[exclusive-tiling]]\nworkspaces = [\"X\"]\ntiling-allowlist = []\n").unwrap().config;
+        assert!(cfg.managed_workspaces().is_empty());
+    }
+
+    #[test]
+    fn install_prints_the_tiling_line_and_the_hint_when_inert() {
+        assert!(tiling_lines(None).is_empty(), "no rule, no line");
+        let live = TilingStatus { state: "live".into(), inert: None, rule_floated: BTreeMap::from([("T".to_string(), 1)]) };
+        assert_eq!(tiling_lines(Some(&live)), ["exclusive tiling: live; rule-floated T:1"]);
+        let inert = TilingStatus { state: "inert".into(), inert: Some("aerospace subscribe exited 2".into()), rule_floated: BTreeMap::new() };
+        assert_eq!(tiling_lines(Some(&inert)), ["exclusive tiling: inert: aerospace subscribe exited 2".to_string(), format!("  hint: {INERT_HINT}")]);
+        // The status JSON round-trips into the view install reads.
+        let json = serde_json::to_value(&inert).unwrap();
+        assert_eq!(serde_json::from_value::<TilingStatus>(json).unwrap().inert, inert.inert);
+    }
 
     const LIVE_LIKE: &str = r#"# my aerospace config
 config-version = 2

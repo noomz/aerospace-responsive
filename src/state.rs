@@ -1,6 +1,8 @@
 //! Daemon state that must survive a restart (pins, profile lock — plan P-7) and the
 //! warning set surfaced by `status` (D25 V5, cleared by cause — plan P-10).
 
+use crate::config::{ElseAction, Entry};
+use crate::tiling::Rule;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,6 +24,94 @@ pub struct Persisted {
     /// Profile lock (02 M1, renamed by 11 V1).
     #[serde(default)]
     pub lock: Option<String>,
+    #[serde(default)]
+    pub exclusive_tiling: TilingMemory,
+}
+
+/// Exclusive tiling's memory (I.state): the windows the rule floated, and per workspace the
+/// rule it last converged to. Survives daemon and AeroSpace restarts (V8, V9).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TilingMemory {
+    /// Rule-floated windows by workspace.
+    #[serde(default)]
+    pub rule_floated: BTreeMap<String, BTreeSet<Floated>>,
+    /// The last converged effective rule by workspace, updated only when its converge completes.
+    #[serde(default)]
+    pub records: BTreeMap<String, RuleRecord>,
+}
+
+/// Keyed (window id, bundle id): a `CGWindowID` is recycled after close, the bundle id tells
+/// a recycled id apart (V9).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Floated {
+    pub window_id: u32,
+    pub app: String,
+}
+
+/// The fields of an effective rule that decide what tiles; sources are not part of it, so
+/// moving a rule between blocks unchanged converges nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RuleRecord {
+    pub else_action: ElseAction,
+    pub tiling_allowlist: Vec<Entry>,
+}
+
+impl RuleRecord {
+    pub fn of(r: &Rule) -> Self {
+        RuleRecord { else_action: r.else_action, tiling_allowlist: r.tiling_allowlist.clone() }
+    }
+
+    /// The config field names that differ from `r` (for `rule changed: <fields>`).
+    pub fn changed(&self, r: &Rule) -> Vec<&'static str> {
+        let mut out = vec![];
+        if self.else_action != r.else_action {
+            out.push("else-action");
+        }
+        if self.tiling_allowlist != r.tiling_allowlist {
+            out.push("tiling-allowlist");
+        }
+        out
+    }
+}
+
+impl TilingMemory {
+    /// The workspace `(id, app)` is rule-floated on, if any.
+    pub fn floated_on(&self, id: u32, app: &str) -> Option<&str> {
+        self.rule_floated.iter().find(|(_, set)| set.iter().any(|f| f.window_id == id && f.app == app)).map(|(ws, _)| ws.as_str())
+    }
+
+    pub fn insert(&mut self, ws: &str, id: u32, app: &str) {
+        self.remove(id);
+        self.rule_floated.entry(ws.to_string()).or_default().insert(Floated { window_id: id, app: app.to_string() });
+    }
+
+    /// Forget window `id` wherever it is. True when something was dropped.
+    pub fn remove(&mut self, id: u32) -> bool {
+        let mut hit = false;
+        for set in self.rule_floated.values_mut() {
+            let before = set.len();
+            set.retain(|f| f.window_id != id);
+            hit |= set.len() != before;
+        }
+        self.rule_floated.retain(|_, set| !set.is_empty());
+        hit
+    }
+
+    /// V9: drop entries whose window is gone or whose id now belongs to another app (a
+    /// recycled id). `live` = (window id, bundle id) of every window. True when it changed.
+    pub fn prune(&mut self, live: &[(u32, &str)]) -> bool {
+        let before = self.clone();
+        for set in self.rule_floated.values_mut() {
+            set.retain(|f| live.iter().any(|(id, app)| *id == f.window_id && *app == f.app));
+        }
+        self.rule_floated.retain(|_, set| !set.is_empty());
+        *self != before
+    }
+
+    pub fn counts(&self) -> BTreeMap<String, usize> {
+        self.rule_floated.iter().map(|(ws, set)| (ws.clone(), set.len())).collect()
+    }
 }
 
 impl Persisted {
@@ -70,13 +160,15 @@ impl Persisted {
 }
 
 /// How a warning clears (plan P-10): Config on the next successful reload, World on every
-/// pass (recomputed), Pass on the next clean pass.
+/// pass (recomputed), Pass on the next clean pass, ExclusiveTiling when a subscribe child
+/// starts (or the last rule goes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Class {
     Config,
     World,
     Pass,
+    ExclusiveTiling,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,11 +252,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         assert_eq!(Persisted::load(&path), Persisted::default());
-        let p = Persisted { pins: vec![pin("1")], lock: Some("desk".into()) };
+        let mut p = Persisted { pins: vec![pin("1")], lock: Some("desk".into()), ..Persisted::default() };
+        p.exclusive_tiling.insert("T", 4380, "net.kovidgoyal.kitty");
         p.save(&path).unwrap();
         assert_eq!(Persisted::load(&path), p);
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(Persisted::load(&path), Persisted::default());
+    }
+
+    #[test]
+    fn state_without_tiling_memory_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, r#"{"pins":[],"lock":"desk"}"#).unwrap();
+        let p = Persisted::load(&path);
+        assert_eq!(p.lock.as_deref(), Some("desk"));
+        assert_eq!(p.exclusive_tiling, TilingMemory::default());
+    }
+
+    #[test]
+    fn prune_drops_gone_and_recycled_windows() {
+        let mut m = TilingMemory::default();
+        m.insert("T", 1, "com.apple.Safari");
+        m.insert("T", 2, "com.apple.Preview");
+        m.insert("X", 3, "com.apple.Finder");
+        // 1 still Safari; 2 recycled by kitty; 3 closed.
+        assert!(m.prune(&[(1, "com.apple.Safari"), (2, "net.kovidgoyal.kitty")]));
+        assert_eq!(m.counts(), BTreeMap::from([("T".to_string(), 1)]));
+        assert_eq!(m.floated_on(1, "com.apple.Safari"), Some("T"));
+        assert!(!m.prune(&[(1, "com.apple.Safari")]), "nothing left to prune");
+    }
+
+    #[test]
+    fn a_window_is_rule_floated_on_one_workspace_at_most() {
+        let mut m = TilingMemory::default();
+        m.insert("T", 7, "a");
+        m.insert("X", 7, "a");
+        assert_eq!(m.floated_on(7, "a"), Some("X"));
+        assert!(m.remove(7));
+        assert!(m.rule_floated.is_empty());
+        assert!(!m.remove(7));
     }
 
     #[test]

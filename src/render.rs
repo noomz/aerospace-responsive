@@ -5,7 +5,10 @@ use crate::config::Axis;
 use crate::display::Display;
 use crate::rules::{ProfileMode, Resolved};
 use crate::state::Warning;
+use crate::tiling::WsView;
+use crate::world::axis_of;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,6 +36,27 @@ pub struct StatusView {
     pub warnings: Vec<Warning>,
     pub aerospace_running: bool,
     pub observe: bool,
+    /// `None` when no exclusive-tiling rule is configured.
+    pub exclusive_tiling: Option<TilingStatus>,
+}
+
+/// `status`'s exclusive-tiling line, from memory (no window read).
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct TilingStatus {
+    /// `live` | `inert` | `observe`.
+    pub state: String,
+    /// Why, while inert (`aerospace subscribe exited 2`); the warning carries the detail.
+    pub inert: Option<String>,
+    pub rule_floated: BTreeMap<String, usize>,
+}
+
+impl TilingStatus {
+    /// `exclusive tiling: live; rule-floated T:2`.
+    pub fn line(&self) -> String {
+        let counts: Vec<String> = self.rule_floated.iter().map(|(ws, n)| format!("{ws}:{n}")).collect();
+        let floated = if counts.is_empty() { "none".to_string() } else { counts.join(" ") };
+        format!("exclusive tiling: {}; rule-floated {floated}", self.state)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,9 +142,64 @@ pub fn explain(r: &Resolved) -> String {
     o
 }
 
+/// `explain`'s exclusive-tiling section (I.cli.explain). `state` = `inert: <why>` or
+/// `observe`, carried in the header.
+pub fn exclusive_tiling(views: &[WsView], state: Option<&str>) -> String {
+    if views.is_empty() {
+        return String::new();
+    }
+    let mut o = String::from("exclusive-tiling:");
+    if let Some(st) = state {
+        let _ = write!(o, " ({st})");
+    }
+    o.push('\n');
+    for v in views {
+        match &v.rule {
+            Some(r) => {
+                let action = serde_json::to_value(r.else_action).ok().and_then(|a| a.as_str().map(String::from)).unwrap_or_default();
+                let _ = writeln!(o, "  {:<4} {:<24} [{}]", v.workspace, format!("else-action {action}"), r.else_action_source);
+                let _ = writeln!(o, "       {:<24} [{}]", "tiling-allowlist", r.tiling_allowlist_source);
+            }
+            None => {
+                let _ = writeln!(o, "  {:<4} (rule removed)", v.workspace);
+            }
+        }
+        let app_w = v.entries.iter().map(|e| e.entry.app.len()).max().unwrap_or(0);
+        let title = |e: &crate::config::Entry| e.title.as_ref().map_or(String::new(), |t| format!("title~{:?}", t.as_str()));
+        let title_w = v.entries.iter().map(|e| title(&e.entry).len()).max().unwrap_or(0);
+        for (i, e) in v.entries.iter().enumerate() {
+            let limit = e.entry.max_tiled.map_or(String::new(), |n| format!("max-tiled {n}"));
+            let count = match (e.tiled, e.entry.max_tiled) {
+                (Some(_), Some(0)) | (None, _) => String::new(),
+                (Some(k), Some(n)) => format!("  ({k}/{n} tiled)"),
+                (Some(k), None) => format!("  ({k} tiled)"),
+            };
+            let line = format!("{} {:<app_w$}  {:<title_w$}  {limit}{count}", i + 1, e.entry.app, title(&e.entry));
+            let _ = writeln!(o, "         {}", line.trim_end());
+        }
+        let _ = writeln!(o, "       converge: {}", v.converge);
+        let Some(wins) = &v.windows else { continue };
+        if wins.is_empty() {
+            o.push_str("       windows: none\n");
+            continue;
+        }
+        o.push_str("       windows:\n");
+        let name_w = wins.iter().map(|w| w.app_name.len()).max().unwrap_or(0);
+        let titles: Vec<String> = wins.iter().map(|w| format!("{:?}", w.title)).collect();
+        let tw = titles.iter().map(|t| t.chars().count()).max().unwrap_or(0);
+        for (w, t) in wins.iter().zip(&titles) {
+            let state = if axis_of(&w.layout).is_some() { "tiled" } else { w.layout.as_str() };
+            let pad = tw - t.chars().count();
+            let _ = writeln!(o, "         {:<6} {:<name_w$}  {t}{:pad$}  {state:<9} {}", w.id, w.app_name, "", w.verdict);
+        }
+    }
+    o
+}
+
 /// Placement table first — cutover step 2 compares it with `aerospace-auto-secondary.sh
-/// --detect` — then the exact commands a pass would issue.
-pub fn dry_run(r: &Resolved, cmds: &[Cmd]) -> String {
+/// --detect` — then the pending exclusive-tiling converges with their reasons, then the exact
+/// commands a pass would issue. `converge` = (workspace, reason).
+pub fn dry_run(r: &Resolved, cmds: &[Cmd], converge: &[(String, String)]) -> String {
     let name = |id: u32| r.layout.iter().find(|l| l.monitor == id).map_or(String::new(), |l| l.monitor_name.clone());
     let mut o = String::from("placement (compare with aerospace-auto-secondary.sh --detect):\n");
     for p in &r.placement {
@@ -131,6 +210,12 @@ pub fn dry_run(r: &Resolved, cmds: &[Cmd]) -> String {
             None => {
                 let _ = writeln!(o, "  {:<4} (nothing satisfiable)", p.workspace);
             }
+        }
+    }
+    if !converge.is_empty() {
+        o.push_str("exclusive-tiling converge:\n");
+        for (ws, why) in converge {
+            let _ = writeln!(o, "  {ws:<4} {why}");
         }
     }
     o.push_str("commands:\n");
@@ -169,6 +254,9 @@ pub fn status(v: &StatusView) -> String {
             let _ = writeln!(o, "last pass: {} ({}): {}", p.at, p.trigger, p.result);
         }
         None => o.push_str("last pass: none yet\n"),
+    }
+    if let Some(t) = &v.exclusive_tiling {
+        let _ = writeln!(o, "{}", t.line());
     }
     if v.pins.is_empty() {
         o.push_str("pins: none\n");
@@ -214,9 +302,66 @@ mod tests {
     #[test]
     fn dry_run_lists_placement_then_commands() {
         let r = resolved();
-        let text = dry_run(&r, &[]);
+        let text = dry_run(&r, &[], &[]);
         assert!(text.contains("1    monitor 1  LEN T23i-10 (2)"));
         assert!(text.contains("(none — already reconciled)"));
+        assert!(!text.contains("exclusive-tiling"), "no block without a pending converge");
+    }
+
+    #[test]
+    fn dry_run_puts_the_converge_block_before_the_commands() {
+        let cmds = [Cmd::Float { id: 5230 }, Cmd::Tile { id: 4380 }];
+        let text = dry_run(&resolved(), &cmds, &[("T".into(), "rule changed: tiling-allowlist (profile desk3 #1)".into())]);
+        let block = text.find("exclusive-tiling converge:\n  T    rule changed: tiling-allowlist (profile desk3 #1)\n").expect(&text);
+        let commands = text.find("commands:\n  aerospace layout floating --window-id 5230\n  aerospace layout tiling --window-id 4380").expect(&text);
+        assert!(text.find("placement").unwrap() < block && block < commands);
+    }
+
+    #[test]
+    fn explain_section_matches_the_mockup() {
+        use crate::state::{RuleRecord, TilingMemory};
+        use crate::world::WinInfo;
+        let cfg = parse(
+            "[[exclusive-tiling]]\nworkspaces = [\"T\"]\ntiling-allowlist = [\n\
+             { app = \"net.kovidgoyal.kitty\", title = \"Settings\", max-tiled = 0 },\n\
+             { app = \"net.kovidgoyal.kitty\", max-tiled = 1 },\n]\n",
+        )
+        .unwrap()
+        .config;
+        let rules = crate::tiling::effective(&cfg, None);
+        let mut mem = TilingMemory::default();
+        mem.records.insert("T".into(), RuleRecord::of(&rules[0]));
+        mem.insert("T", 4380, "net.kovidgoyal.kitty");
+        let w = |id, app: &str, name: &str, title: &str, layout: &str| WinInfo {
+            id,
+            workspace: "T".into(),
+            app: app.into(),
+            app_name: name.into(),
+            title: title.into(),
+            layout: layout.into(),
+        };
+        let wins = [
+            w(4211, "net.kovidgoyal.kitty", "kitty", "noomz: ~", "h_tiles"),
+            w(4380, "net.kovidgoyal.kitty", "kitty", "noomz: htop", "floating"),
+            w(5120, "com.apple.Preview", "Preview", "x.pdf", "floating"),
+        ];
+        let text = exclusive_tiling(&crate::tiling::view(&rules, &mem, Some(&wins)), None);
+        let want = "\
+exclusive-tiling:
+  T    else-action float        [default]
+       tiling-allowlist         [top-level #1]
+         1 net.kovidgoyal.kitty  title~\"Settings\"  max-tiled 0
+         2 net.kovidgoyal.kitty                    max-tiled 1  (1/1 tiled)
+       converge: up to date
+       windows:
+         4211   kitty    \"noomz: ~\"     tiled     entry 2 (1/1)
+         4380   kitty    \"noomz: htop\"  floating  rule-floated: entry 2 full
+         5120   Preview  \"x.pdf\"        floating  yours (rule ignores)
+";
+        assert_eq!(text, want, "\n{text}");
+        let inert = exclusive_tiling(&crate::tiling::view(&rules, &mem, None), Some("inert: aerospace subscribe exited 2"));
+        assert!(inert.starts_with("exclusive-tiling: (inert: aerospace subscribe exited 2)\n"), "{inert}");
+        assert!(!inert.contains("windows:"));
     }
 
     #[test]
@@ -232,9 +377,14 @@ mod tests {
             warnings: w.list(),
             aerospace_running: true,
             observe: false,
+            exclusive_tiling: None,
         };
         let text = status(&v);
         assert!(text.contains("[pass] state still differs"));
         assert!(text.contains("pins: none"));
+        assert!(!text.contains("exclusive tiling"), "omitted when no rule is configured");
+        let t = TilingStatus { state: "live".into(), inert: None, rule_floated: BTreeMap::from([("T".to_string(), 2)]) };
+        let text = status(&StatusView { exclusive_tiling: Some(t), ..v });
+        assert!(text.contains("exclusive tiling: live; rule-floated T:2\n"), "{text}");
     }
 }

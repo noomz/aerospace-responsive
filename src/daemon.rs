@@ -12,7 +12,7 @@ use std::sync::mpsc;
 pub fn run(config: PathBuf, observe: bool) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Msg>();
     let aero_sock = paths::aerospace_socket();
-    let worker = Worker::new(
+    let mut worker = Worker::new(
         CliAero,
         macos::screens,
         config.clone(),
@@ -20,6 +20,7 @@ pub fn run(config: PathBuf, observe: bool) -> Result<()> {
         aero_sock.exists(),
         observe,
     );
+    worker.set_sender(tx.clone());
     let abort = worker.abort.clone();
 
     let to_worker = tx.clone();

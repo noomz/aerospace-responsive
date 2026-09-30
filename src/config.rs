@@ -21,6 +21,8 @@ pub struct Config {
     pub placement: Vec<PlacementRule>,
     #[serde(default)]
     pub profile: Vec<Profile>,
+    #[serde(default, rename = "exclusive-tiling")]
+    pub exclusive_tiling: Vec<TilingBlock>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,6 +159,79 @@ pub struct Profile {
     pub layout: Vec<LayoutRule>,
     #[serde(default)]
     pub placement: Vec<PlacementRule>,
+    #[serde(default, rename = "exclusive-tiling")]
+    pub exclusive_tiling: Vec<TilingBlock>,
+}
+
+/// One `[[exclusive-tiling]]` block. Blocks cascade per workspace and per field, last wins
+/// (top-level in file order, then the active profile's); see `tiling::cascade`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct TilingBlock {
+    pub workspaces: Vec<String>,
+    #[serde(default)]
+    pub else_action: Option<ElseAction>,
+    /// Replaced whole by a later block, never concatenated.
+    #[serde(default)]
+    pub tiling_allowlist: Option<Vec<Entry>>,
+}
+
+/// What exclusive tiling does to a window it does not admit. v1 has one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ElseAction {
+    #[default]
+    Float,
+}
+
+/// A tiling allowlist entry: exact bundle id, optional title regex, optional tile limit
+/// (absent = unlimited, 0 = carve-out: matches, never tiles).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Entry {
+    pub app: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<TitleRegex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tiled: Option<u32>,
+}
+
+/// AeroSpace's `window-title-regex-substring` semantics: case-insensitive, unanchored, so
+/// patterns copy over from `aerospace.toml`. Compared by pattern text.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct TitleRegex {
+    pattern: String,
+    re: regex::Regex,
+}
+
+impl TitleRegex {
+    pub fn as_str(&self) -> &str {
+        &self.pattern
+    }
+    pub fn is_match(&self, title: &str) -> bool {
+        self.re.is_match(title)
+    }
+}
+
+impl TryFrom<String> for TitleRegex {
+    type Error = String;
+    fn try_from(pattern: String) -> Result<Self, String> {
+        let re = regex::RegexBuilder::new(&pattern).case_insensitive(true).build().map_err(|e| format!("invalid title regex: {e}"))?;
+        Ok(TitleRegex { pattern, re })
+    }
+}
+
+impl From<TitleRegex> for String {
+    fn from(t: TitleRegex) -> String {
+        t.pattern
+    }
+}
+
+impl PartialEq for TitleRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern
+    }
 }
 
 /// Predicate over the attached SET (02 M1, plan P-5): `count` is exact, `includes` needs a
@@ -271,6 +346,27 @@ fn validate(c: &Config) -> Result<()> {
         }
         check_rules(&p.layout, &p.placement, &at)?;
     }
+    validate_tiling(c)
+}
+
+fn validate_tiling(c: &Config) -> Result<()> {
+    let top = c.exclusive_tiling.iter().enumerate().map(|(i, b)| (format!("top-level #{}", i + 1), b));
+    let prof = c.profile.iter().flat_map(|p| p.exclusive_tiling.iter().enumerate().map(|(i, b)| (format!("profile {} #{}", p.name, i + 1), b)));
+    for (at, b) in top.chain(prof) {
+        if b.workspaces.is_empty() {
+            bail!("[[exclusive-tiling]] {at}: `workspaces` is empty");
+        }
+    }
+    // A rule must say what may tile wherever it applies: top-level alone, and under each profile.
+    let setups = std::iter::once(None).chain(c.profile.iter().map(Some));
+    for p in setups {
+        for (ws, f) in crate::tiling::cascade(c, p) {
+            if f.tiling_allowlist.is_none() {
+                let under = p.map_or("top-level".to_string(), |p| format!("profile {:?}", p.name));
+                bail!("[[exclusive-tiling]] workspace {ws:?} has no tiling-allowlist ({under})");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -287,6 +383,11 @@ impl Config {
             .chain(self.profile.iter().flat_map(|p| &p.placement))
             .flat_map(|r| r.workspaces.iter().cloned())
             .collect()
+    }
+
+    /// Any `[[exclusive-tiling]]` block anywhere: the subscribe child runs only then (V14).
+    pub fn has_exclusive_tiling(&self) -> bool {
+        !self.exclusive_tiling.is_empty() || self.profile.iter().any(|p| !p.exclusive_tiling.is_empty())
     }
 }
 
@@ -377,6 +478,49 @@ mod tests {
     fn duplicate_profile_names_are_rejected() {
         let text = "[[profile]]\nname = \"a\"\nwhen = {}\n[[profile]]\nname = \"a\"\nwhen = {}\n";
         assert!(parse(text).is_err());
+    }
+
+    fn tiling_err(text: &str) -> String {
+        format!("{:#}", parse(text).unwrap_err())
+    }
+
+    #[test]
+    fn exclusive_tiling_load_errors() {
+        let kitty = "tiling-allowlist = [{ app = \"net.kovidgoyal.kitty\" }]\n";
+        assert!(tiling_err(&format!("[[exclusive-tiling]]\nworkspaces = []\n{kitty}")).contains("`workspaces` is empty"));
+        let bad_action = tiling_err(&format!("[[exclusive-tiling]]\nworkspaces = [\"T\"]\nelse-action = \"tile\"\n{kitty}"));
+        assert!(bad_action.contains("expected `float`"), "{bad_action}");
+        let no_app = tiling_err("[[exclusive-tiling]]\nworkspaces = [\"T\"]\ntiling-allowlist = [{ title = \"x\" }]\n");
+        assert!(no_app.contains("missing field `app`"), "{no_app}");
+        let bad_re = tiling_err("[[exclusive-tiling]]\nworkspaces = [\"T\"]\ntiling-allowlist = [{ app = \"a\", title = \"(\" }]\n");
+        assert!(bad_re.contains("invalid title regex"), "{bad_re}");
+        let negative = tiling_err("[[exclusive-tiling]]\nworkspaces = [\"T\"]\ntiling-allowlist = [{ app = \"a\", max-tiled = -1 }]\n");
+        assert!(negative.contains("max-tiled"), "{negative}");
+        let unknown = tiling_err("[[exclusive-tiling]]\nworkspaces = [\"T\"]\ntiling-allowlist = [{ app = \"a\", max = 1 }]\n");
+        assert!(unknown.contains("unknown field"), "{unknown}");
+    }
+
+    #[test]
+    fn a_rule_without_an_allowlist_is_checked_top_level_and_per_profile() {
+        let top = tiling_err("[[exclusive-tiling]]\nworkspaces = [\"T\"]\n");
+        assert!(top.contains("workspace \"T\" has no tiling-allowlist (top-level)"), "{top}");
+        // The profile supplies the allowlist, but top-level alone still lacks one.
+        let partial = "[[exclusive-tiling]]\nworkspaces = [\"T\"]\n[[profile]]\nname = \"p\"\nwhen = {}\n\
+            [[profile.exclusive-tiling]]\nworkspaces = [\"T\"]\ntiling-allowlist = []\n";
+        assert!(tiling_err(partial).contains("(top-level)"));
+        let prof = "[[profile]]\nname = \"p\"\nwhen = {}\n[[profile.exclusive-tiling]]\nworkspaces = [\"T\"]\nelse-action = \"float\"\n";
+        assert!(tiling_err(prof).contains("(profile \"p\")"));
+        let empty_ok = parse("[[exclusive-tiling]]\nworkspaces = [\"T\"]\ntiling-allowlist = []\n").unwrap();
+        assert!(empty_ok.config.has_exclusive_tiling(), "an empty allowlist is valid: nothing tiles");
+    }
+
+    #[test]
+    fn the_commented_example_block_parses_when_uncommented() {
+        let start = EXAMPLE.find("# [[exclusive-tiling]]").expect("example has the block");
+        let block: String = EXAMPLE[start..].lines().map(|l| format!("{}\n", l.strip_prefix("# ").unwrap_or(l))).collect();
+        let l = parse(&block).unwrap();
+        let r = crate::tiling::effective(&l.config, None);
+        assert_eq!((r.len(), r[0].workspace.as_str(), r[0].tiling_allowlist.len()), (1, "T", 2));
     }
 
     #[test]

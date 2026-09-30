@@ -7,6 +7,9 @@ use std::collections::BTreeSet;
 
 pub const MONITOR_FORMAT: &str = "%{monitor-id} %{monitor-name} %{monitor-appkit-nsscreen-screens-id}";
 pub const WINDOW_FORMAT: &str = "%{window-id} %{workspace} %{monitor-id} %{workspace-root-container-layout}";
+/// Exclusive tiling's read. `%{window-layout}` is `floating` for a floating window, a tiling
+/// layout (`h_tiles`, ...) for a tiled one, else `sticky`, `macos_native_*`, ...
+pub const DETAIL_FORMAT: &str = "%{window-id} %{workspace} %{app-bundle-id} %{app-name} %{window-title} %{window-layout}";
 /// Deliberately without `%{workspace-root-container-layout}`: through list-workspaces that
 /// read creates an empty workspace's root container and freezes its orientation.
 pub const WORKSPACE_FORMAT: &str = "%{workspace} %{monitor-id} %{workspace-is-visible} %{workspace-is-focused}";
@@ -31,6 +34,31 @@ pub struct WindowRow {
     pub monitor: u32,
     #[serde(rename = "workspace-root-container-layout")]
     pub root_layout: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct WinInfo {
+    #[serde(rename = "window-id")]
+    pub id: u32,
+    pub workspace: String,
+    #[serde(rename = "app-bundle-id")]
+    pub app: String,
+    #[serde(rename = "app-name")]
+    pub app_name: String,
+    #[serde(rename = "window-title")]
+    pub title: String,
+    #[serde(rename = "window-layout")]
+    pub layout: String,
+}
+
+impl WinInfo {
+    pub fn tiled(&self) -> bool {
+        axis_of(&self.layout).is_some()
+    }
+    /// Floating proper: sticky, minimized and native-fullscreen windows are neither.
+    pub fn floating(&self) -> bool {
+        self.layout == "floating"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -151,6 +179,19 @@ mod tests {
         assert_eq!(visible_on(&rows, 2), Some("T"));
         assert_eq!(focused(&rows).unwrap().workspace, "T");
         assert_eq!(row(&rows, "A").unwrap().monitor, 2);
+    }
+
+    #[test]
+    fn parses_window_details() {
+        let d: Vec<WinInfo> = serde_json::from_str(
+            r#"[{"window-id": 4211, "workspace": "T", "app-bundle-id": "net.kovidgoyal.kitty", "app-name": "kitty", "window-title": "noomz: ~", "window-layout": "h_tiles"},
+                {"window-id": 5120, "workspace": "T", "app-bundle-id": "com.apple.Preview", "app-name": "Preview", "window-title": "x.pdf", "window-layout": "floating"},
+                {"window-id": 12, "workspace": "T", "app-bundle-id": "com.bitwarden.desktop", "app-name": "Bitwarden", "window-title": "", "window-layout": "sticky"}]"#,
+        )
+        .unwrap();
+        assert!(d[0].tiled() && !d[0].floating());
+        assert!(d[1].floating() && !d[1].tiled());
+        assert!(!d[2].floating() && !d[2].tiled(), "sticky is neither");
     }
 
     #[test]

@@ -68,3 +68,20 @@ when = { includes = [{ label = "portrait-lenovo" }, { builtin = true }], count =
 name        = "laptop-only"
 when        = { count = 1, builtin = true }
 description = "defaults are correct here; the profile exists to say so deliberately"
+
+# ---------- exclusive tiling: only the allowlist tiles on a workspace ----------
+# Needs AeroSpace with the window-moved/window-closed events (README, Requirements); on stock
+# AeroSpace the rule is inert and `status` warns. A window arriving TILED that the allowlist
+# does not admit, or whose entry is full, gets the else-action (float); anything arriving
+# floating is left alone. The rule only ever undoes its own floats.
+# Entry: `app` = exact bundle id; `title` = regex, case-insensitive, unanchored (as AeroSpace's
+# window-title-regex-substring); `max-tiled` = absent unlimited, 0 never tiles. First match wins.
+# Blocks cascade per workspace and per field, last wins (then [[profile.exclusive-tiling]]).
+#
+# [[exclusive-tiling]]
+# workspaces = ["T"]
+# else-action = "float"        # the only one, and the default
+# tiling-allowlist = [
+#   { app = "net.kovidgoyal.kitty", title = "Settings", max-tiled = 0 },
+#   { app = "net.kovidgoyal.kitty", max-tiled = 1 },
+# ]
