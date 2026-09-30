@@ -109,6 +109,8 @@ cleanup() {
     for name in "${launched[@]}"; do # everything open in it is ours; TextEdit refuses to quit over open documents
         osascript -e "tell application \"$name\" to close every document saving no" >/dev/null 2>&1 || true
         osascript -e "tell application \"$name\" to quit" >/dev/null 2>&1 || true
+        sleep 1
+        pgrep -xq "$name" && killall "$name" 2>/dev/null # e.g. Terminal asking to confirm its shells
     done
     [[ -n "${SUB_PID:-}" ]] && kill "$SUB_PID" 2>/dev/null || true
     [[ -n "${HOME_WS:-}" ]] && aerospace workspace "$HOME_WS" >/dev/null 2>&1 || true
@@ -160,14 +162,21 @@ expect_layout "$second" tiled "rule-floated TextEdit re-tiles on $AWAY (no rule 
 [[ " $(rule_floated_on "$WS") " != *" $second "* ]] && pass "its memory entry is gone" || fail "still remembered on $WS"
 
 say "close prunes memory"
-aerospace close --window-id "$other"
-expect_layout "$other" gone "Terminal closed"
+# A TextEdit document closes without a prompt; Terminal would ask about its shell.
+third=$(new_window "$TEXTEDIT" osascript -e 'tell application "TextEdit" to make new document')
+created+=("$third")
+stage "$third" "third TextEdit"
+aerospace move-node-to-workspace --window-id "$third" "$WS"
+expect_layout "$third" floating "third TextEdit on $WS is over max-tiled = 1"
+[[ " $(rule_floated_on "$WS") " == *" $third "* ]] && pass "third TextEdit is rule-floated on $WS" || fail "third TextEdit not in state.json memory for $WS"
+aerospace close --window-id "$third"
+expect_layout "$third" gone "third TextEdit closed"
 sleep 0.5
-[[ " $(rule_floated_on "$WS") " != *" $other "* ]] && pass "closed window pruned from state.json" || fail "closed window still in state.json"
+[[ " $(rule_floated_on "$WS") " != *" $third "* ]] && pass "closed window pruned from state.json" || fail "closed window still in state.json"
 
 say "the event stream"
 grep -q "\"_event\":\"window-moved\".*\"prevWorkspace\":\"$AWAY\".*\"windowId\":$first" "$EVENTS" && pass "window-moved with prevWorkspace for $first" || fail "no window-moved for $first in $EVENTS"
-grep -q "\"_event\":\"window-closed\".*\"windowId\":$other" "$EVENTS" && pass "window-closed for $other" || fail "no window-closed for $other in $EVENTS"
+grep -q "\"_event\":\"window-closed\".*\"windowId\":$third" "$EVENTS" && pass "window-closed for $third" || fail "no window-closed for $third in $EVENTS"
 [[ "$(workspace_of "$first")" == "$WS" ]] && pass "first TextEdit still on $WS" || fail "first TextEdit left $WS"
 
 say ""
