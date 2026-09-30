@@ -90,6 +90,9 @@ pub struct Worker<A: Aero, S: FnMut() -> Vec<Screen>> {
     inert: Option<String>,
     /// The display set of the last gated pass: window events resolve the rule against it (V12).
     last_ds: Option<Vec<Display>>,
+    /// Where the daemon has seen each window (connect resync, then every event): an arrival is
+    /// judged only against windows it already knew there, so arrival order wins a burst (V22).
+    known: std::collections::BTreeMap<u32, String>,
     /// Exclusive tiling's memory as `state.json` had it: observe mode keeps its own changes
     /// in-process and writes this back instead (V15).
     tiling_on_disk: TilingMemory,
@@ -139,6 +142,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             sub_retry_at: None,
             inert: None,
             last_ds: None,
+            known: Default::default(),
             tiling_on_disk,
         };
         let _ = w.load_config();
@@ -604,6 +608,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             Ok(w) => w,
             Err(e) => return crate::log!("exclusive tiling: resync read failed: {e:#}"),
         };
+        self.known = wins.iter().map(|w| (w.id, w.workspace.clone())).collect();
         let live: Vec<(u32, &str)> = wins.iter().map(|w| (w.id, w.app.as_str())).collect();
         let mut changed = self.persisted.exclusive_tiling.prune(&live);
         let rules = self.current_rules();
@@ -644,6 +649,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         self.sub_retries = 0; // a line proves the connection works
         let (id, workspace, app) = match ev {
             WindowEvent::WindowClosed { id, app, .. } => {
+                self.known.remove(&id);
                 if self.persisted.exclusive_tiling.floated_on(id, &app).is_some() && self.persisted.exclusive_tiling.remove(id) {
                     self.save_state();
                 }
@@ -651,6 +657,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             }
             WindowEvent::WindowMoved { id, workspace, app, .. } => (id, workspace, app),
         };
+        self.known.insert(id, workspace.clone()); // judged below; later arrivals count it
         let left = self.persisted.exclusive_tiling.floated_on(id, &app).is_some_and(|ws| ws != workspace);
         let rules = self.current_rules();
         let rule = rules.iter().find(|r| r.workspace == workspace).cloned();
@@ -674,6 +681,9 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         if w.workspace != workspace {
             return; // moved on again: its next event decides
         }
+        // V22: a window whose own arrival here is still queued does not count yet.
+        let wins: Vec<WinInfo> = wins.iter().filter(|x| x.id == id || self.known.get(&x.id) == Some(&x.workspace)).cloned().collect();
+        let Some(w) = wins.iter().find(|x| x.id == id) else { return };
         let mut changed = false;
         if left {
             changed = true;
@@ -1122,6 +1132,23 @@ mod tests {
         assert_eq!(floated(&w, "T"), [500, 502]);
         assert_eq!(Persisted::load(&d.path().join("state.json")).exclusive_tiling, w.persisted.exclusive_tiling, "memory saved");
         assert!(w.pending.is_none() && !w.abort.load(Ordering::SeqCst), "events never arm a pass or abort one (V12)");
+    }
+
+    #[test]
+    fn in_a_burst_the_first_arrival_keeps_the_slot() {
+        // B3: both kitties land on T before the daemon handles the first event. The first to
+        // arrive keeps the one slot, even with the higher id (V22).
+        let (mut w, _d) = live(docked(), RULE);
+        w.aero.add_window("1", 520, KITTY, "first", false);
+        w.aero.add_window("1", 510, KITTY, "second", false);
+        w.handle(moved(520, "1", None, KITTY));
+        w.handle(moved(510, "1", None, KITTY));
+        w.aero.move_window(520, "T");
+        w.aero.move_window(510, "T");
+        w.handle(moved(520, "T", Some("1"), KITTY));
+        w.handle(moved(510, "T", Some("1"), KITTY));
+        assert_eq!(w.aero.log, [Cmd::Float { id: 510 }]);
+        assert_eq!(floated(&w, "T"), [510]);
     }
 
     #[test]
