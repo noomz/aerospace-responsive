@@ -133,6 +133,8 @@ pub struct Resolved {
     pub no_match: Vec<String>,
     /// Rules naming only a known-but-absent labelled monitor (06 S4: info).
     pub info: Vec<String>,
+    /// Effective exclusive-tiling rules for this setup, by workspace (V16).
+    pub exclusive_tiling: Vec<crate::tiling::Rule>,
 }
 
 impl Resolved {
@@ -175,6 +177,7 @@ pub fn resolve(cfg: &Config, ds: &[Display], lock: Option<&str>) -> Resolved {
         placement,
         no_match,
         info,
+        exclusive_tiling: crate::tiling::effective(cfg, profile),
     }
 }
 
