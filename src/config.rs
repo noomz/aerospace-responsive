@@ -515,6 +515,15 @@ mod tests {
     }
 
     #[test]
+    fn the_commented_example_block_parses_when_uncommented() {
+        let start = EXAMPLE.find("# [[exclusive-tiling]]").expect("example has the block");
+        let block: String = EXAMPLE[start..].lines().map(|l| format!("{}\n", l.strip_prefix("# ").unwrap_or(l))).collect();
+        let l = parse(&block).unwrap();
+        let r = crate::tiling::effective(&l.config, None);
+        assert_eq!((r.len(), r[0].workspace.as_str(), r[0].tiling_allowlist.len()), (1, "T", 2));
+    }
+
+    #[test]
     fn empty_file_is_a_valid_empty_config() {
         let l = parse("").unwrap();
         assert!(l.config.layout.is_empty() && l.config.placement.is_empty());
