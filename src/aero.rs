@@ -210,22 +210,27 @@ impl Aero for CliAero {
             .spawn()
             .context("cannot spawn `aerospace subscribe` (is it on PATH?)")?;
         let stdout = child.stdout.take().expect("piped");
+        let mut stderr = child.stderr.take().expect("piped");
+        // Drained alongside stdout, so a chatty stderr can never stall the child.
+        let errors = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = stderr.read_to_string(&mut s);
+            s
+        });
         let shared = Arc::new(Mutex::new(Some(child)));
         let reader = shared.clone();
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(l) => sink(SubLine::Line(l)),
-                    Err(_) => break,
-                }
+            let (mut out, mut buf) = (BufReader::new(stdout), Vec::new());
+            // Lossy: one bad byte must not end the reader while the child keeps running.
+            while matches!(out.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
+                sink(SubLine::Line(String::from_utf8_lossy(&buf).trim_end().to_string()));
+                buf.clear();
             }
             // Taken by the Subscription's drop = killed on purpose: report nothing.
             let Some(mut c) = reader.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
-            let mut stderr = String::new();
-            if let Some(mut e) = c.stderr.take() {
-                let _ = e.read_to_string(&mut stderr);
-            }
+            let _ = c.kill(); // no-op once it exited; after a read error it must not outlive us
             let code = c.wait().ok().and_then(|s| s.code());
+            let stderr = errors.join().unwrap_or_default();
             sink(SubLine::Exit { code, stderr: stderr.trim().to_string() });
         });
         Ok(Subscription::new(move || {

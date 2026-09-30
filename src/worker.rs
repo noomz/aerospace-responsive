@@ -158,7 +158,11 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
             };
             match msg {
-                Ok(m) => self.handle(m),
+                // A steady stream of window events must not postpone a due pass or retry.
+                Ok(m) => {
+                    self.handle(m);
+                    self.tick(Instant::now());
+                }
                 Err(RecvTimeoutError::Timeout) => self.tick(Instant::now()),
                 Err(RecvTimeoutError::Disconnected) => return,
             }
