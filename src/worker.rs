@@ -577,28 +577,88 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let mem = &self.persisted.exclusive_tiling;
         let left: Vec<&WinInfo> = wins.iter().filter(|w| mem.floated_on(w.id, &w.app).is_some_and(|ws| ws != w.workspace)).collect();
         for w in left {
-            changed |= self.apply_leave(w, &wins, &rules);
+            self.apply_leave(w, &wins, &rules);
+            changed = true;
         }
         if changed {
             self.save_state();
         }
     }
 
-    /// V5, V6: a rule-floated window is now on `w.workspace`. True when memory changed.
-    fn apply_leave(&mut self, w: &WinInfo, wins: &[WinInfo], rules: &[Rule]) -> bool {
-        match tiling::leave(w, rules.iter().find(|r| r.workspace == w.workspace), wins) {
-            Leave::Drop => self.persisted.exclusive_tiling.remove(w.id),
-            Leave::Retile => self.exec(&Cmd::Tile { id: w.id }, "left its exclusive workspace") && self.persisted.exclusive_tiling.remove(w.id),
+    /// V5, V6: a rule-floated window is now on `w.workspace`; memory follows the decision.
+    fn apply_leave(&mut self, w: &WinInfo, wins: &[WinInfo], rules: &[Rule]) -> Leave {
+        let decision = tiling::leave(w, rules.iter().find(|r| r.workspace == w.workspace), wins);
+        match &decision {
+            Leave::Drop => {
+                self.persisted.exclusive_tiling.remove(w.id);
+            }
+            Leave::Retile => {
+                if self.exec(&Cmd::Tile { id: w.id }, &format!("left for {}", w.workspace)) {
+                    self.persisted.exclusive_tiling.remove(w.id);
+                }
+            }
             Leave::StayFloated(why) => {
                 crate::log!("exclusive tiling: window {} stays floating on {}: {why}", w.id, w.workspace);
                 self.persisted.exclusive_tiling.insert(&w.workspace, w.id, &w.app);
-                true
             }
         }
+        decision
     }
 
-    fn window_event(&mut self, _ev: WindowEvent) {
+    /// V12, V18: `window-moved` = arrival on `workspace`, plus a leave when the window is
+    /// rule-floated elsewhere; `window-closed` prunes memory eagerly (V9).
+    fn window_event(&mut self, ev: WindowEvent) {
         self.sub_retries = 0; // a line proves the connection works
+        let (id, workspace, app) = match ev {
+            WindowEvent::WindowClosed { id, app, .. } => {
+                if self.persisted.exclusive_tiling.floated_on(id, &app).is_some() && self.persisted.exclusive_tiling.remove(id) {
+                    self.save_state();
+                }
+                return;
+            }
+            WindowEvent::WindowMoved { id, workspace, app, .. } => (id, workspace, app),
+        };
+        let left = self.persisted.exclusive_tiling.floated_on(id, &app).is_some_and(|ws| ws != workspace);
+        let rules = self.current_rules();
+        let rule = rules.iter().find(|r| r.workspace == workspace).cloned();
+        if rule.is_none() && !left {
+            return; // no rule here, nothing of ours leaving: no read
+        }
+        self.decide_moved(id, &workspace, rule.as_ref(), left, &rules);
+    }
+
+    fn decide_moved(&mut self, id: u32, workspace: &str, rule: Option<&Rule>, left: bool, rules: &[Rule]) {
+        let wins = match self.aero.window_details() {
+            Ok(w) => w,
+            Err(e) => return crate::log!("exclusive tiling: window read failed, window {id} not decided: {e:#}"),
+        };
+        let Some(w) = wins.iter().find(|w| w.id == id) else {
+            if self.persisted.exclusive_tiling.remove(id) {
+                self.save_state();
+            }
+            return; // closed meanwhile
+        };
+        if w.workspace != workspace {
+            return; // moved on again: its next event decides
+        }
+        let mut changed = false;
+        if left {
+            changed = true;
+            if self.apply_leave(w, &wins, rules) != Leave::Drop {
+                return self.save_state();
+            }
+        }
+        // The arrival: only a window arriving tiled is the rule's business (V1, V2).
+        if let Some(rule) = rule
+            && let tiling::Arrival::Float(why) = tiling::arrival(rule, w, &wins)
+            && self.exec(&Cmd::Float { id }, &format!("arrived on {workspace}: {why}"))
+        {
+            self.persisted.exclusive_tiling.insert(workspace, id, &w.app);
+            changed = true;
+        }
+        if changed {
+            self.save_state();
+        }
     }
 
     /// Effective rules against the last gated display set (V12), or a fresh read before the
@@ -946,6 +1006,92 @@ mod tests {
         let (mut w, _d) = worker_cfg(fake, RULE, None);
         w.handle(Msg::Trigger(Trigger::Startup));
         assert!(ask(&mut w, Request::Status).text.contains("aerospace subscribe could not start"));
+    }
+
+    const KITTY: &str = "net.kovidgoyal.kitty";
+    /// Rules on T and C, both kitty-only with one slot.
+    const RULE_TC: &str = "\n[[exclusive-tiling]]\nworkspaces = [\"T\", \"C\"]\ntiling-allowlist = [{ app = \"net.kovidgoyal.kitty\", max-tiled = 1 }]\n";
+
+    fn moved(id: u32, ws: &str, prev: Option<&str>, app: &str) -> Msg {
+        Msg::Window(WindowEvent::WindowMoved { id, workspace: ws.into(), prev_workspace: prev.map(Into::into), app: app.into() })
+    }
+
+    /// A live worker (child running) on `extra`, the fake as given.
+    fn live(fake: FakeAero, extra: &str) -> (TestWorker, tempfile::TempDir) {
+        let (mut w, d) = worker_cfg(fake, extra, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.pending = None; // the startup pass is not under test here
+        (w, d)
+    }
+
+    fn floated(w: &TestWorker, ws: &str) -> Vec<u32> {
+        w.persisted.exclusive_tiling.rule_floated.get(ws).map_or(vec![], |s| s.iter().map(|f| f.window_id).collect())
+    }
+
+    #[test]
+    fn arrivals_float_what_the_rule_does_not_admit() {
+        let (mut w, d) = live(docked(), RULE);
+        // One at a time, as windows open: the limit counts what is tiled at each arrival (V3).
+        for (id, app, floating) in [(500, "com.apple.Safari", false), (501, KITTY, false), (502, KITTY, false), (503, "com.apple.Preview", true)] {
+            w.aero.add_window("T", id, app, "", floating);
+            w.handle(moved(id, "T", None, app));
+        }
+        assert_eq!(w.aero.log, [Cmd::Float { id: 500 }, Cmd::Float { id: 502 }], "Safari not allowlisted; second kitty over the limit");
+        assert_eq!(floated(&w, "T"), [500, 502]);
+        assert_eq!(Persisted::load(&d.path().join("state.json")).exclusive_tiling, w.persisted.exclusive_tiling, "memory saved");
+        assert!(w.pending.is_none() && !w.abort.load(Ordering::SeqCst), "events never arm a pass or abort one (V12)");
+    }
+
+    #[test]
+    fn a_workspace_without_a_rule_is_left_alone() {
+        let mut fake = docked();
+        fake.add_window("1", 500, "com.apple.Safari", "", false);
+        let (mut w, _d) = live(fake, RULE);
+        w.handle(moved(500, "1", Some("2"), "com.apple.Safari"));
+        assert!(w.aero.log.is_empty());
+    }
+
+    #[test]
+    fn leave_retiles_unless_the_destination_would_float_it_too() {
+        let mut fake = docked();
+        fake.add_window("1", 600, "com.apple.Safari", "", true);
+        fake.add_window("C", 601, "com.apple.Preview", "", true);
+        fake.add_window("C", 602, KITTY, "", true);
+        fake.add_window("C", 603, KITTY, "vim", false);
+        let (mut w, _d) = live(fake, RULE_TC);
+        for (id, app) in [(600, "com.apple.Safari"), (601, "com.apple.Preview"), (602, KITTY)] {
+            w.persisted.exclusive_tiling.insert("T", id, app);
+        }
+        w.handle(moved(600, "1", Some("T"), "com.apple.Safari"));
+        w.handle(moved(601, "C", Some("T"), "com.apple.Preview"));
+        w.handle(moved(602, "C", Some("T"), KITTY));
+        assert_eq!(w.aero.log, [Cmd::Tile { id: 600 }], "no rule on 1: re-tile");
+        assert_eq!(floated(&w, "C"), [601, 602], "C floats Preview (not allowlisted) and kitty (603 holds the slot)");
+        assert!(floated(&w, "T").is_empty());
+    }
+
+    #[test]
+    fn a_rule_floated_window_you_tiled_is_forgotten_then_judged_as_an_arrival() {
+        let mut fake = docked();
+        fake.add_window("C", 700, "com.apple.Safari", "", false); // you tiled it on T, then moved it
+        let (mut w, _d) = live(fake, RULE_TC);
+        w.persisted.exclusive_tiling.insert("T", 700, "com.apple.Safari");
+        w.handle(moved(700, "C", Some("T"), "com.apple.Safari"));
+        assert_eq!(w.aero.log, [Cmd::Float { id: 700 }], "V6 drop, then V18 arrival on C");
+        assert_eq!(floated(&w, "C"), [700]);
+    }
+
+    #[test]
+    fn close_prunes_memory_eagerly() {
+        let mut fake = docked();
+        fake.add_window("T", 800, "com.apple.Safari", "", false);
+        let (mut w, d) = live(fake, RULE);
+        w.handle(moved(800, "T", None, "com.apple.Safari"));
+        assert_eq!(floated(&w, "T"), [800]);
+        w.aero.close_window(800);
+        w.handle(Msg::Window(WindowEvent::WindowClosed { id: 800, workspace: "T".into(), app: "com.apple.Safari".into() }));
+        assert!(w.persisted.exclusive_tiling.rule_floated.is_empty());
+        assert!(Persisted::load(&d.path().join("state.json")).exclusive_tiling.rule_floated.is_empty());
     }
 
     #[test]
