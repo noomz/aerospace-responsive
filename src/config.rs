@@ -515,6 +515,15 @@ mod tests {
     }
 
     #[test]
+    fn the_readme_exclusive_tiling_example_parses() {
+        let readme = include_str!("../README.md");
+        let section = &readme[readme.find("### Exclusive tiling").expect("README section")..];
+        let block = section.split("```toml\n").nth(1).and_then(|b| b.split("```").next()).expect("toml block");
+        let r = crate::tiling::effective(&parse(block).unwrap().config, None);
+        assert_eq!((r[0].workspace.as_str(), r[0].tiling_allowlist.len()), ("T", 2));
+    }
+
+    #[test]
     fn the_commented_example_block_parses_when_uncommented() {
         let start = EXAMPLE.find("# [[exclusive-tiling]]").expect("example has the block");
         let block: String = EXAMPLE[start..].lines().map(|l| format!("{}\n", l.strip_prefix("# ").unwrap_or(l))).collect();

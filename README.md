@@ -65,17 +65,66 @@ fewer matches make the rule unsatisfiable (`explain` says `nth is 2, only 1 matc
 
 ### Exclusive tiling
 
-`[[exclusive-tiling]]` names workspaces where only windows on a **tiling allowlist** tile — e.g.
-kitty the only tiled app on `T`. A window arriving tiled that no entry admits, or whose entry's
-`max-tiled` is full, is floated; a window arriving floating is never touched, and the rule only
-ever undoes its own floats (when that window leaves for a workspace where it may tile). Entries
-match an exact bundle id plus an optional title regex; the first match governs. The rule acts on
-arrivals only: on the first run and when a rule changes (including a profile switch) it
-**converges** the workspace once — every window judged as an arrival, the lowest window id keeping
-a limited slot — and never again on a plain restart. It needs no `aerospace.toml` change. Moves are
-watched through `aerospace subscribe window-moved window-closed`, a child the daemon runs only while
-a rule exists — events, not polling. `reconcile --dry-run` shows a pending converge and its
-commands; `daemon --observe` logs the rule's would-be commands too.
+On the workspaces a rule names, only windows its **tiling allowlist** admits may tile — e.g. kitty
+the only tiled app on `T`. Needs the fork events (see Requirements); no `aerospace.toml` change.
+
+```toml
+[[exclusive-tiling]]
+workspaces = ["T"]
+else-action = "float"            # optional; the default and only value
+tiling-allowlist = [
+  { app = "net.kovidgoyal.kitty", title = "Settings", max-tiled = 0 },  # kitty's settings never tile
+  { app = "net.kovidgoyal.kitty", max-tiled = 1 },                      # one other kitty may tile
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `workspaces` | Workspaces the rule applies to (non-empty) |
+| `else-action` | What happens to a window the allowlist does not admit: `"float"` (default; the only value) |
+| `tiling-allowlist` | Ordered entries; a window is governed by the **first** entry it matches. `[]` = nothing tiles |
+| `app` | Exact bundle id (required). Find one with `aerospace list-apps --format '%{app-bundle-id} %{app-name}'` |
+| `title` | Optional regex on the window title, case-insensitive and unanchored (as AeroSpace's `window-title-regex-substring`) |
+| `max-tiled` | Optional tile limit for the entry: absent = unlimited, `0` = matches but never tiles |
+
+What the rule does:
+
+- It acts on **arrivals**: a window that lands on the workspace **tiled** (opened there, moved by keyboard,
+  mouse or a callback) and is not admitted, or whose entry's `max-tiled` is full, is floated. A window
+  arriving floating (dialogs, sticky windows, your floats, `on-window-detected` floats) is never touched.
+- The limit counts the entry's windows tiled there now, whoever tiled them. When two windows arrive
+  together, the first to arrive keeps the slot. A freed slot does not re-tile anything.
+- It never fights you: tile or float a window yourself and it stays that way. It only undoes its own
+  floats — a window it floated re-tiles when it leaves for a workspace where it may tile.
+- On the first run, and whenever a workspace's rule changes (including by a profile switch), it
+  **converges** that workspace once: every window judged as an arrival, the lowest window id keeping a
+  limited slot. Removing a rule re-tiles the windows it floated. A plain restart converges nothing.
+- Blocks cascade per workspace and per field, last block wins: top-level `[[exclusive-tiling]]` in file
+  order, then the active profile's `[[profile.exclusive-tiling]]`. `tiling-allowlist` is replaced
+  whole, never merged. Every workspace with a rule needs a `tiling-allowlist` (top-level alone and under
+  each profile); a bad regex, an unknown `else-action` or a negative `max-tiled` is a load error.
+- Moves are watched through `aerospace subscribe window-moved window-closed`, a child the daemon runs
+  only while a rule exists — events, not polling. On stock AeroSpace the child exits, the rule does
+  nothing, and `status` warns (exit 4) with the reason.
+
+`status` gets one line (`exclusive tiling: live; rule-floated T:2`, or `inert` / `observe`). `explain`
+shows each rule, where every field came from, and a verdict for every window on the workspace:
+
+```
+exclusive-tiling:
+  T    else-action float        [default]
+       tiling-allowlist         [top-level #1]
+         1 net.kovidgoyal.kitty  title~"Settings"  max-tiled 0
+         2 net.kovidgoyal.kitty                    max-tiled 1  (1/1 tiled)
+       converge: up to date
+       windows:
+         4211   kitty    "noomz: ~"     tiled     entry 2 (1/1)
+         4380   kitty    "noomz: htop"  floating  rule-floated: entry 2 full
+         5120   Preview  "x.pdf"        floating  yours (rule ignores)
+```
+
+`reconcile --dry-run` lists a pending converge and its `layout floating|tiling --window-id` commands;
+`daemon --observe` logs the rule's would-be commands without running them.
 
 ## Rollback
 
