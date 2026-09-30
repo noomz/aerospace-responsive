@@ -851,6 +851,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             observe: self.observe,
             exclusive_tiling: self.config.has_exclusive_tiling().then(|| TilingStatus {
                 state: self.tiling_state().into(),
+                inert: self.sub.is_none().then(|| self.inert.clone().unwrap_or_else(|| "not subscribed to window events".into())),
                 rule_floated: self.persisted.exclusive_tiling.counts(),
             }),
         };

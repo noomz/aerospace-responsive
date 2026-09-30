@@ -41,11 +41,22 @@ pub struct StatusView {
 }
 
 /// `status`'s exclusive-tiling line, from memory (no window read).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct TilingStatus {
     /// `live` | `inert` | `observe`.
     pub state: String,
+    /// Why, while inert (`aerospace subscribe exited 2`); the warning carries the detail.
+    pub inert: Option<String>,
     pub rule_floated: BTreeMap<String, usize>,
+}
+
+impl TilingStatus {
+    /// `exclusive tiling: live; rule-floated T:2`.
+    pub fn line(&self) -> String {
+        let counts: Vec<String> = self.rule_floated.iter().map(|(ws, n)| format!("{ws}:{n}")).collect();
+        let floated = if counts.is_empty() { "none".to_string() } else { counts.join(" ") };
+        format!("exclusive tiling: {}; rule-floated {floated}", self.state)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -245,9 +256,7 @@ pub fn status(v: &StatusView) -> String {
         None => o.push_str("last pass: none yet\n"),
     }
     if let Some(t) = &v.exclusive_tiling {
-        let counts: Vec<String> = t.rule_floated.iter().map(|(ws, n)| format!("{ws}:{n}")).collect();
-        let floated = if counts.is_empty() { "none".to_string() } else { counts.join(" ") };
-        let _ = writeln!(o, "exclusive tiling: {}; rule-floated {floated}", t.state);
+        let _ = writeln!(o, "{}", t.line());
     }
     if v.pins.is_empty() {
         o.push_str("pins: none\n");
@@ -374,7 +383,7 @@ exclusive-tiling:
         assert!(text.contains("[pass] state still differs"));
         assert!(text.contains("pins: none"));
         assert!(!text.contains("exclusive tiling"), "omitted when no rule is configured");
-        let t = TilingStatus { state: "live".into(), rule_floated: BTreeMap::from([("T".to_string(), 2)]) };
+        let t = TilingStatus { state: "live".into(), inert: None, rule_floated: BTreeMap::from([("T".to_string(), 2)]) };
         let text = status(&StatusView { exclusive_tiling: Some(t), ..v });
         assert!(text.contains("exclusive tiling: live; rule-floated T:2\n"), "{text}");
     }
