@@ -229,7 +229,8 @@ impl Aero for FakeAero {
             let tiled = if w.root == Axis::H { "h_tiles" } else { "v_tiles" };
             for x in &w.windows {
                 let layout = if x.floating { "floating" } else { tiled };
-                out.push(WinInfo { id: x.id, workspace: w.name.clone(), app: x.app.clone(), title: x.title.clone(), layout: layout.into() });
+                let app_name = x.app.rsplit('.').next().unwrap_or_default().to_string();
+                out.push(WinInfo { id: x.id, workspace: w.name.clone(), app: x.app.clone(), app_name, title: x.title.clone(), layout: layout.into() });
             }
         }
         Ok(out)

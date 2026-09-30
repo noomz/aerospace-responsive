@@ -6,7 +6,7 @@ use crate::config::{self, Config};
 use crate::display::{Display, Screen};
 use crate::ipc::{Request, Response};
 use crate::pass::{self, PassReport};
-use crate::render::{self, LastPass, MonitorView, PinView, StatusView};
+use crate::render::{self, LastPass, MonitorView, PinView, StatusView, TilingStatus};
 use crate::restore::{self, RestoreCtx};
 use crate::rules::{self, ProfileMode, Resolved};
 use crate::state::{self, Class, Persisted, Pin, TilingMemory, Warnings};
@@ -103,6 +103,11 @@ fn reply_all(waiters: Vec<Sender<Response>>, r: Response) {
 
 fn fmt_err(e: anyhow::Error) -> String {
     format!("{e:#}")
+}
+
+/// (workspace, why it converges) for the dry-run block.
+fn reasons(plans: &[Plan]) -> Vec<(String, String)> {
+    plans.iter().map(|p| (p.workspace.clone(), p.describe())).collect()
 }
 
 impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
@@ -401,7 +406,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 for plan in &plans {
                     tiling::commit(&mut self.persisted.exclusive_tiling, plan);
                 }
-                render::dry_run(r, &cmds)
+                render::dry_run(r, &cmds, &reasons(&plans))
             }
             Err(e) => format!("observe: {e:#}\n"),
         };
@@ -768,11 +773,34 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         world::focused(&rows).map(|r| r.workspace.clone()).ok_or_else(|| "no focused workspace".to_string())
     }
 
+    /// `live` | `inert` | `observe` (I.cli.status).
+    fn tiling_state(&self) -> &'static str {
+        match (&self.sub, self.observe) {
+            (None, _) => "inert",
+            (Some(_), true) => "observe",
+            (Some(_), false) => "live",
+        }
+    }
+
     fn explain(&mut self, path: Option<PathBuf>) -> Result<Response, String> {
         let cfg = self.candidate(path)?;
         let ds = self.world()?;
         let r = rules::resolve(&cfg, &ds, self.persisted.lock.as_deref());
-        Ok(Response::ok(render::explain(&r), json!(r)))
+        let mut text = render::explain(&r);
+        let mut j = json!(r);
+        if !r.exclusive_tiling.is_empty() || !self.persisted.exclusive_tiling.records.is_empty() {
+            let wins = self.aero.window_details().ok(); // one read, answered between passes
+            let views = tiling::view(&r.exclusive_tiling, &self.persisted.exclusive_tiling, wins.as_deref());
+            let state = self.tiling_state();
+            let note = match state {
+                "inert" => Some(format!("inert: {}", self.inert.as_deref().unwrap_or("not subscribed to window events"))),
+                "observe" => Some("observe".to_string()),
+                _ => None,
+            };
+            text.push_str(&render::exclusive_tiling(&views, note.as_deref()));
+            j["exclusive_tiling"] = json!({ "state": state, "inert": self.inert, "workspaces": views });
+        }
+        Ok(Response::ok(text, j))
     }
 
     fn dry_run(&mut self, path: Option<PathBuf>) -> Result<Response, String> {
@@ -780,9 +808,13 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let ds = self.world()?;
         let s = self.aero.windows().map_err(fmt_err)?;
         let r = rules::resolve(&cfg, &ds, self.persisted.lock.as_deref());
-        let cmds = pass::dry_run(&r, &s, &ds, &self.persisted.pinned_names(), &[]);
+        // What the pass would do: an inert rule converges nothing (C3).
+        let plans = if self.sub.is_some() { self.converge_plans(&r.exclusive_tiling) } else { vec![] };
+        let cmds = pass::dry_run(&r, &s, &ds, &self.persisted.pinned_names(), &plans);
         let lines: Vec<String> = cmds.iter().map(|c| c.to_string()).collect();
-        Ok(Response::ok(render::dry_run(&r, &cmds), json!({ "placement": r.placement, "commands": lines })))
+        let converge: Vec<Value> = reasons(&plans).into_iter().map(|(ws, why)| json!({ "workspace": ws, "reason": why })).collect();
+        let text = render::dry_run(&r, &cmds, &reasons(&plans));
+        Ok(Response::ok(text, json!({ "placement": r.placement, "converge": converge, "commands": lines })))
     }
 
     fn monitors(&mut self) -> Result<Response, String> {
@@ -817,6 +849,10 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             warnings: self.warnings.list(),
             aerospace_running: self.aero_up,
             observe: self.observe,
+            exclusive_tiling: self.config.has_exclusive_tiling().then(|| TilingStatus {
+                state: self.tiling_state().into(),
+                rule_floated: self.persisted.exclusive_tiling.counts(),
+            }),
         };
         let mut resp = Response::ok(render::status(&view), json!(view));
         if !self.warnings.is_empty() {
@@ -1187,6 +1223,36 @@ mod tests {
         let disk = Persisted::load(&d.path().join("state.json"));
         assert_eq!(disk.exclusive_tiling, st.exclusive_tiling);
         assert_eq!(disk.pins.len(), 1);
+    }
+
+    #[test]
+    fn surfaces_show_the_rule_live_and_inert() {
+        let mut fake = docked();
+        fake.add_window("T", 400, KITTY, "noomz: ~", false);
+        let (mut w, _d) = live(fake, RULE);
+        let dry = ask(&mut w, Request::Reconcile { dry_run: true, config: None });
+        assert!(dry.text.contains("exclusive-tiling converge:\n  T    first run\n"), "{}", dry.text);
+        assert!(dry.text.contains("aerospace layout floating --window-id 105"), "{}", dry.text);
+        assert_eq!(dry.json["converge"][0]["reason"], "first run");
+        assert!(w.aero.log.is_empty(), "dry-run executes nothing");
+
+        let ex = ask(&mut w, Request::Explain { config: None });
+        assert!(ex.text.contains("exclusive-tiling:\n  T "), "{}", ex.text);
+        assert!(ex.text.contains("converge: pending: first run"), "{}", ex.text);
+        assert!(ex.text.contains("tiled by you, not allowlisted"), "{}", ex.text);
+        assert_eq!(ex.json["exclusive_tiling"]["state"], "live");
+        assert_eq!(ex.json["exclusive_tiling"]["workspaces"][0]["workspace"], "T");
+
+        let st = ask(&mut w, Request::Status);
+        assert!(st.text.contains("exclusive tiling: live; rule-floated none"), "{}", st.text);
+        assert_eq!(st.json["exclusive_tiling"]["state"], "live");
+
+        exit(&mut w, 2);
+        let ex = ask(&mut w, Request::Explain { config: None });
+        assert!(ex.text.contains("exclusive-tiling: (inert: aerospace subscribe exited 2)"), "{}", ex.text);
+        assert!(ask(&mut w, Request::Status).text.contains("exclusive tiling: inert;"));
+        let dry = ask(&mut w, Request::Reconcile { dry_run: true, config: None });
+        assert!(!dry.text.contains("--window-id"), "an inert rule converges nothing: {}", dry.text);
     }
 
     #[test]

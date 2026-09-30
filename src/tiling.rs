@@ -186,6 +186,13 @@ pub struct Plan {
     pub record_after: Option<RuleRecord>,
 }
 
+impl Plan {
+    /// `rule changed: tiling-allowlist (profile desk3 #1)`, `first run`, `rule removed, re-tiles 2`.
+    pub fn describe(&self) -> String {
+        self.reason.describe(self.steps.len())
+    }
+}
+
 /// Every workspace with a rule or a record whose converge is pending, in name order.
 pub fn plan_converge(rules: &[Rule], mem: &TilingMemory, windows: &[WinInfo]) -> Vec<Plan> {
     let names: BTreeSet<&String> = rules.iter().map(|r| &r.workspace).chain(mem.records.keys()).collect();
@@ -256,6 +263,122 @@ pub fn commit(mem: &mut TilingMemory, plan: &Plan) {
         Some(r) => mem.records.insert(plan.workspace.clone(), r.clone()),
         None => mem.records.remove(&plan.workspace),
     };
+}
+
+impl Reason {
+    /// `re_tiles` = the removal's re-tile count.
+    pub fn describe(&self, re_tiles: usize) -> String {
+        match self {
+            Reason::FirstRun => "first run".into(),
+            Reason::Changed { fields } => format!("rule changed: {}", fields.join(", ")),
+            Reason::Removed => format!("rule removed, re-tiles {re_tiles}"),
+        }
+    }
+}
+
+/// One allowlist entry with how many of its windows tile on the workspace now.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryView {
+    #[serde(flatten)]
+    pub entry: Entry,
+    /// `None` without a window read.
+    pub tiled: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WindowView {
+    pub id: u32,
+    pub app: String,
+    pub app_name: String,
+    pub title: String,
+    pub layout: String,
+    pub verdict: String,
+}
+
+/// `explain`'s view of one ruled workspace (I.cli.explain).
+#[derive(Debug, Clone, Serialize)]
+pub struct WsView {
+    pub workspace: String,
+    /// `None` = the rule was removed and its record still waits for the converge.
+    pub rule: Option<Rule>,
+    pub entries: Vec<EntryView>,
+    /// `up to date` | `pending: <reason>`.
+    pub converge: String,
+    /// `None` without a window read.
+    pub windows: Option<Vec<WindowView>>,
+}
+
+/// Each window's verdict, from the closed set: `entry N (k/limit)`; `rule-floated: <why>`;
+/// `yours (rule ignores)`; `tiled by you, not allowlisted | over entry N limit`.
+fn verdict(rule: Option<&Rule>, w: &WinInfo, here: &[&WinInfo], wins: &[WinInfo], mem: &TilingMemory) -> String {
+    let ours = mem.floated_on(w.id, &w.app) == Some(w.workspace.as_str());
+    let Some(rule) = rule else {
+        return if ours { "rule-floated: rule removed, re-tiles".into() } else { "yours (rule ignores)".into() };
+    };
+    if w.tiled() {
+        let Some(i) = first_match(rule, w) else { return "tiled by you, not allowlisted".into() };
+        let mut of_entry: Vec<u32> = here.iter().filter(|x| x.tiled() && first_match(rule, x) == Some(i)).map(|x| x.id).collect();
+        of_entry.sort_unstable();
+        let rank = of_entry.iter().position(|id| *id == w.id).unwrap_or(0);
+        return match rule.tiling_allowlist[i].max_tiled {
+            Some(n) if rank >= n as usize => format!("over entry {} limit", i + 1),
+            Some(n) => format!("entry {} ({}/{n})", i + 1, of_entry.len().min(n as usize)),
+            None => format!("entry {} ({}/∞)", i + 1, of_entry.len()),
+        };
+    }
+    if !ours {
+        return "yours (rule ignores)".into();
+    }
+    match admit(rule, w, wins) {
+        Err(why) => format!("rule-floated: {why}"),
+        Ok(i) => format!("rule-floated: entry {} (no promotion)", i + 1),
+    }
+}
+
+/// `explain`'s exclusive-tiling section: every workspace with a rule or a record.
+pub fn view(rules: &[Rule], mem: &TilingMemory, wins: Option<&[WinInfo]>) -> Vec<WsView> {
+    let names: BTreeSet<&String> = rules.iter().map(|r| &r.workspace).chain(mem.records.keys()).collect();
+    let plans = wins.map(|w| plan_converge(rules, mem, w)).unwrap_or_default();
+    names
+        .into_iter()
+        .map(|ws| {
+            let rule = rules.iter().find(|r| &r.workspace == ws);
+            let here: Vec<&WinInfo> = wins.unwrap_or_default().iter().filter(|w| &w.workspace == ws).collect();
+            let entries = rule.map_or(vec![], |r| {
+                r.tiling_allowlist
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| EntryView { entry: e.clone(), tiled: wins.map(|all| tiled_in(r, i, all, u32::MAX)) })
+                    .collect()
+            });
+            let converge = match pending(rule, mem.records.get(ws)) {
+                None => "up to date".to_string(),
+                Some(reason) => {
+                    let re_tiles = match plans.iter().find(|p| &p.workspace == ws) {
+                        Some(p) => p.steps.len(),
+                        None => mem.rule_floated.get(ws).map_or(0, |s| s.len()),
+                    };
+                    format!("pending: {}", reason.describe(re_tiles))
+                }
+            };
+            let windows = wins.map(|all| {
+                let mut v: Vec<WindowView> = here
+                    .iter()
+                    .map(|w| WindowView {
+                        id: w.id,
+                        app: w.app.clone(),
+                        app_name: w.app_name.clone(),
+                        title: w.title.clone(),
+                        layout: w.layout.clone(),
+                        verdict: verdict(rule, w, &here, all, mem),
+                    })
+                    .collect();
+                v.sort_by_key(|w| w.id);
+                v
+            });
+            WsView { workspace: ws.clone(), rule: rule.cloned(), entries, converge, windows }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -335,7 +458,8 @@ tiling-allowlist = [
     }
 
     fn win(id: u32, ws: &str, app: &str, title: &str, layout: &str) -> WinInfo {
-        WinInfo { id, workspace: ws.into(), app: app.into(), title: title.into(), layout: layout.into() }
+        let app_name = app.rsplit('.').next().unwrap().to_string();
+        WinInfo { id, workspace: ws.into(), app: app.into(), app_name, title: title.into(), layout: layout.into() }
     }
 
     #[test]
@@ -464,5 +588,56 @@ tiling-allowlist = [
         assert_eq!(mem.floated_on(1, "a"), Some("T"));
         note(&mut mem, "T", &Cmd::Tile { id: 1 }, "a");
         assert!(mem.rule_floated.is_empty());
+    }
+
+    #[test]
+    fn view_gives_every_window_a_verdict_from_the_closed_set() {
+        let r = kitty_rule();
+        let mut mem = TilingMemory::default();
+        mem.records.insert("T".into(), RuleRecord::of(&r));
+        mem.insert("T", 4380, KITTY);
+        mem.insert("T", 5012, "com.apple.Safari");
+        mem.insert("T", 5300, KITTY);
+        let wins = [
+            win(4211, "T", KITTY, "noomz: ~", "h_tiles"),
+            win(4380, "T", KITTY, "noomz: htop", "floating"),
+            win(5012, "T", "com.apple.Safari", "GitHub", "floating"),
+            win(5120, "T", "com.apple.Preview", "x.pdf", "floating"),
+            win(5230, "T", "com.apple.Finder", "Downloads", "h_tiles"),
+            win(5240, "T", KITTY, "vim", "h_tiles"),
+            win(5300, "T", KITTY, "kitty settings", "floating"),
+        ];
+        let v = view(std::slice::from_ref(&r), &mem, Some(&wins));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].converge, "up to date");
+        let verdicts: Vec<(u32, &str)> = v[0].windows.as_ref().unwrap().iter().map(|w| (w.id, w.verdict.as_str())).collect();
+        assert_eq!(
+            verdicts,
+            [
+                (4211, "entry 2 (1/1)"),
+                (4380, "rule-floated: entry 2 full"),
+                (5012, "rule-floated: not allowlisted"),
+                (5120, "yours (rule ignores)"),
+                (5230, "tiled by you, not allowlisted"),
+                (5240, "over entry 2 limit"),
+                (5300, "rule-floated: entry 1 carve-out"),
+            ]
+        );
+        assert_eq!(v[0].entries[1].tiled, Some(2), "counts whoever tiled them");
+    }
+
+    #[test]
+    fn view_converge_line_names_the_pending_reason() {
+        let r = kitty_rule();
+        let first = view(std::slice::from_ref(&r), &TilingMemory::default(), None);
+        assert_eq!(first[0].converge, "pending: first run");
+        let mut mem = TilingMemory::default();
+        let old = Rule { tiling_allowlist: vec![], ..r.clone() };
+        mem.records.insert("T".into(), RuleRecord::of(&old));
+        assert_eq!(view(std::slice::from_ref(&r), &mem, None)[0].converge, "pending: rule changed: tiling-allowlist (top-level #1)");
+        mem.insert("T", 1, "a");
+        let removed = view(&[], &mem, Some(&[win(1, "T", "a", "", "floating")]));
+        assert_eq!(removed[0].converge, "pending: rule removed, re-tiles 1");
+        assert!(removed[0].rule.is_none());
     }
 }
