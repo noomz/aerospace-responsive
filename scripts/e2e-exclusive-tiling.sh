@@ -87,8 +87,11 @@ aerospace subscribe --all >"$EVENTS" 2>&1 &
 SUB_PID=$!
 sleep 1
 kill -0 "$SUB_PID" 2>/dev/null || { say "aerospace subscribe exited: $(cat "$EVENTS")"; say "needs AeroSpace with window-moved/window-closed"; exit 2; }
-aerospace-responsive status | grep -q '^exclusive tiling: live' || { say "the daemon's exclusive tiling is not live:"; aerospace-responsive status; exit 2; }
-aerospace-responsive explain | grep -q "$TEXTEDIT" || { say "no exclusive-tiling rule for $TEXTEDIT; add the block from this script's header"; exit 2; }
+# status exits 4 while any warning is pending, so read its text rather than piping it (pipefail).
+status=$(aerospace-responsive status || true)
+grep -q '^exclusive tiling: live' <<<"$status" || { say "the daemon's exclusive tiling is not live:"; say "$status"; exit 2; }
+explain=$(aerospace-responsive explain || true)
+grep -q "$TEXTEDIT" <<<"$explain" || { say "no exclusive-tiling rule for $TEXTEDIT; add the block from this script's header"; exit 2; }
 HOME_WS=$(aerospace list-workspaces --focused)
 [[ "$HOME_WS" != "$WS" ]] || { say "focus a workspace other than $WS first"; exit 2; }
 pass "subscribe child alive, daemon live, rule present; logging events to $EVENTS"
