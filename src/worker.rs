@@ -275,7 +275,13 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 _ => crate::log!("restore: could not capture visibility; no restore for this disturbance"),
             }
         }
-        match pass::run_pass(&mut self.aero, &r, &ds, &pinned, &self.abort) {
+        let before = self.persisted.exclusive_tiling.clone();
+        let tiling = self.sub.is_some().then_some(&mut self.persisted.exclusive_tiling); // inert: no converge (C3)
+        let result = pass::run_pass(&mut self.aero, &r, &ds, &pinned, &self.abort, tiling);
+        if self.persisted.exclusive_tiling != before {
+            self.save_state(); // also after an error: memory follows each executed command
+        }
+        match result {
             Ok(rep) => self.after_pass(rep, p),
             Err(e) => {
                 // The pass may have moved workspaces before dying, so the layout phase and the
@@ -314,6 +320,9 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             let repass = rep.empty_snapshot;
             self.pending = Some(Pending { due: Instant::now() + self.debounce, repass, ..p });
             return;
+        }
+        for ws in &rep.converged {
+            crate::log!("exclusive tiling: {ws} converged");
         }
         let cleared = self.persisted.drop_empty(&rep.nonempty);
         if !cleared.is_empty() {
@@ -377,7 +386,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     fn observe_pass(&mut self, r: &Resolved, ds: &[Display], pinned: &BTreeSet<String>, p: Pending) {
         let text = match self.aero.windows() {
             Ok(s) => {
-                let cmds = pass::dry_run(r, &s, ds, pinned);
+                let cmds = pass::dry_run(r, &s, ds, pinned, &[]);
                 crate::log!("observe: would run {} command(s)", cmds.len());
                 for c in &cmds {
                     crate::log!("  would run: {c}");
@@ -742,7 +751,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let ds = self.world()?;
         let s = self.aero.windows().map_err(fmt_err)?;
         let r = rules::resolve(&cfg, &ds, self.persisted.lock.as_deref());
-        let cmds = pass::dry_run(&r, &s, &ds, &self.persisted.pinned_names());
+        let cmds = pass::dry_run(&r, &s, &ds, &self.persisted.pinned_names(), &[]);
         let lines: Vec<String> = cmds.iter().map(|c| c.to_string()).collect();
         Ok(Response::ok(render::dry_run(&r, &cmds), json!({ "placement": r.placement, "commands": lines })))
     }
@@ -1092,6 +1101,40 @@ mod tests {
         w.handle(Msg::Window(WindowEvent::WindowClosed { id: 800, workspace: "T".into(), app: "com.apple.Safari".into() }));
         assert!(w.persisted.exclusive_tiling.rule_floated.is_empty());
         assert!(Persisted::load(&d.path().join("state.json")).exclusive_tiling.rule_floated.is_empty());
+    }
+
+    #[test]
+    fn the_record_survives_a_restart_so_a_plain_restart_converges_nothing() {
+        let mut fake = docked();
+        fake.add_window("T", 400, KITTY, "", false);
+        let (mut w, d) = live(fake, RULE);
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert!(w.aero.log.contains(&Cmd::Float { id: 105 }), "first run floats T's non-kitty window");
+        let saved = Persisted::load(&d.path().join("state.json"));
+        assert!(saved.exclusive_tiling.records.contains_key("T"));
+        // You tile it back by hand; the daemon restarts with the same rule.
+        let mut fake = std::mem::replace(&mut w.aero, docked());
+        fake.run(&Cmd::Tile { id: 105 }).unwrap();
+        fake.log.clear();
+        let mut w2 = Worker::new(fake, all_screens(), d.path().join("cfg.toml"), d.path().join("state.json"), true, false);
+        w2.set_sender(mpsc::channel().0);
+        w2.handle(Msg::Trigger(Trigger::Startup));
+        w2.tick(later());
+        assert!(!w2.aero.log.iter().any(|c| matches!(c, Cmd::Float { .. } | Cmd::Tile { .. })), "equal record: your tile survives");
+    }
+
+    #[test]
+    fn an_inert_rule_does_not_converge() {
+        let mut fake = docked();
+        fake.add_window("T", 400, KITTY, "", false);
+        let (mut w, _d) = worker_cfg(fake, RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        exit(&mut w, 2);
+        w.sub_retry_at = None;
+        w.tick(later());
+        assert!(!w.aero.log.iter().any(|c| matches!(c, Cmd::Float { .. })));
+        assert!(w.persisted.exclusive_tiling.records.is_empty(), "the first live pass converges later");
     }
 
     #[test]
