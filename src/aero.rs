@@ -5,10 +5,12 @@ use crate::config::Axis;
 use crate::display::Display;
 use crate::world::{AeroMonitor, DETAIL_FORMAT, MONITOR_FORMAT, Snapshot, WINDOW_FORMAT, WORKSPACE_FORMAT, WinInfo, WorkspaceRow};
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::process::Command;
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -85,6 +87,72 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
+/// The fork's window events (I.fork.events). Every `window-moved` is an arrival on
+/// `workspace` and, with `prev` set, a leave from it (V18); `window-detected` is ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "_event", rename_all = "kebab-case")]
+pub enum WindowEvent {
+    #[serde(rename_all = "camelCase")]
+    WindowMoved {
+        #[serde(rename = "windowId")]
+        id: u32,
+        workspace: String,
+        #[serde(default)]
+        prev_workspace: Option<String>,
+        #[serde(rename = "appBundleId", default = "null_app")]
+        app: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    WindowClosed {
+        #[serde(rename = "windowId")]
+        id: u32,
+        workspace: String,
+        #[serde(rename = "appBundleId", default = "null_app")]
+        app: String,
+    },
+}
+
+/// What `%{app-bundle-id}` prints for an app without one, so events and reads agree.
+fn null_app() -> String {
+    "NULL-APP-BUNDLE-ID".into()
+}
+
+/// The window events in one line of `aerospace subscribe` output. The CLI prints each socket
+/// read as it comes, so a line may hold several JSON objects; anything else is skipped.
+pub fn parse_events(line: &str) -> Vec<WindowEvent> {
+    serde_json::Deserializer::from_str(line)
+        .into_iter::<serde_json::Value>()
+        .map_while(Result::ok)
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect()
+}
+
+/// Output of a subscribe child: a line, or its end with exit code and stderr (the probe, V14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubLine {
+    Line(String),
+    Exit { code: Option<i32>, stderr: String },
+}
+
+/// A running subscribe child; dropping it kills the child without reporting an exit.
+pub struct Subscription(Option<Box<dyn FnOnce() + Send>>);
+
+impl Subscription {
+    pub fn new(on_drop: impl FnOnce() + Send + 'static) -> Self {
+        Subscription(Some(Box::new(on_drop)))
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
+pub type Sink = Box<dyn FnMut(SubLine) + Send>;
+
 pub trait Aero {
     fn monitors(&mut self) -> Result<Vec<AeroMonitor>>;
     fn windows(&mut self) -> Result<Snapshot>;
@@ -94,6 +162,9 @@ pub trait Aero {
     fn window_details(&mut self) -> Result<Vec<WinInfo>>;
     /// `Err` carries AeroSpace's stderr, e.g. a force-assignment refusal.
     fn run(&mut self, cmd: &Cmd) -> Result<(), String>;
+    /// `aerospace subscribe window-moved window-closed`, its output fed to `sink` from a
+    /// reader thread until the child ends.
+    fn subscribe(&mut self, sink: Sink) -> Result<Subscription>;
 }
 
 /// Spawns `aerospace` from PATH (the LaunchAgent sets PATH; see install.rs).
@@ -130,6 +201,40 @@ impl Aero for CliAero {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         Err(if err.is_empty() { format!("exit {}", out.status) } else { err })
     }
+    fn subscribe(&mut self, mut sink: Sink) -> Result<Subscription> {
+        let mut child = Command::new("aerospace")
+            .args(["subscribe", "window-moved", "window-closed"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("cannot spawn `aerospace subscribe` (is it on PATH?)")?;
+        let stdout = child.stdout.take().expect("piped");
+        let shared = Arc::new(Mutex::new(Some(child)));
+        let reader = shared.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                match line {
+                    Ok(l) => sink(SubLine::Line(l)),
+                    Err(_) => break,
+                }
+            }
+            // Taken by the Subscription's drop = killed on purpose: report nothing.
+            let Some(mut c) = reader.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+            let mut stderr = String::new();
+            if let Some(mut e) = c.stderr.take() {
+                let _ = e.read_to_string(&mut stderr);
+            }
+            let code = c.wait().ok().and_then(|s| s.code());
+            sink(SubLine::Exit { code, stderr: stderr.trim().to_string() });
+        });
+        Ok(Subscription::new(move || {
+            if let Some(mut c) = shared.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +264,27 @@ mod tests {
         f.run(&Cmd::Tile { id: 7 }).unwrap();
         assert!(f.window_details().unwrap().iter().find(|w| w.id == 7).unwrap().tiled());
         assert!(f.run(&Cmd::Tile { id: 999 }).is_err());
+    }
+
+    #[test]
+    fn subscribe_lines_parse_to_window_events() {
+        let moved = r#"{"_event":"window-moved","appBundleId":"net.kovidgoyal.kitty","appName":"kitty","prevWorkspace":"1","windowId":4211,"workspace":"T"}"#;
+        let first = r#"{"_event":"window-moved","appName":"kitty","appBundleId":"net.kovidgoyal.kitty","windowId":4380,"workspace":"T"}"#;
+        let closed = r#"{"_event":"window-closed","appBundleId":"com.apple.Safari","windowId":5012,"workspace":"T"}"#;
+        assert_eq!(
+            parse_events(moved),
+            [WindowEvent::WindowMoved { id: 4211, workspace: "T".into(), prev_workspace: Some("1".into()), app: "net.kovidgoyal.kitty".into() }]
+        );
+        assert_eq!(parse_events(first)[0], WindowEvent::WindowMoved { id: 4380, workspace: "T".into(), prev_workspace: None, app: "net.kovidgoyal.kitty".into() });
+        assert_eq!(parse_events(closed), [WindowEvent::WindowClosed { id: 5012, workspace: "T".into(), app: "com.apple.Safari".into() }]);
+        // Two reads coalesced on one line; other events and junk are skipped.
+        assert_eq!(parse_events(&format!("{moved}{closed}")).len(), 2);
+        assert!(parse_events(r#"{"_event":"window-detected","windowId":1,"workspace":"T"}"#).is_empty());
+        assert!(parse_events("ERROR: Unknown event 'window-moved'").is_empty());
+        assert!(parse_events("").is_empty());
+        // An app without a bundle id reads as list-windows prints it.
+        let bare = r#"{"_event":"window-closed","windowId":9,"workspace":"T"}"#;
+        assert_eq!(parse_events(bare), [WindowEvent::WindowClosed { id: 9, workspace: "T".into(), app: "NULL-APP-BUNDLE-ID".into() }]);
     }
 
     #[test]

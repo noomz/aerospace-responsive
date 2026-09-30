@@ -1,7 +1,7 @@
 //! The one writer (D17, D24): a single thread that owns config, state and every mutation.
 //! Triggers funnel through a trailing debounce; requests are answered in between passes.
 
-use crate::aero::Aero;
+use crate::aero::{self, Aero, Cmd, SubLine, Subscription, WindowEvent};
 use crate::config::{self, Config};
 use crate::display::{Display, Screen};
 use crate::ipc::{Request, Response};
@@ -10,7 +10,8 @@ use crate::render::{self, LastPass, MonitorView, PinView, StatusView};
 use crate::restore::{self, RestoreCtx};
 use crate::rules::{self, ProfileMode, Resolved};
 use crate::state::{self, Class, Persisted, Pin, Warnings};
-use crate::world;
+use crate::tiling::{self, Leave, Rule};
+use crate::world::{self, WinInfo};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -36,10 +37,19 @@ pub enum Msg {
     Trigger(Trigger),
     AeroSocket(bool),
     Request(Request, Sender<Response>),
+    /// From the subscribe child: handled at the next `recv`, never debounced, never arms a
+    /// pass or sets the abort flag (V12).
+    Window(WindowEvent),
+    /// The subscribe child ended on its own: the capability probe (V14). `child` names the
+    /// child, so a stale report is ignored.
+    SubscribeExit { child: u64, code: Option<i32>, stderr: String },
 }
 
 const BACKSTOP_DELAY: Duration = Duration::from_secs(10); // P-13
 const GATE_TRIES: u32 = 3; // P-2
+/// V14: bounded respawn after the child exits; after these only existing triggers respawn.
+const SUB_RETRY: [Duration; 3] = [Duration::from_secs(1), Duration::from_secs(5), Duration::from_secs(30)];
+pub const INERT_HINT: &str = "exclusive tiling needs an AeroSpace with window-moved/window-closed (restart AeroSpace after installing)";
 
 struct Pending {
     due: Instant,
@@ -69,6 +79,17 @@ pub struct Worker<A: Aero, S: FnMut() -> Vec<Screen>> {
     gate_failures: u32,
     last_pass: Option<LastPass>,
     observe: bool,
+    /// The worker's own inbox, handed to the subscribe reader thread.
+    tx: Option<Sender<Msg>>,
+    /// The subscribe child; `Some` = exclusive tiling is live (V14).
+    sub: Option<Subscription>,
+    sub_gen: u64,
+    sub_retries: usize,
+    sub_retry_at: Option<Instant>,
+    /// Why the rule is inert, while it is (`aerospace subscribe exited 2`).
+    inert: Option<String>,
+    /// The display set of the last gated pass: window events resolve the rule against it (V12).
+    last_ds: Option<Vec<Display>>,
 }
 
 fn reply_all(waiters: Vec<Sender<Response>>, r: Response) {
@@ -102,14 +123,26 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             gate_failures: 0,
             last_pass: None,
             observe,
+            tx: None,
+            sub: None,
+            sub_gen: 0,
+            sub_retries: 0,
+            sub_retry_at: None,
+            inert: None,
+            last_ds: None,
         };
         let _ = w.load_config();
         w
     }
 
+    /// Must be called before `run`: the subscribe child reports into this channel.
+    pub fn set_sender(&mut self, tx: Sender<Msg>) {
+        self.tx = Some(tx);
+    }
+
     pub fn run(mut self, rx: Receiver<Msg>) {
         loop {
-            let due = [self.pending.as_ref().map(|p| p.due), self.backstop].into_iter().flatten().min();
+            let due = [self.pending.as_ref().map(|p| p.due), self.backstop, self.sub_retry_at].into_iter().flatten().min();
             let msg = match due {
                 None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
                 Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
@@ -126,13 +159,33 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         match msg {
             Msg::Trigger(Trigger::Config) => {
                 if let Ok(true) = self.load_config() {
+                    self.ensure_subscription();
                     self.arm(Trigger::Config, true, None);
                 }
             }
-            Msg::Trigger(Trigger::Unlock) => self.arm(Trigger::Unlock, false, None),
+            Msg::Trigger(Trigger::Unlock) => {
+                self.ensure_subscription();
+                self.arm(Trigger::Unlock, false, None);
+            }
+            Msg::Trigger(Trigger::Startup) => {
+                self.ensure_subscription();
+                self.arm(Trigger::Startup, true, None);
+            }
             Msg::Trigger(t) => self.arm(t, true, None),
-            Msg::AeroSocket(up) => self.aero_socket(up),
+            Msg::AeroSocket(up) => {
+                self.aero_socket(up);
+                if up {
+                    self.ensure_subscription();
+                }
+            }
             Msg::Request(req, reply) => self.request(req, reply),
+            Msg::Window(ev) => self.window_event(ev),
+            Msg::SubscribeExit { child, code, stderr } => {
+                if child == self.sub_gen && self.sub.take().is_some() {
+                    let how = code.map_or("aerospace subscribe was killed".into(), |c| format!("aerospace subscribe exited {c}"));
+                    self.sub_failed(how, stderr);
+                }
+            }
         }
     }
 
@@ -143,6 +196,12 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         }
         if self.pending.as_ref().is_some_and(|p| p.due <= now) {
             self.fire();
+        }
+        if self.sub_retry_at.is_some_and(|t| t <= now) {
+            self.sub_retry_at = None;
+            if self.sub.is_none() && self.config.has_exclusive_tiling() {
+                self.spawn_subscription();
+            }
         }
     }
 
@@ -186,6 +245,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let ds = match self.gate() {
             Ok(ds) => {
                 self.gate_failures = 0;
+                self.last_ds = Some(ds.clone());
                 ds
             }
             Err(why) => {
@@ -443,11 +503,140 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         }
     }
 
+    // ---------- exclusive tiling: the subscribe child (V14) ----------
+
+    /// On a trigger that may have fixed the connection (Startup, config reload, unlock,
+    /// AeroSpace's socket appearing, explicit reconcile): run the child iff a rule exists.
+    fn ensure_subscription(&mut self) {
+        if !self.config.has_exclusive_tiling() {
+            if self.sub.take().is_some() {
+                crate::log!("exclusive tiling: no rule left; subscribe child stopped");
+            }
+            self.sub_retry_at = None;
+            self.inert = None;
+            self.warnings.clear(Class::ExclusiveTiling);
+            return;
+        }
+        self.sub_retries = 0;
+        if self.sub.is_none() {
+            self.spawn_subscription();
+        }
+    }
+
+    fn spawn_subscription(&mut self) {
+        self.sub_retry_at = None;
+        let Some(tx) = self.tx.clone() else { return };
+        if !self.aero_up {
+            return; // its socket appearing respawns
+        }
+        self.sub_gen += 1;
+        let child = self.sub_gen;
+        let sink = Box::new(move |l: SubLine| match l {
+            SubLine::Line(line) => {
+                for ev in aero::parse_events(&line) {
+                    let _ = tx.send(Msg::Window(ev));
+                }
+            }
+            SubLine::Exit { code, stderr } => {
+                let _ = tx.send(Msg::SubscribeExit { child, code, stderr });
+            }
+        });
+        match self.aero.subscribe(sink) {
+            Ok(s) => {
+                self.sub = Some(s);
+                self.inert = None;
+                self.warnings.clear(Class::ExclusiveTiling);
+                crate::log!("exclusive tiling: subscribed to window events");
+                self.resync();
+            }
+            Err(e) => self.sub_failed("aerospace subscribe could not start".into(), format!("{e:#}")),
+        }
+    }
+
+    /// The child is gone (or never started): inert, warn, and retry a bounded number of times.
+    fn sub_failed(&mut self, how: String, stderr: String) {
+        let detail = if stderr.is_empty() { String::new() } else { format!(" ({stderr})") };
+        self.warn(Class::ExclusiveTiling, "exclusive-tiling", &format!("exclusive tiling is inert: {how}{detail}. Hint: {INERT_HINT}"));
+        self.inert = Some(how);
+        if let Some(d) = SUB_RETRY.get(self.sub_retries) {
+            self.sub_retry_at = Some(Instant::now() + *d);
+            self.sub_retries += 1;
+        }
+    }
+
+    /// V14: on each (re)connect, one read reconciles memory only — prune gone and recycled
+    /// windows, apply the leaves missed while disconnected. No arrivals.
+    fn resync(&mut self) {
+        let wins = match self.aero.window_details() {
+            Ok(w) => w,
+            Err(e) => return crate::log!("exclusive tiling: resync read failed: {e:#}"),
+        };
+        let live: Vec<(u32, &str)> = wins.iter().map(|w| (w.id, w.app.as_str())).collect();
+        let mut changed = self.persisted.exclusive_tiling.prune(&live);
+        let rules = self.current_rules();
+        let mem = &self.persisted.exclusive_tiling;
+        let left: Vec<&WinInfo> = wins.iter().filter(|w| mem.floated_on(w.id, &w.app).is_some_and(|ws| ws != w.workspace)).collect();
+        for w in left {
+            changed |= self.apply_leave(w, &wins, &rules);
+        }
+        if changed {
+            self.save_state();
+        }
+    }
+
+    /// V5, V6: a rule-floated window is now on `w.workspace`. True when memory changed.
+    fn apply_leave(&mut self, w: &WinInfo, wins: &[WinInfo], rules: &[Rule]) -> bool {
+        match tiling::leave(w, rules.iter().find(|r| r.workspace == w.workspace), wins) {
+            Leave::Drop => self.persisted.exclusive_tiling.remove(w.id),
+            Leave::Retile => self.exec(&Cmd::Tile { id: w.id }, "left its exclusive workspace") && self.persisted.exclusive_tiling.remove(w.id),
+            Leave::StayFloated(why) => {
+                crate::log!("exclusive tiling: window {} stays floating on {}: {why}", w.id, w.workspace);
+                self.persisted.exclusive_tiling.insert(&w.workspace, w.id, &w.app);
+                true
+            }
+        }
+    }
+
+    fn window_event(&mut self, _ev: WindowEvent) {
+        self.sub_retries = 0; // a line proves the connection works
+    }
+
+    /// Effective rules against the last gated display set (V12), or a fresh read before the
+    /// first pass.
+    fn current_rules(&mut self) -> Vec<Rule> {
+        let ds = match self.last_ds.clone() {
+            Some(ds) => ds,
+            None => self.world().unwrap_or_default(),
+        };
+        rules::resolve(&self.config, &ds, self.persisted.lock.as_deref()).exclusive_tiling
+    }
+
+    /// One rule command, or its log line in observe mode. True when it took effect.
+    fn exec(&mut self, cmd: &Cmd, why: &str) -> bool {
+        if self.observe {
+            crate::log!("exclusive tiling: would run: {cmd}  ({why})");
+            return true;
+        }
+        match self.aero.run(cmd) {
+            Ok(()) => {
+                crate::log!("exclusive tiling: {cmd}  ({why})");
+                true
+            }
+            Err(e) => {
+                crate::log!("exclusive tiling: {cmd} failed: {e}");
+                false
+            }
+        }
+    }
+
     // ---------- requests ----------
 
     fn request(&mut self, req: Request, reply: Sender<Response>) {
         let resp = match req {
-            Request::Reconcile { dry_run: false, .. } => return self.arm(Trigger::Poke, true, Some(reply)),
+            Request::Reconcile { dry_run: false, .. } => {
+                self.ensure_subscription();
+                return self.arm(Trigger::Poke, true, Some(reply));
+            }
             Request::Reconcile { dry_run: true, config } => self.dry_run(config),
             Request::Explain { config } => self.explain(config),
             Request::Monitors => self.monitors(),
@@ -634,6 +823,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     fn reload(&mut self) -> Result<Response, String> {
         self.config_text = None; // explicit: always re-parse
         self.load_config()?;
+        self.ensure_subscription();
         self.arm(Trigger::Config, true, None);
         Ok(Response::ok("config reloaded\n", Value::Null))
     }
@@ -680,6 +870,100 @@ mod tests {
 
     fn worker(fake: FakeAero) -> (TestWorker, tempfile::TempDir) {
         worker_with(fake, all_screens(), true)
+    }
+
+    /// kitty-on-T: one kitty may tile on T.
+    const RULE: &str = "\n[[exclusive-tiling]]\nworkspaces = [\"T\"]\ntiling-allowlist = [{ app = \"net.kovidgoyal.kitty\", max-tiled = 1 }]\n";
+
+    /// A worker on the example config plus `extra`, wired to a channel like the daemon's,
+    /// optionally over a pre-existing `state.json`.
+    fn worker_cfg(fake: FakeAero, extra: &str, state: Option<&Persisted>) -> (TestWorker, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg.toml");
+        std::fs::write(&cfg, format!("{EXAMPLE}{extra}")).unwrap();
+        if let Some(p) = state {
+            p.save(&dir.path().join("state.json")).unwrap();
+        }
+        let mut w = Worker::new(fake, all_screens(), cfg, dir.path().join("state.json"), true, false);
+        w.set_sender(mpsc::channel().0);
+        (w, dir)
+    }
+
+    fn set_config(w: &mut TestWorker, d: &tempfile::TempDir, extra: &str) {
+        std::fs::write(d.path().join("cfg.toml"), format!("{EXAMPLE}{extra}")).unwrap();
+        w.handle(Msg::Trigger(Trigger::Config));
+    }
+
+    fn exit(w: &mut TestWorker, code: i32) {
+        let child = w.sub_gen;
+        w.handle(Msg::SubscribeExit { child, code: Some(code), stderr: "ERROR: Unknown event 'window-moved'".into() });
+    }
+
+    #[test]
+    fn subscribe_child_runs_only_while_a_rule_is_configured() {
+        let (mut w, d) = worker_cfg(docked(), "", None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        assert!(w.aero.subs.is_empty(), "no rule, no child");
+        set_config(&mut w, &d, RULE);
+        assert_eq!(w.aero.live_subs(), 1);
+        set_config(&mut w, &d, RULE.replace("max-tiled = 1", "max-tiled = 2").as_str());
+        assert_eq!((w.aero.subs.len(), w.aero.live_subs()), (1, 1), "an edit keeps the running child");
+        set_config(&mut w, &d, "");
+        assert_eq!(w.aero.live_subs(), 0, "the last rule removed kills the child");
+    }
+
+    #[test]
+    fn child_exit_is_inert_with_three_bounded_retries_then_triggers_only() {
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        assert_eq!(w.aero.subs.len(), 1);
+        exit(&mut w, 2);
+        let st = ask(&mut w, Request::Status);
+        assert_eq!(st.exit, 4, "inert is a pending warning");
+        assert!(st.text.contains("aerospace subscribe exited 2 (ERROR: Unknown event 'window-moved')"), "{}", st.text);
+        assert!(st.text.contains(INERT_HINT), "{}", st.text);
+        for n in 2..=4 {
+            assert!(w.sub_retry_at.is_some());
+            w.tick(later());
+            assert_eq!(w.aero.subs.len(), n, "retry {}", n - 1);
+            exit(&mut w, 2);
+        }
+        assert!(w.sub_retry_at.is_none(), "1s, 5s, 30s, then no open-ended timer");
+        w.tick(later());
+        assert_eq!(w.aero.subs.len(), 4);
+        w.handle(Msg::AeroSocket(true));
+        assert_eq!(w.aero.live_subs(), 1, "an existing trigger respawns");
+        assert!(w.warnings.list().iter().all(|x| x.key != "exclusive-tiling"), "a running child clears the warning");
+        let stale = w.sub_gen - 1;
+        w.handle(Msg::SubscribeExit { child: stale, code: Some(1), stderr: String::new() });
+        assert_eq!(w.aero.live_subs(), 1, "a stale child's exit is ignored");
+    }
+
+    #[test]
+    fn a_child_that_cannot_spawn_is_inert_too() {
+        let mut fake = docked();
+        fake.fail_subscribe = true;
+        let (mut w, _d) = worker_cfg(fake, RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        assert!(ask(&mut w, Request::Status).text.contains("aerospace subscribe could not start"));
+    }
+
+    #[test]
+    fn reconnect_prunes_memory_and_applies_missed_leaves_but_no_arrivals() {
+        let mut fake = docked();
+        fake.add_window("1", 900, "com.apple.Safari", "", true); // left T while disconnected
+        fake.add_window("T", 902, "com.apple.Preview", "", true); // still rule-floated on T
+        fake.add_window("T", 903, "com.apple.Finder", "", false); // moved in meanwhile: stays tiled
+        let mut st = Persisted::default();
+        st.exclusive_tiling.insert("T", 900, "com.apple.Safari");
+        st.exclusive_tiling.insert("T", 901, "com.apple.TextEdit"); // closed meanwhile
+        st.exclusive_tiling.insert("T", 902, "com.apple.Preview");
+        let (mut w, d) = worker_cfg(fake, RULE, Some(&st));
+        w.handle(Msg::AeroSocket(true));
+        assert_eq!(w.aero.log, [Cmd::Tile { id: 900 }], "only the missed leave acts");
+        let saved = Persisted::load(&d.path().join("state.json"));
+        let ids: Vec<u32> = saved.exclusive_tiling.rule_floated["T"].iter().map(|f| f.window_id).collect();
+        assert_eq!(ids, [902]);
     }
 
     fn later() -> Instant {

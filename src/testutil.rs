@@ -56,7 +56,9 @@ pub fn desk3() -> Vec<Display> {
     vec![len_portrait(1), builtin(2), len_landscape(3)]
 }
 
-use crate::aero::{Aero, Cmd};
+use crate::aero::{Aero, Cmd, Sink, Subscription};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::config::Axis;
 use crate::world::{AeroMonitor, Snapshot, WinInfo, WindowRow, WorkspaceRow};
 use std::collections::BTreeSet;
@@ -89,6 +91,10 @@ pub struct FakeAero {
     pub ignore_layout: bool,
     /// Make `windows()` fail, as a socket blip does mid-pass.
     pub fail_windows: bool,
+    /// One flag per `subscribe` call: true while that Subscription is alive.
+    pub subs: Vec<Arc<AtomicBool>>,
+    /// Make `subscribe` fail to spawn.
+    pub fail_subscribe: bool,
 }
 
 impl FakeAero {
@@ -122,11 +128,18 @@ impl FakeAero {
             refuse: BTreeSet::new(),
             ignore_layout: false,
             fail_windows: false,
+            subs: vec![],
+            fail_subscribe: false,
         }
     }
 
     pub fn ws(&self, name: &str) -> &FakeWs {
         self.ws.iter().find(|w| w.name == name).expect("no such fake workspace")
+    }
+
+    /// Subscriptions still alive (spawned and not dropped).
+    pub fn live_subs(&self) -> usize {
+        self.subs.iter().filter(|a| a.load(Ordering::SeqCst)).count()
     }
 
     pub fn add_window(&mut self, ws: &str, id: u32, app: &str, title: &str, floating: bool) {
@@ -261,5 +274,15 @@ impl Aero for FakeAero {
             Cmd::Float { id } => self.win_mut(*id).map(|w| w.floating = true),
             Cmd::Tile { id } => self.win_mut(*id).map(|w| w.floating = false),
         }
+    }
+
+    /// Tests feed `Msg::Window` / `Msg::SubscribeExit` themselves; the sink is unused.
+    fn subscribe(&mut self, _sink: Sink) -> anyhow::Result<Subscription> {
+        if self.fail_subscribe {
+            anyhow::bail!("cannot spawn `aerospace subscribe`");
+        }
+        let alive = Arc::new(AtomicBool::new(true));
+        self.subs.push(alive.clone());
+        Ok(Subscription::new(move || alive.store(false, Ordering::SeqCst)))
     }
 }

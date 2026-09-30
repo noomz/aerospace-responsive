@@ -160,13 +160,15 @@ impl Persisted {
 }
 
 /// How a warning clears (plan P-10): Config on the next successful reload, World on every
-/// pass (recomputed), Pass on the next clean pass.
+/// pass (recomputed), Pass on the next clean pass, ExclusiveTiling when a subscribe child
+/// starts (or the last rule goes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Class {
     Config,
     World,
     Pass,
+    ExclusiveTiling,
 }
 
 #[derive(Debug, Clone, Serialize)]
