@@ -583,7 +583,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 self.sub = Some(s);
                 self.inert = None;
                 self.warnings.clear(Class::ExclusiveTiling);
-                crate::log!("exclusive tiling: subscribed to window events");
+                crate::log!("exclusive tiling: subscribe child started");
                 self.resync();
             }
             Err(e) => self.sub_failed("aerospace subscribe could not start".into(), format!("{e:#}")),
