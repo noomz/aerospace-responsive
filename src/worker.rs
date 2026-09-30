@@ -9,8 +9,8 @@ use crate::pass::{self, PassReport};
 use crate::render::{self, LastPass, MonitorView, PinView, StatusView};
 use crate::restore::{self, RestoreCtx};
 use crate::rules::{self, ProfileMode, Resolved};
-use crate::state::{self, Class, Persisted, Pin, Warnings};
-use crate::tiling::{self, Leave, Rule};
+use crate::state::{self, Class, Persisted, Pin, TilingMemory, Warnings};
+use crate::tiling::{self, Leave, Plan, Rule};
 use crate::world::{self, WinInfo};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -90,6 +90,9 @@ pub struct Worker<A: Aero, S: FnMut() -> Vec<Screen>> {
     inert: Option<String>,
     /// The display set of the last gated pass: window events resolve the rule against it (V12).
     last_ds: Option<Vec<Display>>,
+    /// Exclusive tiling's memory as `state.json` had it: observe mode keeps its own changes
+    /// in-process and writes this back instead (V15).
+    tiling_on_disk: TilingMemory,
 }
 
 fn reply_all(waiters: Vec<Sender<Response>>, r: Response) {
@@ -105,6 +108,7 @@ fn fmt_err(e: anyhow::Error) -> String {
 impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     pub fn new(aero: A, screens: S, config_path: PathBuf, state_path: PathBuf, aero_up: bool, observe: bool) -> Self {
         let persisted = Persisted::load(&state_path);
+        let tiling_on_disk = persisted.exclusive_tiling.clone();
         let mut w = Worker {
             aero,
             screens,
@@ -130,6 +134,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             sub_retry_at: None,
             inert: None,
             last_ds: None,
+            tiling_on_disk,
         };
         let _ = w.load_config();
         w
@@ -384,12 +389,17 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     }
 
     fn observe_pass(&mut self, r: &Resolved, ds: &[Display], pinned: &BTreeSet<String>, p: Pending) {
+        // V15: the converge is logged, and taken as done in-process only.
+        let plans = if self.sub.is_some() { self.converge_plans(&r.exclusive_tiling) } else { vec![] };
         let text = match self.aero.windows() {
             Ok(s) => {
-                let cmds = pass::dry_run(r, &s, ds, pinned, &[]);
+                let cmds = pass::dry_run(r, &s, ds, pinned, &plans);
                 crate::log!("observe: would run {} command(s)", cmds.len());
                 for c in &cmds {
                     crate::log!("  would run: {c}");
+                }
+                for plan in &plans {
+                    tiling::commit(&mut self.persisted.exclusive_tiling, plan);
                 }
                 render::dry_run(r, &cmds)
             }
@@ -507,7 +517,12 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     }
 
     fn save_state(&mut self) {
-        if let Err(e) = self.persisted.save(&self.state_path) {
+        let saved = if self.observe {
+            &Persisted { exclusive_tiling: self.tiling_on_disk.clone(), ..self.persisted.clone() }
+        } else {
+            &self.persisted
+        };
+        if let Err(e) = saved.save(&self.state_path) {
             crate::log!("cannot save state: {e:#}");
         }
     }
@@ -667,6 +682,20 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         }
         if changed {
             self.save_state();
+        }
+    }
+
+    /// The pending converge plans against a fresh window read; none when nothing is ruled.
+    fn converge_plans(&mut self, rules: &[Rule]) -> Vec<Plan> {
+        if rules.is_empty() && self.persisted.exclusive_tiling.records.is_empty() {
+            return vec![];
+        }
+        match self.aero.window_details() {
+            Ok(wins) => tiling::plan_converge(rules, &self.persisted.exclusive_tiling, &wins),
+            Err(e) => {
+                crate::log!("exclusive tiling: window read failed: {e:#}");
+                vec![]
+            }
         }
     }
 
@@ -1135,6 +1164,29 @@ mod tests {
         w.tick(later());
         assert!(!w.aero.log.iter().any(|c| matches!(c, Cmd::Float { .. })));
         assert!(w.persisted.exclusive_tiling.records.is_empty(), "the first live pass converges later");
+    }
+
+    #[test]
+    fn observe_logs_the_rule_and_keeps_its_memory_in_process() {
+        let mut fake = docked();
+        fake.add_window("T", 400, KITTY, "", false);
+        let mut st = Persisted::default();
+        st.exclusive_tiling.insert("X", 1, "on-disk");
+        let (mut w, d) = worker_cfg(fake, RULE, Some(&st));
+        w.observe = true;
+        w.handle(Msg::Trigger(Trigger::Startup));
+        assert_eq!(w.aero.live_subs(), 1, "observe subscribes");
+        w.tick(later());
+        assert!(w.persisted.exclusive_tiling.records.contains_key("T"), "the converge counts as done in-process");
+        w.aero.add_window("T", 401, "com.apple.Safari", "", false);
+        w.handle(moved(401, "T", None, "com.apple.Safari"));
+        assert!(w.persisted.exclusive_tiling.floated_on(401, "com.apple.Safari").is_some());
+        assert!(!w.aero.log.iter().any(|c| matches!(c, Cmd::Float { .. } | Cmd::Tile { .. })), "nothing executed");
+        // Anything else that saves state (a pin) must not leak the in-process memory.
+        assert_eq!(ask(&mut w, Request::Pin { workspace: Some("T".into()) }).exit, 0);
+        let disk = Persisted::load(&d.path().join("state.json"));
+        assert_eq!(disk.exclusive_tiling, st.exclusive_tiling);
+        assert_eq!(disk.pins.len(), 1);
     }
 
     #[test]
