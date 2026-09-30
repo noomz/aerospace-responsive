@@ -119,7 +119,8 @@ pub struct PassReport {
     pub left_visible: BTreeMap<u32, String>,
 }
 
-/// `tiling` is exclusive tiling's memory while the rule is live, `None` while it is inert (C3).
+/// `tiling` is exclusive tiling's memory (`None` = no converge at all); `live` = the rule gets
+/// window events. While inert only removals converge (C3, V20).
 pub fn run_pass(
     aero: &mut dyn Aero,
     r: &Resolved,
@@ -127,6 +128,7 @@ pub fn run_pass(
     pinned: &BTreeSet<String>,
     abort: &AtomicBool,
     tiling: Option<&mut TilingMemory>,
+    live: bool,
 ) -> Result<PassReport> {
     let mut rep = PassReport::default();
 
@@ -163,7 +165,7 @@ pub fn run_pass(
         && (!r.exclusive_tiling.is_empty() || !mem.records.is_empty())
     {
         let details = aero.window_details()?;
-        for plan in tiling::plan_converge(&r.exclusive_tiling, mem, &details) {
+        for plan in tiling::plan_converge(&r.exclusive_tiling, mem, &details).into_iter().filter(|p| tiling::runnable(p, live)) {
             for (cmd, app) in &plan.steps {
                 if abort.load(Ordering::SeqCst) {
                     rep.aborted = true;
@@ -228,7 +230,7 @@ mod tests {
         let ds = desk3();
         let r = resolve(&cfg(), &ds, None);
         let pinned = pinned.iter().map(|s| s.to_string()).collect();
-        run_pass(f, &r, &ds, &pinned, &AtomicBool::new(false), None).unwrap()
+        run_pass(f, &r, &ds, &pinned, &AtomicBool::new(false), None, false).unwrap()
     }
 
     fn mv(ws: &str, to: u32) -> Cmd {
@@ -303,7 +305,7 @@ mod tests {
         let mut f = docked();
         let ds = desk3();
         let r = resolve(&cfg(), &ds, None);
-        let rep = run_pass(&mut f, &r, &ds, &BTreeSet::new(), &AtomicBool::new(true), None).unwrap();
+        let rep = run_pass(&mut f, &r, &ds, &BTreeSet::new(), &AtomicBool::new(true), None, false).unwrap();
         assert!(rep.aborted && f.log.is_empty());
     }
 
@@ -353,7 +355,7 @@ mod tests {
         let ds = desk3();
         let r = resolve(cfg, &ds, None);
         let pinned = pinned.iter().map(|s| s.to_string()).collect();
-        run_pass(f, &r, &ds, &pinned, &AtomicBool::new(abort), Some(mem)).unwrap()
+        run_pass(f, &r, &ds, &pinned, &AtomicBool::new(abort), Some(mem), true).unwrap()
     }
 
     #[test]
@@ -391,12 +393,19 @@ mod tests {
     }
 
     #[test]
-    fn inert_rule_converges_nothing() {
+    fn inert_rule_converges_nothing_but_a_removal_still_retiles() {
         let mut f = docked_kitty();
         let ds = desk3();
+        let mut mem = TilingMemory::default();
         let r = resolve(&cfg_with(RULE), &ds, None);
-        run_pass(&mut f, &r, &ds, &BTreeSet::new(), &AtomicBool::new(false), None).unwrap();
-        assert!(!f.log.iter().any(|c| matches!(c, Cmd::Float { .. } | Cmd::Tile { .. })));
+        run_pass(&mut f, &r, &ds, &BTreeSet::new(), &AtomicBool::new(false), Some(&mut mem), false).unwrap();
+        assert!(!f.log.iter().any(|c| matches!(c, Cmd::Float { .. } | Cmd::Tile { .. })), "inert: no first run");
+        tiling_pass(&mut f, &cfg_with(RULE), &mut mem, &[], false); // live: first run floats 105 and 300
+        let n = f.log.len();
+        let removed = resolve(&cfg(), &ds, None);
+        run_pass(&mut f, &removed, &ds, &BTreeSet::new(), &AtomicBool::new(false), Some(&mut mem), false).unwrap();
+        assert_eq!(f.log[n..], [Cmd::Tile { id: 105 }, Cmd::Tile { id: 300 }], "V20: removal needs no events");
+        assert_eq!(mem, TilingMemory::default());
     }
 
     #[test]
@@ -436,7 +445,7 @@ mod tests {
         let ds = desk3();
         let r = resolve(&cfg_with(RULE), &ds, None);
         let mut fake_err = FailTile(docked_kitty()); // e.g. the window closed after the read
-        let err = run_pass(&mut fake_err, &r, &ds, &BTreeSet::new(), &AtomicBool::new(false), Some(&mut mem)).unwrap_err();
+        let err = run_pass(&mut fake_err, &r, &ds, &BTreeSet::new(), &AtomicBool::new(false), Some(&mut mem), true).unwrap_err();
         assert!(format!("{err:#}").contains("layout floating --window-id 105"), "{err:#}");
         assert!(mem.records.is_empty());
     }

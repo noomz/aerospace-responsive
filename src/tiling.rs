@@ -239,6 +239,12 @@ pub fn plan_converge(rules: &[Rule], mem: &TilingMemory, windows: &[WinInfo]) ->
     out
 }
 
+/// C3 gates only rules that need events: while inert, a configured rule converges nothing, but a
+/// removal (a record without a rule) still re-tiles the rule's own floats (V20).
+pub fn runnable(plan: &Plan, live: bool) -> bool {
+    live || plan.reason == Reason::Removed
+}
+
 /// Memory follows one executed converge command.
 pub fn note(mem: &mut TilingMemory, ws: &str, cmd: &Cmd, app: &str) {
     match cmd {
