@@ -9,20 +9,25 @@
 #   workspaces = ["X"]
 #   tiling-allowlist = [{ app = "com.apple.TextEdit", max-tiled = 1 }]
 #
-# TextEdit windows must arrive tiled (no on-window-detected rule floating them). Covers: arrival
-# via an unfocused move, the tile limit, a non-allowlisted arrival, leave re-tile, close prune.
-# Opens two TextEdit documents and a Preview window, and closes them again.
+# New windows open wherever AeroSpace puts them (often floating); the script stages each on scratch
+# workspace Y (no rule), tiles it there, then moves it to X, so the rule sees a tiled arrival. Covers:
+# arrival via an unfocused move, the tile limit, a non-allowlisted arrival, leave re-tile, close
+# prune. Launches TextEdit and Terminal first (an app's first window after launch can open
+# floating), opens two TextEdit documents and a Terminal window, and closes them again; an app the
+# script launched is quit at the end.
 set -euo pipefail
 
 WS=X
 AWAY=Y
 TEXTEDIT=com.apple.TextEdit
+TERMINAL=com.apple.Terminal
 STATE="$HOME/Library/Application Support/aerospace-responsive/state.json"
 LOG_DIR="${LOG_DIR:-.scratch/exclusive-tiling/e2e}"
 mkdir -p "$LOG_DIR"
 EVENTS="$LOG_DIR/subscribe-$(date +%Y%m%dT%H%M%S).log"
 failures=0
 created=()
+launched=()
 
 say() { printf '%s\n' "$*"; }
 pass() { say "  ok    $*"; }
@@ -73,9 +78,37 @@ new_window() {
     exit 1
 }
 
+# Start `name` (bundle `app`) if it is not running, and quit it at the end. Then open one warm-up
+# window with the opener (the rest of the arguments): the first window after an app launches can
+# open floating, which would make it no arrival for the rule. Every window this opens is tracked.
+start_app() {
+    local app=$1 name=$2 before
+    shift 2
+    before=$(ids_of "$app")
+    if ! pgrep -xq "$name"; then
+        osascript -e "tell application \"$name\" to launch" >/dev/null
+        launched+=("$name")
+        sleep 2
+    fi
+    "$@" >/dev/null
+    sleep 1
+    while read -r id; do [[ -n "$id" ]] && created+=("$id"); done < <(comm -13 <(printf '%s\n' "$before") <(ids_of "$app"))
+}
+
+# Move a fresh window to the no-rule workspace and tile it there: the arrival the rule acts on.
+stage() {
+    aerospace move-node-to-workspace --window-id "$1" "$AWAY"
+    aerospace layout tiling --window-id "$1" 2>/dev/null || true # already tiled: a no-op error
+    expect_layout "$1" tiled "$2 staged tiled on $AWAY"
+}
+
 cleanup() {
     for id in "${created[@]}"; do
         aerospace close --window-id "$id" >/dev/null 2>&1 || true
+    done
+    for name in "${launched[@]}"; do # everything open in it is ours; TextEdit refuses to quit over open documents
+        osascript -e "tell application \"$name\" to close every document saving no" >/dev/null 2>&1 || true
+        osascript -e "tell application \"$name\" to quit" >/dev/null 2>&1 || true
     done
     [[ -n "${SUB_PID:-}" ]] && kill "$SUB_PID" 2>/dev/null || true
     [[ -n "${HOME_WS:-}" ]] && aerospace workspace "$HOME_WS" >/dev/null 2>&1 || true
@@ -95,26 +128,31 @@ grep -q "$TEXTEDIT" <<<"$explain" || { say "no exclusive-tiling rule for $TEXTED
 HOME_WS=$(aerospace list-workspaces --focused)
 [[ "$HOME_WS" != "$WS" ]] || { say "focus a workspace other than $WS first"; exit 2; }
 pass "subscribe child alive, daemon live, rule present; logging events to $EVENTS"
+start_app "$TEXTEDIT" TextEdit osascript -e 'tell application "TextEdit" to make new document'
+start_app "$TERMINAL" Terminal osascript -e 'tell application "Terminal" to do script ""'
 
 say "arrival by an unfocused move, and the tile limit"
 first=$(new_window "$TEXTEDIT" osascript -e 'tell application "TextEdit" to make new document')
 created+=("$first")
 second=$(new_window "$TEXTEDIT" osascript -e 'tell application "TextEdit" to make new document')
 created+=("$second")
-expect_layout "$first" tiled "TextEdit arrives tiled on $HOME_WS"
+stage "$first" "first TextEdit"
+stage "$second" "second TextEdit"
 aerospace move-node-to-workspace --window-id "$first" "$WS"
 expect_layout "$first" tiled "first TextEdit on $WS keeps its slot"
 aerospace move-node-to-workspace --window-id "$second" "$WS"
 expect_layout "$second" floating "second TextEdit on $WS is over max-tiled = 1"
+expect_layout "$first" tiled "first TextEdit still holds the slot after the daemon judged both"
 [[ " $(rule_floated_on "$WS") " == *" $second "* ]] && pass "second TextEdit is rule-floated on $WS" || fail "second TextEdit not in state.json memory for $WS"
 [[ "$(aerospace list-workspaces --focused)" == "$HOME_WS" ]] && pass "focus never followed (unfocused moves)" || fail "focus moved"
 
 say "a window the allowlist does not name"
-icon=/System/Applications/Calculator.app/Contents/Resources/AppIcon.icns
-preview=$(new_window com.apple.Preview open -a Preview "$icon")
-created+=("$preview")
-aerospace move-node-to-workspace --window-id "$preview" "$WS"
-expect_layout "$preview" floating "Preview on $WS is not allowlisted"
+other=$(new_window "$TERMINAL" osascript -e 'tell application "Terminal" to do script ""')
+created+=("$other")
+stage "$other" Terminal
+aerospace move-node-to-workspace --window-id "$other" "$WS"
+expect_layout "$other" floating "Terminal on $WS is not allowlisted"
+[[ " $(rule_floated_on "$WS") " == *" $other "* ]] && pass "Terminal is rule-floated on $WS" || fail "Terminal not in state.json memory for $WS"
 
 say "leave: the destination decides"
 aerospace move-node-to-workspace --window-id "$second" "$AWAY"
@@ -122,14 +160,14 @@ expect_layout "$second" tiled "rule-floated TextEdit re-tiles on $AWAY (no rule 
 [[ " $(rule_floated_on "$WS") " != *" $second "* ]] && pass "its memory entry is gone" || fail "still remembered on $WS"
 
 say "close prunes memory"
-aerospace close --window-id "$preview"
-expect_layout "$preview" gone "Preview closed"
+aerospace close --window-id "$other"
+expect_layout "$other" gone "Terminal closed"
 sleep 0.5
-[[ " $(rule_floated_on "$WS") " != *" $preview "* ]] && pass "closed window pruned from state.json" || fail "closed window still in state.json"
+[[ " $(rule_floated_on "$WS") " != *" $other "* ]] && pass "closed window pruned from state.json" || fail "closed window still in state.json"
 
 say "the event stream"
-grep -q "\"_event\":\"window-moved\".*\"prevWorkspace\":\"$HOME_WS\".*\"windowId\":$first" "$EVENTS" && pass "window-moved with prevWorkspace for $first" || fail "no window-moved for $first in $EVENTS"
-grep -q "\"_event\":\"window-closed\".*\"windowId\":$preview" "$EVENTS" && pass "window-closed for $preview" || fail "no window-closed for $preview in $EVENTS"
+grep -q "\"_event\":\"window-moved\".*\"prevWorkspace\":\"$AWAY\".*\"windowId\":$first" "$EVENTS" && pass "window-moved with prevWorkspace for $first" || fail "no window-moved for $first in $EVENTS"
+grep -q "\"_event\":\"window-closed\".*\"windowId\":$other" "$EVENTS" && pass "window-closed for $other" || fail "no window-closed for $other in $EVENTS"
 [[ "$(workspace_of "$first")" == "$WS" ]] && pass "first TextEdit still on $WS" || fail "first TextEdit left $WS"
 
 say ""
