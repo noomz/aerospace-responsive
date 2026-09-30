@@ -58,15 +58,23 @@ pub fn desk3() -> Vec<Display> {
 
 use crate::aero::{Aero, Cmd};
 use crate::config::Axis;
-use crate::world::{AeroMonitor, Snapshot, WindowRow, WorkspaceRow};
+use crate::world::{AeroMonitor, Snapshot, WinInfo, WindowRow, WorkspaceRow};
 use std::collections::BTreeSet;
+
+#[derive(Debug, Clone)]
+pub struct FakeWin {
+    pub id: u32,
+    pub app: String,
+    pub title: String,
+    pub floating: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct FakeWs {
     pub name: String,
     pub monitor: u32,
     pub visible: bool,
-    pub windows: Vec<u32>,
+    pub windows: Vec<FakeWin>,
     pub root: Axis,
 }
 
@@ -103,7 +111,7 @@ impl FakeAero {
                     windows: (0..*n)
                         .map(|_| {
                             next_id += 1;
-                            next_id
+                            FakeWin { id: next_id, app: "com.example.app".into(), title: String::new(), floating: false }
                         })
                         .collect(),
                     root: *root,
@@ -119,6 +127,32 @@ impl FakeAero {
 
     pub fn ws(&self, name: &str) -> &FakeWs {
         self.ws.iter().find(|w| w.name == name).expect("no such fake workspace")
+    }
+
+    pub fn add_window(&mut self, ws: &str, id: u32, app: &str, title: &str, floating: bool) {
+        let i = self.idx(ws).expect("no such fake workspace");
+        self.ws[i].windows.push(FakeWin { id, app: app.into(), title: title.into(), floating });
+    }
+
+    pub fn win(&self, id: u32) -> Option<&FakeWin> {
+        self.ws.iter().flat_map(|w| &w.windows).find(|w| w.id == id)
+    }
+
+    fn win_mut(&mut self, id: u32) -> Result<&mut FakeWin, String> {
+        self.ws.iter_mut().flat_map(|w| &mut w.windows).find(|w| w.id == id).ok_or_else(|| format!("no window {id}"))
+    }
+
+    /// `move-node-to-workspace --window-id`: the window keeps its floating state.
+    pub fn move_window(&mut self, id: u32, to: &str) {
+        let w = self.close_window(id).expect("no such fake window");
+        let i = self.idx(to).expect("no such fake workspace");
+        self.ws[i].windows.push(w);
+    }
+
+    pub fn close_window(&mut self, id: u32) -> Option<FakeWin> {
+        let ws = self.ws.iter_mut().find(|w| w.windows.iter().any(|x| x.id == id))?;
+        let i = ws.windows.iter().position(|x| x.id == id)?;
+        Some(ws.windows.remove(i))
     }
 
     /// The workspace rows, without borrowing `self` mutably.
@@ -162,8 +196,8 @@ impl Aero for FakeAero {
         let mut windows = vec![];
         for w in &self.ws {
             let layout = if w.root == Axis::H { "h_tiles" } else { "v_tiles" };
-            for id in &w.windows {
-                windows.push(WindowRow { id: *id, workspace: w.name.clone(), monitor: w.monitor, root_layout: layout.into() });
+            for x in &w.windows {
+                windows.push(WindowRow { id: x.id, workspace: w.name.clone(), monitor: w.monitor, root_layout: layout.into() });
             }
         }
         Ok(Snapshot { windows })
@@ -171,6 +205,21 @@ impl Aero for FakeAero {
 
     fn workspaces(&mut self) -> anyhow::Result<Vec<WorkspaceRow>> {
         Ok(self.clone_rows())
+    }
+
+    fn window_details(&mut self) -> anyhow::Result<Vec<WinInfo>> {
+        if self.fail_windows {
+            anyhow::bail!("list-windows: connection refused");
+        }
+        let mut out = vec![];
+        for w in &self.ws {
+            let tiled = if w.root == Axis::H { "h_tiles" } else { "v_tiles" };
+            for x in &w.windows {
+                let layout = if x.floating { "floating" } else { tiled };
+                out.push(WinInfo { id: x.id, workspace: w.name.clone(), app: x.app.clone(), title: x.title.clone(), layout: layout.into() });
+            }
+        }
+        Ok(out)
     }
 
     fn run(&mut self, cmd: &Cmd) -> Result<(), String> {
@@ -209,6 +258,8 @@ impl Aero for FakeAero {
                 self.focused = ws.clone();
                 Ok(())
             }
+            Cmd::Float { id } => self.win_mut(*id).map(|w| w.floating = true),
+            Cmd::Tile { id } => self.win_mut(*id).map(|w| w.floating = false),
         }
     }
 }

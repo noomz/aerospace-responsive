@@ -3,7 +3,7 @@
 
 use crate::config::Axis;
 use crate::display::Display;
-use crate::world::{AeroMonitor, MONITOR_FORMAT, Snapshot, WINDOW_FORMAT, WORKSPACE_FORMAT, WorkspaceRow};
+use crate::world::{AeroMonitor, DETAIL_FORMAT, MONITOR_FORMAT, Snapshot, WINDOW_FORMAT, WORKSPACE_FORMAT, WinInfo, WorkspaceRow};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -18,6 +18,9 @@ pub enum Cmd {
     Flatten { ws: String },
     Layout { ws: String, axis: Axis },
     Focus { ws: String },
+    /// Exclusive tiling's else-action, and its undo (I.aero).
+    Float { id: u32 },
+    Tile { id: u32 },
 }
 
 impl Cmd {
@@ -33,6 +36,8 @@ impl Cmd {
             }
             // `workspace` is the only non-moving way to show a workspace; it always focuses (13).
             Cmd::Focus { ws } => vec![s("workspace"), s("--"), ws.clone()],
+            Cmd::Float { id } => vec![s("layout"), s("floating"), s("--window-id"), id.to_string()],
+            Cmd::Tile { id } => vec![s("layout"), s("tiling"), s("--window-id"), id.to_string()],
         }
     }
 }
@@ -84,6 +89,9 @@ pub trait Aero {
     fn monitors(&mut self) -> Result<Vec<AeroMonitor>>;
     fn windows(&mut self) -> Result<Snapshot>;
     fn workspaces(&mut self) -> Result<Vec<WorkspaceRow>>;
+    /// Every window with app, title and layout: exclusive tiling's read, kept out of the
+    /// pass snapshot so display passes never pay for titles.
+    fn window_details(&mut self) -> Result<Vec<WinInfo>>;
     /// `Err` carries AeroSpace's stderr, e.g. a force-assignment refusal.
     fn run(&mut self, cmd: &Cmd) -> Result<(), String>;
 }
@@ -111,6 +119,9 @@ impl Aero for CliAero {
     fn workspaces(&mut self) -> Result<Vec<WorkspaceRow>> {
         self.json(&["list-workspaces", "--all", "--json", "--format", WORKSPACE_FORMAT])
     }
+    fn window_details(&mut self) -> Result<Vec<WinInfo>> {
+        self.json(&["list-windows", "--all", "--json", "--format", DETAIL_FORMAT])
+    }
     fn run(&mut self, cmd: &Cmd) -> Result<(), String> {
         let out = Command::new("aerospace").args(cmd.args()).output().map_err(|e| e.to_string())?;
         if out.status.success() {
@@ -133,6 +144,21 @@ mod tests {
         assert_eq!(Cmd::Layout { ws: "1".into(), axis: Axis::V }.to_string(), "aerospace layout --root --workspace 1 vertical");
         assert_eq!(Cmd::Flatten { ws: "C".into() }.to_string(), "aerospace flatten-workspace-tree --workspace C");
         assert_eq!(Cmd::Focus { ws: "T".into() }.to_string(), "aerospace workspace -- T");
+        assert_eq!(Cmd::Float { id: 5230 }.to_string(), "aerospace layout floating --window-id 5230");
+        assert_eq!(Cmd::Tile { id: 4380 }.to_string(), "aerospace layout tiling --window-id 4380");
+    }
+
+    #[test]
+    fn fake_float_and_tile_apply_by_window_id() {
+        let mut f = FakeAero::new(&desk3(), &[("T", 2, true, 1, Axis::H)], "T");
+        f.add_window("T", 7, "com.apple.Safari", "GitHub", false);
+        f.run(&Cmd::Float { id: 7 }).unwrap();
+        let d = f.window_details().unwrap();
+        let w = d.iter().find(|w| w.id == 7).unwrap();
+        assert!(w.floating() && !w.tiled());
+        f.run(&Cmd::Tile { id: 7 }).unwrap();
+        assert!(f.window_details().unwrap().iter().find(|w| w.id == 7).unwrap().tiled());
+        assert!(f.run(&Cmd::Tile { id: 999 }).is_err());
     }
 
     #[test]
