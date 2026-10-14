@@ -1,6 +1,6 @@
 [package]
 name = "aerospace-responsive"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Reshape AeroSpace workspace placement and layout when displays change"
 license = "MIT OR Apache-2.0"
