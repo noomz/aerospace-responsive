@@ -49,6 +49,15 @@ const BACKSTOP_DELAY: Duration = Duration::from_secs(10); // P-13
 const GATE_TRIES: u32 = 3; // P-2
 /// V14: bounded respawn after the child exits; after these only existing triggers respawn.
 const SUB_RETRY: [Duration; 3] = [Duration::from_secs(1), Duration::from_secs(5), Duration::from_secs(30)];
+/// An empty `list-windows` is retried on this schedule, then given up on (ticket 12). Wake
+/// needed one retry; login needs ~30s, since apps open their windows after AeroSpace starts.
+const EMPTY_RETRY: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+];
 pub const INERT_HINT: &str = "exclusive tiling needs an AeroSpace with window-moved/window-closed (restart AeroSpace after installing)";
 
 struct Pending {
@@ -57,6 +66,8 @@ struct Pending {
     full: bool,
     /// This run is the one budgeted re-pass; a fresh trigger merged in resets it.
     repass: bool,
+    /// Empty reads this run has retried (`EMPTY_RETRY`); a fresh trigger merged in resets it.
+    empty_tries: usize,
     trigger: Trigger,
     waiters: Vec<Sender<Response>>,
 }
@@ -231,13 +242,14 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             Some(p) => {
                 p.due = due;
                 p.repass &= repass;
+                p.empty_tries = 0;
                 if full && !p.full {
                     p.trigger = trigger;
                 }
                 p.full |= full;
                 p.waiters.extend(waiter);
             }
-            None => self.pending = Some(Pending { due, full, repass, trigger, waiters: waiter.into_iter().collect() }),
+            None => self.pending = Some(Pending { due, full, repass, empty_tries: 0, trigger, waiters: waiter.into_iter().collect() }),
         }
     }
 
@@ -325,18 +337,21 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             }
         }
         if rep.aborted || rep.empty_snapshot {
-            let why = if rep.aborted { "aborted by a display change" } else { "list-windows came back empty" };
-            if rep.empty_snapshot && p.repass {
+            // An abort restarts a full reconcile, which ticket 03 says owns the next run — so it
+            // gets its budgets back. An empty read is a retry of the same run, on a bounded
+            // schedule, or a genuinely empty model would re-arm forever.
+            let (why, retry, empty_tries) = if rep.aborted {
+                ("aborted by a display change", Some(self.debounce), 0)
+            } else {
+                ("list-windows came back empty", EMPTY_RETRY.get(p.empty_tries).copied(), p.empty_tries + 1)
+            };
+            let Some(delay) = retry else {
                 self.restore = None; // the disturbance is over; do not replay it later
                 self.record(p.trigger, why.into());
                 return reply_all(p.waiters, Response::err(why));
-            }
-            crate::log!("pass {why}; restarting through the debounce");
-            // An empty read is a retry of the same run, and ticket 12 allows exactly one (the
-            // second lands in the give-up return above). An abort restarts a full reconcile,
-            // which ticket 03 says owns the next run — so it gets its budget back.
-            let repass = rep.empty_snapshot;
-            self.pending = Some(Pending { due: Instant::now() + self.debounce, repass, ..p });
+            };
+            crate::log!("pass {why}; retrying in {}s", delay.as_secs());
+            self.pending = Some(Pending { due: Instant::now() + delay, repass: false, empty_tries, ..p });
             return;
         }
         for ws in &rep.converged {
@@ -1418,18 +1433,35 @@ mod tests {
     }
 
     #[test]
-    fn a_persistently_empty_read_retries_once_then_gives_up() {
-        // Ticket 12: an empty list-windows right at wake is a retry, not a state to act on —
-        // and exactly one retry, or a genuinely empty model would re-arm forever.
+    fn a_persistently_empty_read_retries_on_a_schedule_then_gives_up() {
+        // Ticket 12: an empty list-windows is a retry, not a state to act on — on a bounded
+        // schedule, or a genuinely empty model would re-arm forever.
         let mut fake = docked();
         fake.ws.iter_mut().for_each(|w| w.windows.clear());
         let (mut w, _d) = worker(fake);
         w.handle(Msg::Trigger(Trigger::Display));
+        for _ in EMPTY_RETRY {
+            w.tick(later());
+            assert!(w.pending.is_some(), "an empty read retries");
+        }
         w.tick(later());
-        assert!(w.pending.as_ref().is_some_and(|p| p.repass), "the first empty read retries");
-        w.tick(later());
-        assert!(w.pending.is_none(), "the second gives up instead of re-arming");
+        assert!(w.pending.is_none(), "the last gives up instead of re-arming");
         assert!(w.aero.log.is_empty(), "an empty model is never acted on");
+    }
+
+    #[test]
+    fn startup_before_any_window_exists_places_once_windows_appear() {
+        // Login: the daemon's first passes read an empty list-windows while apps still open.
+        let mut fake = docked();
+        fake.ws.iter_mut().for_each(|w| w.windows.clear());
+        let (mut w, _d) = worker(fake);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.tick(later());
+        assert!(w.aero.log.is_empty() && w.pending.is_some(), "still retrying after two empty reads");
+        w.aero.ws = docked().ws; // the apps are up
+        w.tick(later());
+        assert!(!w.aero.log.is_empty(), "the retry places workspaces");
     }
 
     #[test]
