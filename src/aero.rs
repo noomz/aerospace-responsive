@@ -88,7 +88,8 @@ fn regex_escape(s: &str) -> String {
 }
 
 /// The fork's window events (I.fork.events). Every `window-moved` is an arrival on
-/// `workspace` and, with `prev` set, a leave from it (V18); `window-detected` is ignored.
+/// `workspace` and, with `prev` set, a leave from it (V18). `window-detected` carries nothing
+/// the worker reads: it only means AeroSpace registered a window, e.g. again after a wake.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "_event", rename_all = "kebab-case")]
 pub enum WindowEvent {
@@ -110,6 +111,7 @@ pub enum WindowEvent {
         #[serde(rename = "appBundleId", default = "null_app")]
         app: String,
     },
+    WindowDetected {},
 }
 
 /// What `%{app-bundle-id}` prints for an app without one, so events and reads agree.
@@ -162,7 +164,7 @@ pub trait Aero {
     fn window_details(&mut self) -> Result<Vec<WinInfo>>;
     /// `Err` carries AeroSpace's stderr, e.g. a force-assignment refusal.
     fn run(&mut self, cmd: &Cmd) -> Result<(), String>;
-    /// `aerospace subscribe window-moved window-closed`, its output fed to `sink` from a
+    /// `aerospace subscribe window-moved window-closed window-detected`, its output fed to `sink` from a
     /// reader thread until the child ends.
     fn subscribe(&mut self, sink: Sink) -> Result<Subscription>;
 }
@@ -203,7 +205,7 @@ impl Aero for CliAero {
     }
     fn subscribe(&mut self, mut sink: Sink) -> Result<Subscription> {
         let mut child = Command::new("aerospace")
-            .args(["subscribe", "window-moved", "window-closed"])
+            .args(["subscribe", "window-moved", "window-closed", "window-detected"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -284,7 +286,8 @@ mod tests {
         assert_eq!(parse_events(closed), [WindowEvent::WindowClosed { id: 5012, workspace: "T".into(), app: "com.apple.Safari".into() }]);
         // Two reads coalesced on one line; other events and junk are skipped.
         assert_eq!(parse_events(&format!("{moved}{closed}")).len(), 2);
-        assert!(parse_events(r#"{"_event":"window-detected","windowId":1,"workspace":"T"}"#).is_empty());
+        assert_eq!(parse_events(r#"{"_event":"window-detected","windowId":1,"workspace":"T"}"#), [WindowEvent::WindowDetected {}]);
+        assert!(parse_events(r#"{"_event":"focus-changed","windowId":1,"workspace":"T"}"#).is_empty());
         assert!(parse_events("ERROR: Unknown event 'window-moved'").is_empty());
         assert!(parse_events("").is_empty());
         // An app without a bundle id reads as list-windows prints it.

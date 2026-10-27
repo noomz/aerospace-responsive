@@ -103,9 +103,12 @@ What the rule does:
   order, then the active profile's `[[profile.exclusive-tiling]]`. `tiling-allowlist` is replaced
   whole, never merged. Every workspace with a rule needs a `tiling-allowlist` (top-level alone and under
   each profile); a bad regex, an unknown `else-action` or a negative `max-tiled` is a load error.
-- Moves are watched through `aerospace subscribe window-moved window-closed`, a child the daemon runs
-  only while a rule exists — events, not polling. On stock AeroSpace the child exits, the rule does
-  nothing, and `status` warns (exit 4) with the reason.
+- Moves are watched through `aerospace subscribe window-moved window-closed window-detected`, a child
+  the daemon runs only while a rule exists — events, not polling. On stock AeroSpace the child exits,
+  the rule does nothing, and `status` warns (exit 4) with the reason.
+- While that child runs, a new window also re-checks placement. Placement skips a workspace that has no
+  windows, and right after a wake AeroSpace re-registers windows one app at a time, so a pass can see a
+  workspace as empty and leave it on the wrong monitor. When its windows come back, the re-check moves it.
 
 `status` gets one line (`exclusive tiling: live; rule-floated T:2`, or `inert` / `observe`). `explain`
 shows each rule, where every field came from, and a verdict for every window on the workspace:

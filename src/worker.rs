@@ -31,6 +31,9 @@ pub enum Trigger {
     Backstop,
     Unlock,
     Repass,
+    /// A window was registered. At wake AeroSpace registers windows app by app, so a pass can
+    /// read a workspace as empty and skip it; this verify catches it once its windows return.
+    WindowDetected,
 }
 
 pub enum Msg {
@@ -38,7 +41,8 @@ pub enum Msg {
     AeroSocket(bool),
     Request(Request, Sender<Response>),
     /// From the subscribe child: handled at the next `recv`, never debounced, never arms a
-    /// pass or sets the abort flag (V12).
+    /// pass or sets the abort flag (V12). `window-detected` is the exception: it arms a
+    /// debounced verify (`Trigger::WindowDetected`).
     Window(WindowEvent),
     /// The subscribe child ended on its own: the capability probe (V14). `child` names the
     /// child, so a stale report is ignored.
@@ -208,6 +212,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 }
             }
             Msg::Request(req, reply) => self.request(req, reply),
+            Msg::Window(WindowEvent::WindowDetected {}) => self.arm(Trigger::WindowDetected, false, None),
             Msg::Window(ev) => self.window_event(ev),
             Msg::SubscribeExit { child, code, stderr } => {
                 if child == self.sub_gen && self.sub.take().is_some() {
@@ -402,7 +407,9 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             Ok(s) => {
                 let m = pass::diff(r, &s, pinned, &BTreeSet::new());
                 if m.is_empty() {
-                    crate::log!("verify: model matches");
+                    if p.trigger != Trigger::WindowDetected {
+                        crate::log!("verify: model matches"); // every new window would log it
+                    }
                 } else if !p.repass {
                     crate::log!("verify: {}; one re-pass", m.join("; "));
                     self.arm(Trigger::Repass, true, None);
@@ -671,6 +678,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 return;
             }
             WindowEvent::WindowMoved { id, workspace, app, .. } => (id, workspace, app),
+            WindowEvent::WindowDetected {} => unreachable!("handle routes window-detected to a verify"),
         };
         self.known.insert(id, workspace.clone()); // judged below; later arrivals count it
         let left = self.persisted.exclusive_tiling.floated_on(id, &app).is_some_and(|ws| ws != workspace);
@@ -1387,6 +1395,25 @@ mod tests {
         w.tick(later());
         assert!(w.pending.is_none());
         assert!(w.warnings.list().iter().any(|x| x.key == "mismatch"));
+    }
+
+    #[test]
+    fn a_window_registered_after_the_pass_gets_its_workspace_placed() {
+        // At wake, list-windows can come back partial: workspace 1's windows are not
+        // registered yet, so the pass cannot see it and skips it.
+        let mut fake = docked();
+        let late = std::mem::take(&mut fake.ws.iter_mut().find(|w| w.name == "1").unwrap().windows);
+        let (mut w, _d) = worker(fake);
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert!(!w.aero.log.iter().any(|c| matches!(c, Cmd::Move { ws, .. } if ws == "1")));
+        w.aero.ws.iter_mut().find(|w| w.name == "1").unwrap().windows = late;
+        w.handle(Msg::Window(WindowEvent::WindowDetected {}));
+        assert!(w.pending.as_ref().is_some_and(|p| !p.full), "a detected window arms a verify, not a pass");
+        w.tick(later());
+        w.tick(later());
+        assert!(w.aero.log.iter().any(|c| matches!(c, Cmd::Move { ws, .. } if ws == "1")));
+        assert!(w.pending.is_none());
     }
 
     #[test]
