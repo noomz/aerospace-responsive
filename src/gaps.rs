@@ -145,7 +145,29 @@ pub fn plan(text: &str, want: &TopValue) -> Result<Plan> {
     };
     let gaps = doc.entry("gaps").or_insert(Item::Table(Table::new()));
     let outer = gaps.as_table_mut().context("`gaps` in the AeroSpace config is not a table")?.entry("outer").or_insert(Item::Table(Table::new()));
-    outer.as_table_mut().context("`gaps.outer` in the AeroSpace config is not a table")?.insert("top", Item::Value(v));
+    let outer = outer.as_table_mut().context("`gaps.outer` in the AeroSpace config is not a table")?;
+    // The comment lines around this key are the user's, not ours to remove — a rewrite that
+    // quietly deletes a commented-out alternative value is not "format-preserving". In toml_edit
+    // those comments ride on the KEY's decor, so capture them and put them back on the new key.
+    let key_decor = outer
+        .key("top")
+        .map(|k| {
+            let on_leaf = k.leaf_decor().prefix().is_some();
+            let d = if on_leaf { k.leaf_decor() } else { k.dotted_decor() };
+            (d.prefix().cloned(), d.suffix().cloned(), on_leaf)
+        })
+        .unwrap_or((None, None, true));
+    outer.insert("top", Item::Value(v));
+    if let Some(mut k) = outer.key_mut("top") {
+        let (prefix, suffix, on_leaf) = key_decor;
+        let d = if on_leaf { k.leaf_decor_mut() } else { k.dotted_decor_mut() };
+        if let Some(p) = prefix {
+            d.set_prefix(p);
+        }
+        if let Some(s) = suffix {
+            d.set_suffix(s);
+        }
+    }
     let new_text = doc.to_string();
     // Read our own output back: this both proves the file is still valid TOML and that the
     // value landed where we think it did (a dotted `gaps.outer.top` in the original could
@@ -235,6 +257,21 @@ mod tests {
         let p = plan("gaps.outer.top = 5\n", &TopValue { patterns: vec![(2, 20)], default: 52 }).unwrap();
         assert_eq!(current(&p.new_text).unwrap().unwrap(), TopValue { patterns: vec![(2, 20)], default: 52 });
         assert_eq!(p.new_text.matches("top").count(), 1, "{}", p.new_text);
+    }
+
+    #[test]
+    fn the_users_comments_around_the_line_survive_the_rewrite() {
+        // The commented-out alternative value is the user's, not ours to remove.
+        let text = "# Gap setup for SketchyBar\n[gaps]\ninner.horizontal = 8\n#outer.top = [{ monitor.main = 50 }, 10]\nouter.top = [{ monitor.main = 42 }, 1]\nouter.right = 10\n";
+        let p = plan(text, &TopValue { patterns: vec![(1, 0)], default: 42 }).unwrap();
+        assert!(p.changed);
+        assert!(p.new_text.contains("# Gap setup for SketchyBar"), "{}", p.new_text);
+        assert!(p.new_text.contains("#outer.top = [{ monitor.main = 50 }, 10]"), "{}", p.new_text);
+        assert!(p.new_text.contains("outer.top = [{ monitor.1 = 0 }, 42]"), "{}", p.new_text);
+        assert!(p.new_text.contains("outer.right = 10"), "{}", p.new_text);
+        assert_eq!(current(&p.new_text).unwrap().unwrap(), TopValue { patterns: vec![(1, 0)], default: 42 });
+        // and a steady state touches none of it.
+        assert!(!plan(&p.new_text, &TopValue { patterns: vec![(1, 0)], default: 42 }).unwrap().changed);
     }
 
     #[test]
