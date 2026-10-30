@@ -26,6 +26,11 @@ pub struct Persisted {
     pub lock: Option<String>,
     #[serde(default)]
     pub exclusive_tiling: TilingMemory,
+    /// The `outer.top` value this tool last wrote. A file that says something else means
+    /// another writer owns that line (an `after-startup-command` gap script, or a hand edit),
+    /// which is worth saying out loud because that writer will fight every pass.
+    #[serde(default)]
+    pub gap_written: Option<crate::gaps::TopValue>,
 }
 
 /// Exclusive tiling's memory (I.state): the windows the rule floated, and per workspace the

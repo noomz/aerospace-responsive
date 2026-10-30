@@ -31,13 +31,15 @@ aerospace-responsive install            # asks before each step; --yes, --only, 
 logs in `~/Library/Logs/aerospace-responsive/`), `reload` (`aerospace reload-config`, verified),
 `reconcile` (first pass). Re-running converges. `uninstall` reverses exactly what `install` added.
 
+After updating the binary with `cargo install`, restart the agent with `launchctl bootout gui/$UID/com.noomz.aerospace-responsive` then `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.noomz.aerospace-responsive.plist`, not `kickstart`: launchd caches the code requirement of the binary it last ran and refuses a replacement one (`last exit reason = OS_REASON_CODESIGNING`, `job state = spawn failed`).
+
 ## Commands
 
 | Command | Does |
 |---|---|
 | `reconcile [--dry-run] [--config F]` | Run a pass now, or print the exact `aerospace` commands it would run |
 | `explain [--config F]` | Every rule considered and why it won or lost; each exclusive-tiling workspace with its windows' verdicts |
-| `monitors` | Attached displays as predicates see them (roles, pixels, serial, labels) |
+| `monitors` | Attached displays as predicates see them (roles, pixels, notch, serial, labels) |
 | `status` | Profile, last pass, pins, exclusive tiling (live/inert), pending warnings — exits 4 while warnings are pending |
 | `pin [ws]` / `unpin [ws\|--all]` / `pins` | Protect a hand-tuned workspace's layout (placement still follows) |
 | `profile [lock <name> \| unlock]` | Show, lock or unlock the setup profile |
@@ -62,6 +64,42 @@ Predicate fields (every present field must hold): `name`, `label` (a `[[monitor]
 monitors matching the other fields. `{ main = false, nth = 2 }` is the second non-main monitor;
 fewer matches make the rule unsatisfiable (`explain` says `nth is 2, only 1 match`). `nth = 0`, or
 `nth` in `[[layout]]`, `[[monitor]]` or a profile `when`, is a load error.
+
+### Top gap and the notch
+
+AeroSpace adds `outer.top` on top of a monitor's **visible** area (`visibleRectPaddedByOuterGaps`),
+and a notched panel already has its notch height removed from that area. A top gap sized to clear a
+bar therefore lands notch-height lower on the built-in than on a display whose visible area starts at
+the physical top edge. A `[gaps]` block makes this tool own that one key and take the notch back, so
+the same number means the same clearance on every monitor:
+
+```toml
+[gaps]
+top-default = 1                    # every monitor no rule below names
+notch-compensation = true          # the default: subtract the measured notch, clamped at 0
+
+[[gaps.top]]
+monitor = { main = true }          # any monitor predicate except `nth`; first match wins
+value = 42
+```
+
+No `[gaps]` block ⇒ `outer.top` is never touched. `inner.*` and `outer.left/right/bottom` are never
+written, notch or not.
+
+The notch is measured, not guessed from a name: AppKit's two menu-bar strips beside the notch give
+its height, and a plain 24 pt menu bar (the strips meet, no gap) compensates nothing — so an older
+Retina panel with no notch keeps its configured number. `monitors` prints what was measured
+(`notch 32pt`), and `explain` prints the arithmetic and the exact line:
+
+```
+gaps: outer.top = [{ monitor.2 = 10 }, 1]
+  monitor 2   Built-in Retina Display    base  42 [gaps.top[0]  notch -32  ->  10]
+```
+
+On the pass that wants a different number, the tool rewrites that key in AeroSpace's config
+(format-preserving, refused if the file does not round-trip) and runs `aerospace reload-config
+--no-gui`. A steady state writes nothing and never reloads. If something else writes the line — a
+gap script in `after-startup-command`, a hand edit — the next pass warns and takes it back.
 
 ### Exclusive tiling
 
@@ -143,6 +181,7 @@ memory of what it floated) stays where it is; a reinstall picks it up.
 - Read an empty workspace's root layout (that would create and freeze it).
 - Flatten unless your rule says so **and** the root axis is about to change.
 - Poll. Or touch a pinned workspace's layout.
+- Write `outer.top` (or any other gap) when your config has no `[gaps]` block.
 
 ## License
 

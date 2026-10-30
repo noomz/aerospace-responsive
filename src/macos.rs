@@ -2,11 +2,11 @@
 //! unlock notification, NSScreen, and the NSApp run loop that makes CG callbacks arrive
 //! (tickets 07 and 10: a bare CFRunLoop receives nothing — D24).
 
-use crate::display::{Rect, Screen};
+use crate::display::{Rect, Screen, notch_height};
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSScreen};
-use objc2_foundation::{NSNumber, NSString};
+use objc2_foundation::{NSNumber, NSRect, NSString};
 use std::ffi::{c_char, c_void};
 use std::sync::{Mutex, OnceLock};
 
@@ -178,7 +178,16 @@ fn on_main<R: Send, F: FnOnce() -> R + Send>(f: F) -> R {
     ctx.r.expect("the main queue ran the closure")
 }
 
-fn cg_screen(cg_id: u32, name: String) -> Screen {
+fn rect(r: NSRect) -> Rect {
+    Rect { x: r.origin.x, y: r.origin.y, w: r.size.width, h: r.size.height }
+}
+
+/// The `(width, height)` of one of AppKit's two menu-bar strips beside a notch.
+fn strip(r: NSRect) -> (f64, f64) {
+    (r.size.width, r.size.height)
+}
+
+fn cg_screen(s: &NSScreen, cg_id: u32, name: String) -> Screen {
     unsafe {
         let b = CGDisplayBounds(cg_id);
         let mode = CGDisplayCopyDisplayMode(cg_id);
@@ -201,6 +210,7 @@ fn cg_screen(cg_id: u32, name: String) -> Screen {
             vendor: CGDisplayVendorNumber(cg_id),
             model: CGDisplayModelNumber(cg_id),
             serial: CGDisplaySerialNumber(cg_id),
+            notch: notch_height(&rect(s.frame()), &rect(s.visibleFrame()), strip(s.auxiliaryTopLeftArea()), strip(s.auxiliaryTopRightArea())),
         }
     }
 }
@@ -215,7 +225,7 @@ pub fn screens() -> Vec<Screen> {
             .iter()
             .filter_map(|s| {
                 let number = s.deviceDescription().objectForKey(&key)?.downcast::<NSNumber>().ok()?;
-                Some(cg_screen(number.unsignedIntValue(), s.localizedName().to_string()))
+                Some(cg_screen(&s, number.unsignedIntValue(), s.localizedName().to_string()))
             })
             .collect()
     })

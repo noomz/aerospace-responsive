@@ -5,6 +5,7 @@ pub mod aero;
 pub mod config;
 pub mod daemon;
 pub mod display;
+pub mod gaps;
 pub mod install;
 pub mod ipc;
 pub mod macos;

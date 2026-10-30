@@ -85,9 +85,10 @@ pub fn monitors(views: &[MonitorView]) -> String {
     for m in views {
         let (d, s) = (&m.display, &m.display.screen);
         let _ = writeln!(o, "monitor {}  {}  (cg {})", d.aero_id, d.aero_name, s.cg_id);
+        let notch = if s.notch > 0.0 { format!("  notch {}pt", s.notch) } else { String::new() };
         let _ = writeln!(
             o,
-            "    {}x{} px  {}x{} pt at ({}, {})  rotation {}",
+            "    {}x{} px  {}x{} pt at ({}, {})  rotation {}{notch}",
             s.px_w, s.px_h, s.bounds.w, s.bounds.h, s.bounds.x, s.bounds.y, s.rotation
         );
         let roles: Vec<&str> = [(s.builtin, "builtin"), (m.external, "external"), (m.portrait, "portrait"), (!m.portrait, "landscape"), (s.main, "main")]
@@ -133,11 +134,28 @@ pub fn explain(r: &Resolved) -> String {
             let _ = writeln!(o, "      {:<28} {}", c.rule, c.outcome);
         }
     }
+    o.push_str(&gaps(r));
     for n in &r.no_match {
         let _ = writeln!(o, "warning: {n}");
     }
     for i in &r.info {
         let _ = writeln!(o, "info: {i}");
+    }
+    o
+}
+
+/// `explain`'s gaps section: the line the tool wants AeroSpace to hold, and where each
+/// monitor's number came from — the rule, the notch that came off it, and what remains.
+/// With no `[gaps]` block it says so, because then `outer.top` is not this tool's.
+pub fn gaps(r: &Resolved) -> String {
+    let Some(want) = crate::gaps::desired(&r.gaps) else {
+        return "gaps: not managed (no [gaps] block): outer.top is left alone\n".to_string();
+    };
+    let mut o = String::new();
+    let _ = writeln!(o, "gaps: outer.top = {}", want.to_toml());
+    for d in &r.gaps {
+        let comp = if d.notch > 0.0 { format!("  notch -{}", d.notch) } else { String::new() };
+        let _ = writeln!(o, "  monitor {:<3} {:<24} base {:>3} [{:<14}{comp}  ->  {:>3}]", d.monitor, d.monitor_name, d.base, d.source, d.top);
     }
     o
 }
@@ -288,6 +306,29 @@ mod tests {
     fn resolved() -> Resolved {
         let cfg = parse(include_str!("../aerospace-responsive.example.toml")).unwrap().config;
         resolve(&cfg, &desk3(), None)
+    }
+
+    #[test]
+    fn explain_prints_the_gap_arithmetic_and_the_line() {
+        let cfg = parse("[gaps]\ntop-default = 1\n[[gaps.top]]\nmonitor = { builtin = true }\nvalue = 52\n").unwrap().config;
+        let r = resolve(&cfg, &desk3(), None);
+        let text = explain(&r);
+        // The built-in (monitor 2) carries a 32 pt notch in the fixtures: 52 - 32 = 20 there, 1 on the LENs.
+        assert!(text.contains("gaps: outer.top = [{ monitor.2 = 20 }, 1]"), "{text}");
+        assert!(text.contains("notch -32"), "{text}");
+        let unmanaged = resolve(&crate::config::Config::default(), &desk3(), None);
+        assert!(explain(&unmanaged).contains("gaps: not managed"), "no [gaps] block says so");
+        assert!(monitors(&[]).is_empty());
+    }
+
+    #[test]
+    fn monitors_prints_the_measured_notch() {
+        let d = crate::testutil::builtin(2);
+        let v = MonitorView { labels: vec![], portrait: d.portrait(), external: d.external(), pixel_area: d.pixel_area(), display: d };
+        let text = monitors(&[v]);
+        assert!(text.contains("notch 32pt"), "{text}");
+        let plain = MonitorView { labels: vec![], portrait: false, external: true, pixel_area: 0, display: crate::testutil::len_landscape(3) };
+        assert!(!monitors(&[plain]).contains("notch"), "no notch, no word");
     }
 
     #[test]

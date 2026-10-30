@@ -23,6 +23,10 @@ pub struct Config {
     pub profile: Vec<Profile>,
     #[serde(default, rename = "exclusive-tiling")]
     pub exclusive_tiling: Vec<TilingBlock>,
+    /// The top gap this tool owns. Absent = it never touches `outer.top`; present = every
+    /// pass makes AeroSpace's value match what the rules and the measured notches say.
+    #[serde(default)]
+    pub gaps: Option<Gaps>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -89,6 +93,29 @@ pub struct Pred {
     /// A set-level property: only valid in a `[[placement]]` monitor (validated at load).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nth: Option<u32>,
+}
+
+/// The `outer.top` gap this tool owns. `inner.*` and `outer.left/right/bottom` stay untouched.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Gaps {
+    /// What every monitor gets that no `[[gaps.top]]` rule names — AeroSpace's trailing value.
+    pub top_default: u32,
+    /// Subtract the measured notch height from a notched monitor's top gap, because AeroSpace
+    /// adds its gap on top of a `visibleFrame` that already excludes the notch. Default true.
+    #[serde(default = "yes")]
+    pub notch_compensation: bool,
+    /// Per-monitor values; first match wins, in file order.
+    #[serde(default)]
+    pub top: Vec<GapRule>,
+}
+
+/// One `[[gaps.top]]` block: a monitor predicate and the top gap to use there.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GapRule {
+    pub monitor: Pred,
+    pub value: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -334,6 +361,11 @@ fn validate(c: &Config) -> Result<()> {
         Ok(())
     };
     check_rules(&c.layout, &c.placement, "")?;
+    if let Some(g) = &c.gaps {
+        for (i, r) in g.top.iter().enumerate() {
+            check_per_monitor(&r.monitor, &format!("gaps.top[{i}]"))?;
+        }
+    }
     let mut names = BTreeSet::new();
     for p in &c.profile {
         if !names.insert(p.name.as_str()) {
@@ -388,6 +420,11 @@ impl Config {
     /// Any `[[exclusive-tiling]]` block anywhere: the subscribe child runs only then (V14).
     pub fn has_exclusive_tiling(&self) -> bool {
         !self.exclusive_tiling.is_empty() || self.profile.iter().any(|p| !p.exclusive_tiling.is_empty())
+    }
+
+    /// Whether `outer.top` is this tool's to write (a `[gaps]` block exists).
+    pub fn owns_gaps(&self) -> bool {
+        self.gaps.is_some()
     }
 }
 
@@ -530,6 +567,29 @@ mod tests {
         let l = parse(&block).unwrap();
         let r = crate::tiling::effective(&l.config, None);
         assert_eq!((r.len(), r[0].workspace.as_str(), r[0].tiling_allowlist.len()), (1, "T", 2));
+    }
+
+    #[test]
+    fn the_commented_gaps_block_parses_when_uncommented() {
+        let start = EXAMPLE.find("# [gaps]").expect("example has the block");
+        let block: String = EXAMPLE[start..]
+            .lines()
+            .take_while(|l| l.starts_with("# ") || l.starts_with('#'))
+            .map(|l| format!("{}\n", l.strip_prefix("# ").unwrap_or(l)))
+            .collect();
+        let l = parse(&block).unwrap();
+        assert!(l.config.owns_gaps());
+        let g = l.config.gaps.unwrap();
+        assert_eq!((g.top_default, g.notch_compensation, g.top.len()), (1, true, 1));
+        assert_eq!(g.top[0].value, 42);
+    }
+
+    #[test]
+    fn a_gaps_rule_rejects_nth_like_layout_does() {
+        let err = parse("[gaps]\ntop-default = 1\n[[gaps.top]]\nmonitor = { builtin = true, nth = 2 }\nvalue = 42\n").unwrap_err();
+        assert!(format!("{err:#}").contains("nth is only valid in [[placement]] monitor"), "{err:#}");
+        assert!(parse("[gaps]\nnotch = 32\n").is_err(), "no key by that name");
+        assert!(parse("[gaps]\ntop-default = 1\n").unwrap().config.owns_gaps());
     }
 
     #[test]

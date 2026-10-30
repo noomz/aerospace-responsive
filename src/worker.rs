@@ -4,7 +4,9 @@
 use crate::aero::{self, Aero, Cmd, SubLine, Subscription, WindowEvent};
 use crate::config::{self, Config};
 use crate::display::{Display, Screen};
+use crate::gaps;
 use crate::ipc::{Request, Response};
+use crate::paths;
 use crate::pass::{self, PassReport};
 use crate::render::{self, LastPass, MonitorView, PinView, StatusView, TilingStatus};
 use crate::restore::{self, RestoreCtx};
@@ -108,6 +110,9 @@ pub struct Worker<A: Aero, S: FnMut() -> Vec<Screen>> {
     /// Where the daemon has seen each window (connect resync, then every event): an arrival is
     /// judged only against windows it already knew there, so arrival order wins a burst (V22).
     known: std::collections::BTreeMap<u32, String>,
+    /// Where AeroSpace's config lives: its own lookup in production (`paths::aerospace_config`),
+    /// a temp file in a test.
+    aero_config: Box<dyn Fn() -> Result<PathBuf, String> + Send>,
     /// Exclusive tiling's memory as `state.json` had it: observe mode keeps its own changes
     /// in-process and writes this back instead (V15).
     tiling_on_disk: TilingMemory,
@@ -137,6 +142,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             screens,
             config_path,
             state_path,
+            aero_config: Box::new(paths::aerospace_config),
             config: Config::default(),
             config_text: None,
             persisted,
@@ -298,6 +304,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         };
         let r = self.resolve_live(&ds);
         let pinned = self.persisted.pinned_names();
+        self.apply_gaps(&r); // ahead of any window read: an empty read at wake must not strand the gap
         if self.observe {
             return self.observe_pass(&r, &ds, &pinned, p);
         }
@@ -331,6 +338,73 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 self.record(p.trigger, msg.clone());
                 reply_all(p.waiters, Response::err(msg));
             }
+        }
+    }
+
+    /// The top gap step. AeroSpace adds `outer.top` on top of a `visibleFrame` that already
+    /// excludes a notch, so a notched panel gets that height taken back; the same configured
+    /// number then means the same distance from the usable edge on every monitor. No `[gaps]`
+    /// block means the line is not ours and is never touched. A steady state writes nothing.
+    ///
+    /// Every problem here warns as `Class::World`: it is re-derived from the file on
+    /// every pass, so it clears itself as soon as the cause goes, and a clean pass cannot
+    /// swallow it the way it swallows a `Class::Pass` warning raised mid-pass.
+    fn apply_gaps(&mut self, r: &Resolved) {
+        let Some(want) = gaps::desired(&r.gaps) else { return };
+        let path = match (self.aero_config)() {
+            Ok(p) => p,
+            Err(e) => {
+                self.warn(Class::World, "gaps", &e);
+                return;
+            }
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.warn(Class::World, "gaps", &format!("cannot read {}: {e}", path.display()));
+                return;
+            }
+        };
+        let plan = match gaps::plan(&text, &want) {
+            Ok(p) => p,
+            Err(e) => {
+                self.warn(Class::World, "gaps", &format!("outer.top left alone: {e:#}",));
+                return;
+            }
+        };
+        if let Some(prev) = self.persisted.gap_written.clone() {
+            if plan.on_disk.as_ref() != Some(&prev) {
+                let now = plan.on_disk.as_ref().map_or_else(|| "a shape this tool does not write".to_string(), |v| v.to_toml());
+                self.warn(
+                    Class::World,
+                    "gaps-writer",
+                    &format!("outer.top in {} is {now}, not the {prev:?} this tool wrote: another writer owns that line", path.display()),
+                );
+            }
+        }
+        if self.persisted.gap_written.as_ref() != Some(&want) {
+            self.persisted.gap_written = Some(want.clone());
+            self.save_state();
+        }
+        if !plan.changed {
+            return;
+        }
+        if self.observe {
+            crate::log!("gaps: would write outer.top = {} to {}", want.to_toml(), path.display());
+            return;
+        }
+        if let Err(e) = std::fs::write(&path, &plan.new_text) {
+            self.warn(Class::World, "gaps", &format!("cannot write {}: {e}", path.display()));
+            return;
+        }
+        let from = plan.on_disk.map_or_else(|| "-".to_string(), |v| v.to_toml());
+        crate::log!("gaps: outer.top {from} -> {} in {}", want.to_toml(), path.display());
+        if let Err(e) = self.aero.run(&Cmd::ReloadConfig) {
+            self.warn(Class::World, "gaps", &format!("wrote outer.top = {} but AeroSpace did not reload: {e}", want.to_toml()));
+        } else {
+            // Worth one line: a reload is the moment AeroSpace re-reads every gap, and a silent
+            // one is hard to attribute afterwards.
+            crate::log!("  {}", Cmd::ReloadConfig);
         }
     }
 
@@ -853,8 +927,8 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let cmds = pass::dry_run(&r, &s, &ds, &self.persisted.pinned_names(), &plans);
         let lines: Vec<String> = cmds.iter().map(|c| c.to_string()).collect();
         let converge: Vec<Value> = reasons(&plans).into_iter().map(|(ws, why)| json!({ "workspace": ws, "reason": why })).collect();
-        let text = render::dry_run(&r, &cmds, &reasons(&plans));
-        Ok(Response::ok(text, json!({ "placement": r.placement, "converge": converge, "commands": lines })))
+        let text = format!("{}{}", render::dry_run(&r, &cmds, &reasons(&plans)), render::gaps(&r));
+        Ok(Response::ok(text, json!({ "placement": r.placement, "converge": converge, "commands": lines, "gaps": r.gaps })))
     }
 
     fn monitors(&mut self) -> Result<Response, String> {
@@ -1029,6 +1103,88 @@ mod tests {
             ],
             "T",
         )
+    }
+
+    #[test]
+    fn the_gap_step_compensates_the_notch_once_then_says_nothing() {
+        let (mut w, dir) = worker_cfg(
+            FakeAero::new(&desk3(), &[("1", 2, true, 1, Axis::H)], "1"),
+            "[gaps]\ntop-default = 1\n[[gaps.top]]\nmonitor = { builtin = true }\nvalue = 52\n",
+            None,
+        );
+        let aero_cfg = dir.path().join("aerospace.toml");
+        std::fs::write(&aero_cfg, "[gaps]\ninner.horizontal = 8   # tight\nouter.top = [{ monitor.main = 42 }, 1]\n").unwrap();
+        let p = aero_cfg.clone();
+        w.aero_config = Box::new(move || Ok(p.clone()));
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        // desk3 puts the built-in at monitor 2 with a 32 pt notch: 52 - 32 = 20 there, 1 elsewhere.
+        let text = std::fs::read_to_string(&aero_cfg).unwrap();
+        assert!(text.contains("outer.top = [{ monitor.2 = 20 }, 1]"), "{text}");
+        assert!(text.contains("inner.horizontal = 8   # tight"), "the rest of the file is untouched: {text}");
+        assert!(w.aero.log.iter().any(|c| *c == Cmd::ReloadConfig), "AeroSpace must be told to reread");
+        // Steady state: a second pass writes nothing and never reloads.
+        let n = w.aero.log.len();
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert_eq!(std::fs::read_to_string(&aero_cfg).unwrap(), text);
+        assert!(!w.aero.log.iter().skip(n).any(|c| *c == Cmd::ReloadConfig), "no change, no reload");
+    }
+
+    #[test]
+    fn the_gap_step_takes_the_line_over_and_says_who_else_writes_it() {
+        let (mut w, dir) = worker_cfg(
+            FakeAero::new(&desk3(), &[("1", 2, true, 1, Axis::H)], "1"),
+            "[gaps]\ntop-default = 1\n[[gaps.top]]\nmonitor = { builtin = true }\nvalue = 52\n",
+            None,
+        );
+        let aero_cfg = dir.path().join("aerospace.toml");
+        std::fs::write(&aero_cfg, "[gaps]\nouter.top = 42\n").unwrap();
+        let p = aero_cfg.clone();
+        w.aero_config = Box::new(move || Ok(p.clone()));
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert_eq!(w.persisted.gap_written.as_ref().map(|v| v.to_toml()), Some("[{ monitor.2 = 20 }, 1]".to_string()));
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        // A hand edit (or a gap script) now shows up instead of being silently overwritten.
+        std::fs::write(&aero_cfg, "[gaps]\nouter.top = 42\n").unwrap();
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        let r = ask(&mut w, Request::Status);
+        assert!(serde_json::to_string(&r.json).unwrap().contains("outer.top in"), "{r:?}");
+        // and it is taken back, so the next pass starts from our value again.
+        assert_eq!(std::fs::read_to_string(&aero_cfg).unwrap(), "[gaps]\nouter.top = [{ monitor.2 = 20 }, 1]\n");
+    }
+
+    #[test]
+    fn no_gaps_block_means_outer_top_is_never_touched() {
+        let (mut w, dir) = worker_cfg(FakeAero::new(&desk3(), &[("1", 2, true, 1, Axis::H)], "1"), "", None);
+        let aero_cfg = dir.path().join("aerospace.toml");
+        std::fs::write(&aero_cfg, "[gaps]\nouter.top = 42\n").unwrap();
+        let p = aero_cfg.clone();
+        w.aero_config = Box::new(move || Ok(p.clone()));
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert_eq!(std::fs::read_to_string(&aero_cfg).unwrap(), "[gaps]\nouter.top = 42\n");
+        assert!(!w.aero.log.iter().any(|c| *c == Cmd::ReloadConfig));
+        assert!(w.persisted.gap_written.is_none());
+    }
+
+    #[test]
+    fn observe_mode_shows_the_gap_line_without_writing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg.toml");
+        std::fs::write(&cfg, format!("{EXAMPLE}[gaps]\ntop-default = 1\n")) .unwrap();
+        let aero_cfg = dir.path().join("aerospace.toml");
+        std::fs::write(&aero_cfg, "[gaps]\nouter.top = 42\n").unwrap();
+        let p = aero_cfg.clone();
+        let mut w = Worker::new(FakeAero::new(&desk3(), &[("1", 2, true, 1, Axis::H)], "1"), all_screens(), cfg, dir.path().join("state.json"), true, true);
+        w.set_sender(mpsc::channel().0);
+        w.aero_config = Box::new(move || Ok(p.clone()));
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert_eq!(std::fs::read_to_string(&aero_cfg).unwrap(), "[gaps]\nouter.top = 42\n", "observe writes nothing");
     }
 
     fn all_screens() -> Box<dyn FnMut() -> Vec<Screen>> {

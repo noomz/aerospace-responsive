@@ -1,7 +1,7 @@
 //! Predicate matching, profile selection and rule resolution (tickets 01, 02, 06).
 //! Pure: the same code answers a live pass, `explain`, and `reconcile --dry-run`.
 
-use crate::config::{Axis, Config, LayoutRule, MonitorSpec, PlacementRule, Pred, Profile, Rank, SetPred};
+use crate::config::{Axis, Config, GapRule, Gaps, LayoutRule, MonitorSpec, PlacementRule, Pred, Profile, Rank, SetPred};
 use crate::display::Display;
 use serde::Serialize;
 
@@ -118,6 +118,20 @@ pub struct PlacementDecision {
     pub considered: Vec<Considered>,
 }
 
+/// One monitor's top gap: the configured number, what the notch cost, and what AeroSpace gets.
+#[derive(Debug, Clone, Serialize)]
+pub struct GapDecision {
+    pub monitor: u32,
+    pub monitor_name: String,
+    /// The configured value, before notch compensation.
+    pub base: u32,
+    pub source: String,
+    /// Points subtracted for a notch (`0.0` with no notch, or with compensation switched off).
+    pub notch: f64,
+    /// The value AeroSpace is told to use.
+    pub top: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Resolved {
     pub profile: Option<String>,
@@ -135,6 +149,9 @@ pub struct Resolved {
     pub info: Vec<String>,
     /// Effective exclusive-tiling rules for this setup, by workspace (V16).
     pub exclusive_tiling: Vec<crate::tiling::Rule>,
+    /// One per attached display when the config has a `[gaps]` block; empty means `outer.top`
+    /// is not this tool's to write.
+    pub gaps: Vec<GapDecision>,
 }
 
 impl Resolved {
@@ -143,6 +160,11 @@ impl Resolved {
     }
     pub fn target_for(&self, ws: &str) -> Option<u32> {
         self.placement.iter().find(|p| p.workspace == ws).and_then(|p| p.target)
+    }
+
+    /// Whether this setup makes the tool write `outer.top`.
+    pub fn owns_gaps(&self) -> bool {
+        !self.gaps.is_empty()
     }
 }
 
@@ -158,6 +180,13 @@ pub fn resolve(cfg: &Config, ds: &[Display], lock: Option<&str>) -> Resolved {
         .into_iter()
         .map(|ws| decide_placement(cfg, ds, ws, &placement_rules))
         .collect();
+    let gaps = match &cfg.gaps {
+        None => vec![],
+        Some(g) => {
+            let rules: Vec<(String, &GapRule)> = g.top.iter().enumerate().map(|(i, r)| (format!("gaps.top[{i}]"), r)).collect();
+            ds.iter().map(|d| decide_gap(cfg, d, g, &rules)).collect()
+        }
+    };
     let (mut no_match, mut info) = (vec![], vec![]);
     for (name, r) in &layout_rules {
         if ds.iter().any(|d| matches(&r.when, d, cfg)) {
@@ -178,6 +207,25 @@ pub fn resolve(cfg: &Config, ds: &[Display], lock: Option<&str>) -> Resolved {
         no_match,
         info,
         exclusive_tiling: crate::tiling::effective(cfg, profile),
+        gaps,
+    }
+}
+
+/// One monitor's top gap: first matching `[[gaps.top]]` rule wins, else the default; then the
+/// measured notch comes off, clamped at zero (a gap cannot be negative).
+fn decide_gap(cfg: &Config, d: &Display, g: &Gaps, rules: &[(String, &GapRule)]) -> GapDecision {
+    let (base, source) = match rules.iter().find(|(_, r)| matches(&r.monitor, d, cfg)) {
+        Some((src, r)) => (r.value, src.clone()),
+        None => (g.top_default, "top-default".to_string()),
+    };
+    let notch = if g.notch_compensation { d.notch_height() } else { 0.0 };
+    GapDecision {
+        monitor: d.aero_id,
+        monitor_name: d.aero_name.clone(),
+        base,
+        source,
+        notch,
+        top: (base as f64 - notch).round().max(0.0) as u32,
     }
 }
 

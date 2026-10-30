@@ -23,6 +23,9 @@ pub enum Cmd {
     /// Exclusive tiling's else-action, and its undo (I.aero).
     Float { id: u32 },
     Tile { id: u32 },
+    /// The only way AeroSpace picks up a changed `outer.top`: it reads its config on reload,
+    /// and `--no-gui` keeps that silent (the daemon has no GUI to answer one).
+    ReloadConfig,
 }
 
 impl Cmd {
@@ -40,6 +43,7 @@ impl Cmd {
             Cmd::Focus { ws } => vec![s("workspace"), s("--"), ws.clone()],
             Cmd::Float { id } => vec![s("layout"), s("floating"), s("--window-id"), id.to_string()],
             Cmd::Tile { id } => vec![s("layout"), s("tiling"), s("--window-id"), id.to_string()],
+            Cmd::ReloadConfig => vec![s("reload-config"), s("--no-gui")],
         }
     }
 }
@@ -258,6 +262,7 @@ mod tests {
         assert_eq!(Cmd::Focus { ws: "T".into() }.to_string(), "aerospace workspace -- T");
         assert_eq!(Cmd::Float { id: 5230 }.to_string(), "aerospace layout floating --window-id 5230");
         assert_eq!(Cmd::Tile { id: 4380 }.to_string(), "aerospace layout tiling --window-id 4380");
+        assert_eq!(Cmd::ReloadConfig.to_string(), "aerospace reload-config --no-gui");
     }
 
     #[test]

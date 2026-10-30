@@ -69,6 +69,20 @@ name        = "laptop-only"
 when        = { count = 1, builtin = true }
 description = "defaults are correct here; the profile exists to say so deliberately"
 
+# ---------- gaps: this tool owns AeroSpace's outer.top only if you say so ----------
+# No [gaps] block = outer.top is never touched. inner.* and outer.left/right/bottom stay yours.
+# The notch a display really has is measured and subtracted: AeroSpace adds the gap on top of a
+# visible area that already excludes it, so the same value means the same clearance everywhere.
+# `monitors` prints the measured notch; `explain` prints the arithmetic.
+#
+# [gaps]
+# top-default = 1               # every monitor no [[gaps.top]] rule names
+# notch-compensation = true     # default; measured notch height taken off, clamped at 0
+#
+# [[gaps.top]]
+# monitor = { main = true }     # any monitor predicate except nth; first match wins
+# value = 42
+
 # ---------- exclusive tiling: only the allowlist tiles on a workspace ----------
 # Needs AeroSpace with the window-moved/window-closed events (README, Requirements); on stock
 # AeroSpace the rule is inert and `status` warns. A window arriving TILED that the allowlist
