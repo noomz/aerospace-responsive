@@ -128,6 +128,8 @@ pub struct GapDecision {
     pub source: String,
     /// Points subtracted for a notch (`0.0` with no notch, or with compensation switched off).
     pub notch: f64,
+    /// Menu bar height added for the single main monitor, or zero.
+    pub menu_bar_add: f64,
     /// The value AeroSpace is told to use.
     pub top: u32,
 }
@@ -184,7 +186,7 @@ pub fn resolve(cfg: &Config, ds: &[Display], lock: Option<&str>) -> Resolved {
         None => vec![],
         Some(g) => {
             let rules: Vec<(String, &GapRule)> = g.top.iter().enumerate().map(|(i, r)| (format!("gaps.top[{i}]"), r)).collect();
-            ds.iter().map(|d| decide_gap(cfg, d, g, &rules)).collect()
+            ds.iter().map(|d| decide_gap(cfg, d, g, &rules, ds.len() == 1)).collect()
         }
     };
     let (mut no_match, mut info) = (vec![], vec![]);
@@ -213,19 +215,21 @@ pub fn resolve(cfg: &Config, ds: &[Display], lock: Option<&str>) -> Resolved {
 
 /// One monitor's top gap: first matching `[[gaps.top]]` rule wins, else the default; then the
 /// measured notch comes off, clamped at zero (a gap cannot be negative).
-fn decide_gap(cfg: &Config, d: &Display, g: &Gaps, rules: &[(String, &GapRule)]) -> GapDecision {
+fn decide_gap(cfg: &Config, d: &Display, g: &Gaps, rules: &[(String, &GapRule)], single: bool) -> GapDecision {
     let (base, source) = match rules.iter().find(|(_, r)| matches(&r.monitor, d, cfg)) {
         Some((src, r)) => (r.value, src.clone()),
         None => (g.top_default, "top-default".to_string()),
     };
     let notch = if g.notch_compensation { d.notch_height() } else { 0.0 };
+    let menu_bar_add = if g.add_menu_bar_height_when_single_monitor && single && d.screen.main { d.screen.menu_bar_height } else { 0.0 };
     GapDecision {
         monitor: d.aero_id,
         monitor_name: d.aero_name.clone(),
         base,
         source,
         notch,
-        top: (base as f64 - notch).round().max(0.0) as u32,
+        menu_bar_add,
+        top: (base as f64 - notch + menu_bar_add).round().max(0.0) as u32,
     }
 }
 
@@ -360,6 +364,24 @@ mod tests {
 
     fn example() -> Config {
         parse(include_str!("../aerospace-responsive.example.toml")).unwrap().config
+    }
+
+    #[test]
+    fn menu_bar_height_is_added_only_for_one_main_monitor() {
+        let cfg = parse("[gaps]\ntop-default = 42\nadd-menu-bar-height-when-single-monitor = true\n").unwrap().config;
+        let laptop = builtin(1);
+        let one = resolve(&cfg, std::slice::from_ref(&laptop), None);
+        assert_eq!((one.gaps[0].notch, one.gaps[0].menu_bar_add, one.gaps[0].top), (32.0, 33.0, 43));
+        let external = resolve(&cfg, &[studio(1)], None);
+        assert_eq!(external.gaps[0].top, 75);
+        let multiple = resolve(&cfg, &[laptop, len_landscape(2)], None);
+        assert_eq!((multiple.gaps[0].menu_bar_add, multiple.gaps[0].top), (0.0, 10));
+        let non_main = resolve(&cfg, &[len_landscape(1)], None);
+        assert_eq!(non_main.gaps[0].menu_bar_add, 0.0);
+        let disabled = parse("[gaps]\ntop-default = 42\n").unwrap().config;
+        assert_eq!(resolve(&disabled, &[builtin(1)], None).gaps[0].top, 10);
+        let no_notch = parse("[gaps]\ntop-default = 42\nnotch-compensation = false\nadd-menu-bar-height-when-single-monitor = true\n").unwrap().config;
+        assert_eq!(resolve(&no_notch, &[builtin(1)], None).gaps[0].top, 75);
     }
 
     #[test]

@@ -77,6 +77,7 @@ the same number means the same clearance on every monitor:
 [gaps]
 top-default = 1                    # every monitor no rule below names
 notch-compensation = true          # the default: subtract the measured notch, clamped at 0
+add-menu-bar-height-when-single-monitor = true # opt in; default false
 
 [[gaps.top]]
 monitor = { main = true }          # any monitor predicate except `nth`; first match wins
@@ -95,6 +96,11 @@ Retina panel with no notch keeps its configured number. `monitors` prints what w
 gaps: outer.top = [{ monitor.2 = 10 }, 1]
   monitor 2   Built-in Retina Display    base  42 [gaps.top[0]  notch -32  ->  10]
 ```
+
+When `add-menu-bar-height-when-single-monitor` is enabled, one attached main monitor gets the
+AppKit `NSMenu.menuBarHeight` added after notch compensation, even when the menu bar is hidden.
+Multiple monitors keep the normal gap. The daemon checks for height changes every 10 seconds while
+this option is enabled; display changes also trigger reconciliation. `explain` shows the addition.
 
 On the pass that wants a different number, the tool rewrites that key in AeroSpace's config
 (format-preserving, refused if the file does not round-trip) and runs `aerospace reload-config

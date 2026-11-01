@@ -105,6 +105,9 @@ pub struct Gaps {
     /// adds its gap on top of a `visibleFrame` that already excludes the notch. Default true.
     #[serde(default = "yes")]
     pub notch_compensation: bool,
+    /// Add the menu bar height when exactly one main monitor is attached.
+    #[serde(default)]
+    pub add_menu_bar_height_when_single_monitor: bool,
     /// Per-monitor values; first match wins, in file order.
     #[serde(default)]
     pub top: Vec<GapRule>,

@@ -184,7 +184,7 @@ mod tests {
     use crate::rules::GapDecision;
 
     fn d(monitor: u32, top: u32) -> GapDecision {
-        GapDecision { monitor, monitor_name: format!("m{monitor}"), base: top, source: "x".into(), notch: 0.0, top }
+        GapDecision { monitor, monitor_name: format!("m{monitor}"), base: top, source: "x".into(), notch: 0.0, menu_bar_add: 0.0, top }
     }
 
     #[test]

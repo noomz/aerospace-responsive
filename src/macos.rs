@@ -5,7 +5,7 @@
 use crate::display::{Rect, Screen, notch_height};
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSScreen};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSMenu, NSScreen};
 use objc2_foundation::{NSNumber, NSRect, NSString};
 use std::ffi::{c_char, c_void};
 use std::sync::{Mutex, OnceLock};
@@ -187,7 +187,7 @@ fn strip(r: NSRect) -> (f64, f64) {
     (r.size.width, r.size.height)
 }
 
-fn cg_screen(s: &NSScreen, cg_id: u32, name: String) -> Screen {
+fn cg_screen(s: &NSScreen, cg_id: u32, name: String, menu_bar_height: f64) -> Screen {
     unsafe {
         let b = CGDisplayBounds(cg_id);
         let mode = CGDisplayCopyDisplayMode(cg_id);
@@ -211,6 +211,7 @@ fn cg_screen(s: &NSScreen, cg_id: u32, name: String) -> Screen {
             model: CGDisplayModelNumber(cg_id),
             serial: CGDisplaySerialNumber(cg_id),
             notch: notch_height(&rect(s.frame()), &rect(s.visibleFrame()), strip(s.auxiliaryTopLeftArea()), strip(s.auxiliaryTopRightArea())),
+            menu_bar_height,
         }
     }
 }
@@ -220,12 +221,17 @@ fn cg_screen(s: &NSScreen, cg_id: u32, name: String) -> Screen {
 pub fn screens() -> Vec<Screen> {
     on_main(|| {
         let mtm = MainThreadMarker::new().expect("on the main thread");
+        let app = NSApplication::sharedApplication(mtm);
+        if app.mainMenu().is_none() {
+            app.setMainMenu(Some(&NSMenu::new(mtm)));
+        }
+        let menu_bar_height = app.mainMenu().map_or(0.0, |menu| menu.menuBarHeight());
         let key = NSString::from_str("NSScreenNumber");
         NSScreen::screens(mtm)
             .iter()
             .filter_map(|s| {
                 let number = s.deviceDescription().objectForKey(&key)?.downcast::<NSNumber>().ok()?;
-                Some(cg_screen(&s, number.unsignedIntValue(), s.localizedName().to_string()))
+                Some(cg_screen(&s, number.unsignedIntValue(), s.localizedName().to_string(), menu_bar_height))
             })
             .collect()
     })

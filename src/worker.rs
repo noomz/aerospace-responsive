@@ -52,6 +52,7 @@ pub enum Msg {
 }
 
 const BACKSTOP_DELAY: Duration = Duration::from_secs(10); // P-13
+const MENU_BAR_POLL: Duration = Duration::from_secs(10);
 const GATE_TRIES: u32 = 3; // P-2
 /// V14: bounded respawn after the child exits; after these only existing triggers respawn.
 const SUB_RETRY: [Duration; 3] = [Duration::from_secs(1), Duration::from_secs(5), Duration::from_secs(30)];
@@ -91,6 +92,7 @@ pub struct Worker<A: Aero, S: FnMut() -> Vec<Screen>> {
     debounce: Duration,
     pending: Option<Pending>,
     backstop: Option<Instant>,
+    menu_bar_poll: Instant,
     aero_up: bool,
     restore: Option<RestoreCtx>,
     gate_failures: u32,
@@ -151,6 +153,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             debounce: Duration::from_millis(config::TRAILING_FLOOR_MS),
             pending: None,
             backstop: None,
+            menu_bar_poll: Instant::now() + MENU_BAR_POLL,
             aero_up,
             restore: None,
             gate_failures: 0,
@@ -177,7 +180,8 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
 
     pub fn run(mut self, rx: Receiver<Msg>) {
         loop {
-            let due = [self.pending.as_ref().map(|p| p.due), self.backstop, self.sub_retry_at].into_iter().flatten().min();
+            let menu_poll = self.config.gaps.as_ref().filter(|g| g.add_menu_bar_height_when_single_monitor).map(|_| self.menu_bar_poll);
+            let due = [self.pending.as_ref().map(|p| p.due), self.backstop, self.sub_retry_at, menu_poll].into_iter().flatten().min();
             let msg = match due {
                 None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
                 Some(d) => rx.recv_timeout(d.saturating_duration_since(Instant::now())),
@@ -230,6 +234,20 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     }
 
     pub fn tick(&mut self, now: Instant) {
+        if self.config.gaps.as_ref().is_some_and(|g| g.add_menu_bar_height_when_single_monitor) && self.menu_bar_poll <= now {
+            self.menu_bar_poll = now + MENU_BAR_POLL;
+            if self.aero_up && let Some([d]) = self.last_ds.as_deref() && d.screen.main {
+                let previous = (d.screen.cg_id, d.screen.menu_bar_height);
+                let screens = (self.screens)();
+                if let [screen] = screens.as_slice()
+                    && screen.cg_id == previous.0
+                    && screen.menu_bar_height > 0.0
+                    && screen.menu_bar_height != previous.1
+                {
+                    self.arm(Trigger::Unlock, false, None);
+                }
+            }
+        }
         if self.backstop.is_some_and(|b| b <= now) {
             self.backstop = None;
             self.arm(Trigger::Backstop, true, None);
@@ -1103,6 +1121,43 @@ mod tests {
             ],
             "T",
         )
+    }
+
+    #[test]
+    fn changed_menu_bar_height_reconciles_and_unchanged_height_stays_quiet() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let displays = vec![crate::testutil::builtin(1)];
+        let (mut w, dir) = worker_cfg(
+            FakeAero::new(&displays, &[("1", 1, true, 1, Axis::H)], "1"),
+            "[gaps]\ntop-default = 42\nadd-menu-bar-height-when-single-monitor = true\n",
+            None,
+        );
+        let height = Rc::new(Cell::new(33.0));
+        let read_height = height.clone();
+        w.screens = Box::new(move || {
+            let mut s = crate::testutil::builtin(1).screen;
+            s.menu_bar_height = read_height.get();
+            vec![s]
+        });
+        let aero_cfg = dir.path().join("aerospace.toml");
+        std::fs::write(&aero_cfg, "[gaps]\nouter.top = 10\n").unwrap();
+        let p = aero_cfg.clone();
+        w.aero_config = Box::new(move || Ok(p.clone()));
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert_eq!(std::fs::read_to_string(&aero_cfg).unwrap(), "[gaps]\nouter.top = 43\n");
+        let count = w.aero.log.len();
+        w.menu_bar_poll = Instant::now();
+        w.tick(Instant::now());
+        assert!(w.pending.is_none());
+        assert_eq!(w.aero.log.len(), count);
+        height.set(40.0);
+        w.menu_bar_poll = Instant::now();
+        w.tick(Instant::now());
+        assert!(w.pending.is_some());
+        w.tick(later());
+        assert_eq!(std::fs::read_to_string(&aero_cfg).unwrap(), "[gaps]\nouter.top = 50\n");
     }
 
     #[test]

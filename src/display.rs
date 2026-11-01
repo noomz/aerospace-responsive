@@ -60,6 +60,8 @@ pub struct Screen {
     /// Notch height in points (`0.0` = no notch), measured by [`notch_height`] from AppKit's
     /// own geometry. This is the top area a gap would be double-counted against.
     pub notch: f64,
+    /// AppKit's menu bar height in points, including when the bar is hidden.
+    pub menu_bar_height: f64,
 }
 
 /// A `Screen` joined to the AeroSpace monitor that shows it.

@@ -199,6 +199,7 @@ When the tool config has a `[gaps]` block, this tool owns AeroSpace's `gaps.oute
   [gaps]
   top-default = 1                 # required; every monitor no [[gaps.top]] names
   notch-compensation = true       # optional, default true
+  add-menu-bar-height-when-single-monitor = false # optional, default false
   [[gaps.top]]
   monitor = { main = true }       # Pred; `nth` is a load error, same as [[layout]]
   value = 42                      # first match wins, file order; else top-default
@@ -210,7 +211,7 @@ When the tool config has a `[gaps]` block, this tool owns AeroSpace's `gaps.oute
 ## §V invariants
 
 - V23 Ownership. Resolved gaps is one `GapDecision` per attached display when `[gaps]` is present, empty otherwise. Empty → `desired` is `None` → the pass returns before opening AeroSpace's config. No read, no write, no reload, `gap_written` stays unset.
-- V24 Per monitor, in `aero_id` order. First matching `[[gaps.top]]`, else `top-default`. Notch subtracted only when `notch-compensation` is on: `(base as f64 - notch).round().max(0) as u32`.
+- V24 Per monitor, in `aero_id` order. First matching `[[gaps.top]]`, else `top-default`. Notch subtracted only when `notch-compensation` is on. Add AppKit `NSMenu.menuBarHeight` only when `add-menu-bar-height-when-single-monitor` is on and the joined set has exactly one main display: `(base as f64 - notch + menu_bar_add).round().max(0) as u32`. The daemon checks for height changes every 10 seconds while enabled; a changed height arms a verify pass.
 - V25 Notch. `auxiliaryTopLeftArea` and `auxiliaryTopRightArea` are the menu-bar strips beside it. Height is `min(left height, right height)`. Result is `0` when that height is ≤ 0, or when `frame.width - (left width + right width) ≤ 1` (the strips meet: a plain menu bar, or no aux area). Otherwise `min(height, top_inset)`, where `top_inset` is what `visibleFrame` keeps off the top of `frame`. A notch AppKit does not carve out of `visibleFrame` compensates nothing, so a gap is never reduced for height it did not double-count.
 - V26 Encoding. Default is the value the most monitors share. A tie goes to the value held by the highest monitor id, so the line is the same every pass. Patterns are the monitors whose result differs, in monitor-id order. No patterns → a bare int.
 - V27 Read-back. `current` is `Some` only for a non-negative int, or an array of length ≥ 2 whose last item is a non-negative int and whose earlier items are each a one-key inline table `monitor.<id ≥ 1> = <non-negative int>`. A name or `main` pattern, a negative, a one-element array, or a non-int is `None`: foreign, and the point of a takeover. Invalid TOML is an error and the file is left alone.
@@ -219,9 +220,9 @@ When the tool config has a `[gaps]` block, this tool owns AeroSpace's `gaps.oute
 - V30 Record. When `gap_written` differs from the wanted value it is set and `save_state` runs before the write. That includes observe, and it includes a write that then fails. See B5.
 - V31 Steady state. A later pass whose wanted value parses back as already on disk does not write and does not reload.
 - V32 Comments. The decor restore keeps a commented-out alternative on the line above `outer.top`, and leaves neighbouring keys (`inner.horizontal`, `outer.right`, the file header) as they were. A dotted `gaps.outer.top` is rewritten so the file contains one `top` definition, not two.
-- V33 Surfaces. `monitors` prints `notch Npt` only when notch > 0. `explain` prints `gaps: outer.top = <toml>` and one row per monitor: id, name, base, source (`gaps.top[i]` or `top-default`), `notch -N` when a notch was subtracted, and the value AeroSpace is told. No block prints the not-managed line. Dry-run JSON includes `gaps`.
+- V33 Surfaces. `monitors` prints `notch Npt` only when notch > 0. `explain` prints `gaps: outer.top = <toml>` and one row per monitor: id, name, base, source (`gaps.top[i]` or `top-default`), `notch -N` when a notch was subtracted, `menu bar +N` when added, and the value AeroSpace is told. No block prints the not-managed line. Dry-run JSON includes `gaps`.
 - V34 Observe. The AeroSpace file is not written and `reload-config` is not run. The would-be line is logged. `save_state` in observe puts exclusive-tiling memory back to what was on disk and writes the rest of `Persisted`, including `gap_written` (B5).
-- V35 Load. `[gaps]` requires `top-default`. `notch-compensation` defaults true. Unknown keys (`notch = 32`) are a load error. `nth` on `[[gaps.top]].monitor` is a load error. The commented example block parses when the `# ` prefixes are stripped.
+- V35 Load. `[gaps]` requires `top-default`. `notch-compensation` defaults true. `add-menu-bar-height-when-single-monitor` defaults false. Unknown keys (`notch = 32`) are a load error. `nth` on `[[gaps.top]].monitor` is a load error. The commented example block parses when the `# ` prefixes are stripped.
 
 ## §T tasks
 
@@ -235,6 +236,7 @@ T25|x|`explain` arithmetic + not-managed line; `monitors` prints `notch Npt`|V33
 T26|x|`state.json` `gap_written`, serde default|V30,I.gaps.state
 T27|x|README "Top gap and the notch"; example config commented block; version 0.3.0|I.gaps.cfg,C11
 T28|x|live check recorded in `8606d4a`: built-in 42 → 10 (42 − 32); docked MateView keeps 42; no-bar default 1 clamps to 0. `e5abd4c`: commented alternative survived two forced writes|V25,V32,C16
+T29|x|optional single-monitor menu bar height; automatic refresh; explain and tests|V24,V33,V35,I.gaps.cfg
 
 ## §B bugs
 

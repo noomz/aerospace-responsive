@@ -155,7 +155,8 @@ pub fn gaps(r: &Resolved) -> String {
     let _ = writeln!(o, "gaps: outer.top = {}", want.to_toml());
     for d in &r.gaps {
         let comp = if d.notch > 0.0 { format!("  notch -{}", d.notch) } else { String::new() };
-        let _ = writeln!(o, "  monitor {:<3} {:<24} base {:>3} [{:<14}{comp}  ->  {:>3}]", d.monitor, d.monitor_name, d.base, d.source, d.top);
+        let menu = if d.menu_bar_add > 0.0 { format!("  menu bar +{}", d.menu_bar_add) } else { String::new() };
+        let _ = writeln!(o, "  monitor {:<3} {:<24} base {:>3} [{:<14}{comp}{menu}  ->  {:>3}]", d.monitor, d.monitor_name, d.base, d.source, d.top);
     }
     o
 }

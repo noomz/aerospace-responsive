@@ -78,6 +78,7 @@ description = "defaults are correct here; the profile exists to say so deliberat
 # [gaps]
 # top-default = 1               # every monitor no [[gaps.top]] rule names
 # notch-compensation = true     # default; measured notch height taken off, clamped at 0
+# add-menu-bar-height-when-single-monitor = false  # opt in to add AppKit menu bar height
 #
 # [[gaps.top]]
 # monitor = { main = true }     # any monitor predicate except nth; first match wins

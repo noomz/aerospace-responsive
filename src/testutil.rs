@@ -16,6 +16,7 @@ fn screen(cg_id: u32, name: &str, bounds: Rect, px: (u64, u64), rotation: f64, m
         model: if builtin { 41152 } else { 25003 },
         serial: if builtin { 0 } else { 16843009 },
         notch,
+        menu_bar_height: 33.0,
     }
 }
 
