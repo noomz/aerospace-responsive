@@ -223,6 +223,7 @@ When the tool config has a `[gaps]` block, this tool owns AeroSpace's `gaps.oute
 - V33 Surfaces. `monitors` prints `notch Npt` only when notch > 0. `explain` prints `gaps: outer.top = <toml>` and one row per monitor: id, name, base, source (`gaps.top[i]` or `top-default`), `notch -N` when a notch was subtracted, `menu bar +N` when added, and the value AeroSpace is told. No block prints the not-managed line. Dry-run JSON includes `gaps`.
 - V34 Observe. The AeroSpace file is not written and `reload-config` is not run. The would-be line is logged. `save_state` in observe puts exclusive-tiling memory back to what was on disk and writes the rest of `Persisted`, including `gap_written` (B5).
 - V35 Load. `[gaps]` requires `top-default`. `notch-compensation` defaults true. `add-menu-bar-height-when-single-monitor` defaults false. Unknown keys (`notch = 32`) are a load error. `nth` on `[[gaps.top]].monitor` is a load error. The commented example block parses when the `# ` prefixes are stripped.
+- V36 Deadline. Every one-shot `aerospace` call (reads, commands, `reload-config`) goes through `aero::aerospace`, bounded by `CALL_DEADLINE` (5s). Past it the child is killed and reaped, and the call fails like any other read or command error: the gate retries after the debounce, verify and resync log, a pass records the error, the backstop still fires. `subscribe` is not bounded; its exit already respawns (V14). See B6.
 
 ## §T tasks
 
@@ -237,6 +238,7 @@ T26|x|`state.json` `gap_written`, serde default|V30,I.gaps.state
 T27|x|README "Top gap and the notch"; example config commented block; version 0.3.0|I.gaps.cfg,C11
 T28|x|live check recorded in `8606d4a`: built-in 42 → 10 (42 − 32); docked MateView keeps 42; no-bar default 1 clamps to 0. `e5abd4c`: commented alternative survived two forced writes|V25,V32,C16
 T29|x|optional single-monitor menu bar height; automatic refresh; explain and tests|V24,V33,V35,I.gaps.cfg
+T30|x|`aero::aerospace` deadline + kill; `bounded_output` tests: sleeping child, pipes closed but running, 1 MiB stdout drained|V36
 
 ## §B bugs
 
@@ -244,3 +246,4 @@ id|date|cause|fix
 -|-|-|-
 B4|2026-10-30|toml_edit hangs comment lines on the key decor; replacing `outer.top` dropped `#outer.top = [{ monitor.main = 50 }, 10]` from the live config|V32
 B5|2026-10-30|`gap_written` is saved before a successful write, and observe's `save_state` persists it (only exclusive-tiling memory is substituted back). A later live pass then warns `gaps-writer` even though this tool never wrote the file, or the write failed|open
+B6|2026-11-03|AeroSpace restart: resync's `list-windows --all` reached the dying server and was never answered; `Command::output` had no deadline, so the worker blocked and `reconcile` / `status` hung behind it until `launchctl bootout` (issue #1)|V36

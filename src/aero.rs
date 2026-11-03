@@ -4,13 +4,69 @@
 use crate::config::Axis;
 use crate::display::Display;
 use crate::world::{AeroMonitor, DETAIL_FORMAT, MONITOR_FORMAT, Snapshot, WINDOW_FORMAT, WORKSPACE_FORMAT, WinInfo, WorkspaceRow};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::io::{BufRead, BufReader, Read};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+
+/// How long a one-shot `aerospace` call may take. A call the server never answers (seen while
+/// AeroSpace restarts) would otherwise block the worker, and every client behind it, for good.
+pub const CALL_DEADLINE: Duration = Duration::from_secs(5);
+
+/// `aerospace <args>`, killed if it has not exited within `CALL_DEADLINE`.
+pub fn aerospace<S: AsRef<str>>(args: &[S]) -> Result<Output> {
+    let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
+    bounded_output(Command::new("aerospace").args(&args), CALL_DEADLINE).map_err(|e| match e.kind() {
+        ErrorKind::TimedOut => anyhow!("aerospace {}: {e}", args.join(" ")),
+        _ => anyhow!(e).context("cannot spawn `aerospace` (is it on PATH?)"),
+    })
+}
+
+/// `Command::output` with a deadline: past it the child is killed and reaped, and the error
+/// is `ErrorKind::TimedOut`.
+fn bounded_output(cmd: &mut Command, deadline: Duration) -> io::Result<Output> {
+    let end = Instant::now() + deadline;
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    // Both pipes drain on their own threads, so a large listing can never fill one and stall
+    // the child.
+    let (tx, rx) = mpsc::channel();
+    let pipes: [Box<dyn Read + Send>; 2] = [Box::new(child.stdout.take().expect("piped")), Box::new(child.stderr.take().expect("piped"))];
+    for (i, mut pipe) in pipes.into_iter().enumerate() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            let _ = tx.send((i, buf));
+        });
+    }
+    let timed_out = |mut child: std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+        Err(io::Error::new(ErrorKind::TimedOut, format!("no answer within {}s; killed it", deadline.as_secs_f64())))
+    };
+    let mut bufs = [Vec::new(), Vec::new()];
+    for _ in 0..2 {
+        match rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
+            Ok((i, buf)) => bufs[i] = buf,
+            Err(_) => return timed_out(child),
+        }
+    }
+    // Both pipes closed; the child exits right after, unless it keeps running without them.
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let [stdout, stderr] = bufs;
+            return Ok(Output { status, stdout, stderr });
+        }
+        if Instant::now() >= end {
+            return timed_out(child);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -178,7 +234,7 @@ pub struct CliAero;
 
 impl CliAero {
     fn json<T: DeserializeOwned>(&self, args: &[&str]) -> Result<T> {
-        let out = Command::new("aerospace").args(args).output().context("cannot spawn `aerospace` (is it on PATH?)")?;
+        let out = aerospace(args)?;
         if !out.status.success() {
             bail!("aerospace {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
         }
@@ -200,7 +256,7 @@ impl Aero for CliAero {
         self.json(&["list-windows", "--all", "--json", "--format", DETAIL_FORMAT])
     }
     fn run(&mut self, cmd: &Cmd) -> Result<(), String> {
-        let out = Command::new("aerospace").args(cmd.args()).output().map_err(|e| e.to_string())?;
+        let out = aerospace(&cmd.args()).map_err(|e| format!("{e:#}"))?;
         if out.status.success() {
             return Ok(());
         }
@@ -252,6 +308,28 @@ impl Aero for CliAero {
 mod tests {
     use super::*;
     use crate::testutil::{FakeAero, builtin, desk3, len_landscape};
+
+    #[test]
+    fn bounded_output_kills_a_child_past_its_deadline() {
+        let t = Instant::now();
+        let e = bounded_output(Command::new("sleep").arg("10"), Duration::from_millis(200)).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::TimedOut);
+        assert!(t.elapsed() < Duration::from_secs(2), "returned at the deadline, not when the child ended");
+        // A child that closes its pipes but keeps running is still bounded.
+        let e = bounded_output(Command::new("sh").args(["-c", "exec >&- 2>&-; sleep 10"]), Duration::from_millis(200)).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::TimedOut);
+        assert!(t.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn bounded_output_returns_what_a_prompt_child_printed() {
+        // 1 MiB on stdout: more than a pipe buffer, so an undrained pipe would stall the child.
+        let script = "head -c 1048576 /dev/zero; echo oops >&2; exit 3";
+        let out = bounded_output(Command::new("sh").args(["-c", script]), Duration::from_secs(5)).unwrap();
+        assert_eq!(out.stdout.len(), 1 << 20);
+        assert_eq!(out.stderr, b"oops\n");
+        assert_eq!(out.status.code(), Some(3));
+    }
 
     #[test]
     fn commands_render_as_copy_pasteable_lines() {

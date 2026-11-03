@@ -425,7 +425,7 @@ fn reload_step(opts: &Opts, expect: Option<&BTreeSet<String>>) -> Result<()> {
         return Ok(());
     }
     let before = placement()?;
-    let out = Command::new("aerospace").args(["reload-config", "--no-gui"]).output().context("cannot run aerospace")?;
+    let out = crate::aero::aerospace(&["reload-config", "--no-gui"])?;
     let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)).trim().to_string();
     if !out.status.success() || !said.is_empty() {
         bail!("reload-config reported: {said}");
