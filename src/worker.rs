@@ -1747,14 +1747,15 @@ mod tests {
     }
 
     #[test]
-    fn restore_runs_after_a_clean_pass() {
+    fn restore_does_not_switch_other_monitors_after_a_clean_pass() {
         let (mut w, _d) = worker(docked());
         w.handle(Msg::Trigger(Trigger::Display));
         w.tick(later());
-        // before: portrait showed A, landscape showed 2, T focused on the built-in.
-        let tail: Vec<&Cmd> = w.aero.log.iter().rev().take(3).collect();
-        assert_eq!(tail, vec![&Cmd::Focus { ws: "T".into() }, &Cmd::Focus { ws: "2".into() }, &Cmd::Focus { ws: "A".into() }]);
+        let focus: Vec<&Cmd> = w.aero.log.iter().filter(|c| matches!(c, Cmd::Focus { .. })).collect();
+        assert!(focus.is_empty(), "already-correct focus needs no workspace command");
         assert_eq!(w.aero.focused, "T");
+        assert_eq!(crate::world::visible_on(&w.aero.clone_rows(), 1), Some("1"));
+        assert_eq!(crate::world::visible_on(&w.aero.clone_rows(), 3), Some("3"));
     }
 
     #[test]
