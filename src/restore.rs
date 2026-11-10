@@ -133,12 +133,15 @@ mod tests {
     }
 
     #[test]
-    fn restores_each_monitor_then_focus_last() {
+    fn restore_does_not_visit_other_monitors() {
         let mut f = before();
         let mut ctx = RestoreCtx::capture(f.monitors.clone(), &f.clone_rows());
         run_pass_moves(&mut f, &mut ctx, vec![mv("1", 2, 1), mv("3", 2, 3)]);
         let (cmds, _) = plan_restore(&ctx, &f.monitors.clone(), &f.clone_rows(), &set(&["A", "1", "3", "T", "2"]));
-        assert_eq!(cmds, vec![Cmd::Focus { ws: "A".into() }, Cmd::Focus { ws: "2".into() }, Cmd::Focus { ws: "T".into() }]);
+        for cmd in cmds {
+            f.run(&cmd).unwrap();
+            assert_eq!(f.focused, "T", "restore must not visit another monitor");
+        }
     }
 
     #[test]
