@@ -48,6 +48,11 @@ After updating the binary with `cargo install`, restart the agent with `launchct
 `--json` on `status`, `explain`, `monitors`, `pins`, `profile`, `reconcile --dry-run`.
 Exit codes: 0 ok, 1 error, 2 usage, 3 daemon not running, 4 warnings pending.
 
+After placement, cosmetic restore issues at most one workspace-focus command on the originally
+focused monitor, and skips restore when fresh reads show a change in focus or that monitor's visible
+workspace. Other monitors keep the workspaces placement left visible, avoiding intermediate focus
+changes across the displays.
+
 `daemon --observe` runs the daemon without executing anything: every pass is logged as the
 commands it would have run. This is how to try a config against the live system safely.
 

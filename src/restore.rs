@@ -45,43 +45,32 @@ pub fn plan_restore(ctx: &RestoreCtx, monitors_now: &[AeroMonitor], rows: &[Work
         .as_ref()
         .and_then(|f| ctx.visible.iter().find(|(_, w)| *w == f).map(|(m, _)| *m));
 
-    let (mut cmds, mut skips) = (vec![], vec![]);
-    for (&m, w) in &ctx.visible {
-        if Some(m) == focused_monitor {
-            continue; // restored last (S4)
-        }
-        let why = if !touched.contains(&m) {
-            Some("not disturbed by the pass")
-        } else if !nonempty.contains(w) {
-            Some("previously-visible workspace is empty")
-        } else if assigned(w) != Some(m) {
-            Some("previously-visible workspace is no longer assigned here")
-        } else if world::visible_on(rows, m) == Some(w.as_str()) {
-            Some("already visible")
-        } else if world::visible_on(rows, m) != ctx.left_visible.get(&m).map(String::as_str) {
-            // S3.3: what M shows now is not what the pass put there — the user acted, and wins.
-            Some("the user changed what this monitor shows")
-        } else {
-            None
-        };
-        match why {
-            Some(why) => skips.push(format!("monitor {m}: {why}")),
-            None => cmds.push(Cmd::Focus { ws: w.clone() }),
-        }
+    let (Some(f), Some(fm)) = (&ctx.focused, focused_monitor) else {
+        return (vec![], vec!["focused workspace was not visible in the snapshot; restore skipped".into()]);
+    };
+    if !touched.contains(&fm) {
+        return (vec![], vec![format!("monitor {fm}: not disturbed by the pass")]);
     }
 
-    // S4: the last command is `workspace F`, or whatever F's monitor now shows, so focus
-    // stays on the same monitor rather than wherever the last restore left it.
-    if let (Some(f), Some(fm)) = (&ctx.focused, focused_monitor) {
-        let now_focused = world::focused(rows).map(|r| r.workspace.as_str());
-        let target = if assigned(f) == Some(fm) { Some(f.clone()) } else { world::visible_on(rows, fm).map(String::from) };
-        match target {
-            Some(t) if !(cmds.is_empty() && now_focused == Some(t.as_str())) => cmds.push(Cmd::Focus { ws: t }),
-            Some(_) => skips.push(format!("monitor {fm}: focus already correct")),
-            None => skips.push(format!("monitor {fm}: nothing to focus")),
-        }
+    let now_focused = world::focused(rows).map(|r| r.workspace.as_str());
+    if now_focused != Some(f.as_str()) {
+        return (vec![], vec![format!("monitor {fm}: focus changed during the pass")]);
     }
-    (cmds, skips)
+    let visible = world::visible_on(rows, fm);
+    if visible != ctx.left_visible.get(&fm).map(String::as_str) {
+        return (vec![], vec![format!("monitor {fm}: the user changed what this monitor shows")]);
+    }
+
+    let target = if assigned(f) == Some(fm) && nonempty.contains(f) {
+        Some(f.as_str())
+    } else {
+        visible
+    };
+    match target {
+        Some(t) if now_focused != Some(t) => (vec![Cmd::Focus { ws: t.into() }], vec![]),
+        Some(_) => (vec![], vec![format!("monitor {fm}: focus already correct")]),
+        None => (vec![], vec![format!("monitor {fm}: nothing to focus")]),
+    }
 }
 
 #[cfg(test)]
@@ -133,12 +122,71 @@ mod tests {
     }
 
     #[test]
-    fn restores_each_monitor_then_focus_last() {
+    fn restore_does_not_visit_other_monitors() {
         let mut f = before();
         let mut ctx = RestoreCtx::capture(f.monitors.clone(), &f.clone_rows());
         run_pass_moves(&mut f, &mut ctx, vec![mv("1", 2, 1), mv("3", 2, 3)]);
         let (cmds, _) = plan_restore(&ctx, &f.monitors.clone(), &f.clone_rows(), &set(&["A", "1", "3", "T", "2"]));
-        assert_eq!(cmds, vec![Cmd::Focus { ws: "A".into() }, Cmd::Focus { ws: "2".into() }, Cmd::Focus { ws: "T".into() }]);
+        assert!(cmds.is_empty());
+        assert_eq!(world::visible_on(&f.clone_rows(), 1), Some("1"));
+        assert_eq!(world::visible_on(&f.clone_rows(), 3), Some("3"));
+        assert_eq!(f.focused, "T");
+    }
+
+    #[test]
+    fn focused_but_hidden_workspace_does_not_get_a_noop_focus_command() {
+        let mut f = before();
+        f.ws.iter_mut().find(|w| w.name == "3").unwrap().monitor = 3;
+        let mut ctx = RestoreCtx::capture(f.monitors.clone(), &f.clone_rows());
+        run_pass_moves(&mut f, &mut ctx, vec![mv("3", 3, 2)]);
+        let (cmds, _) = plan_restore(&ctx, &f.monitors.clone(), &f.clone_rows(), &set(&["A", "1", "3", "T", "2"]));
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn a_user_focus_change_stops_restore() {
+        let mut f = before();
+        let mut ctx = RestoreCtx::capture(f.monitors.clone(), &f.clone_rows());
+        run_pass_moves(&mut f, &mut ctx, vec![mv("1", 2, 1)]);
+        f.focused = "A".into();
+        let (cmds, skips) = plan_restore(&ctx, &f.monitors.clone(), &f.clone_rows(), &set(&["A", "1", "3", "T", "2"]));
+        assert!(cmds.is_empty());
+        assert!(skips.iter().any(|s| s.contains("focus changed")));
+    }
+
+    #[test]
+    fn a_user_visibility_change_on_the_focused_monitor_stops_restore() {
+        let mut f = before();
+        let mut ctx = RestoreCtx::capture(f.monitors.clone(), &f.clone_rows());
+        run_pass_moves(&mut f, &mut ctx, vec![mv("T", 2, 1)]);
+        f.run(&Cmd::Focus { ws: "3".into() }).unwrap();
+        f.run(&Cmd::Focus { ws: "T".into() }).unwrap();
+        let (cmds, skips) = plan_restore(&ctx, &f.monitors.clone(), &f.clone_rows(), &set(&["A", "1", "3", "T", "2"]));
+        assert!(cmds.is_empty());
+        assert!(skips.iter().any(|s| s.contains("the user changed what this monitor shows")));
+    }
+
+    #[test]
+    fn empty_focused_workspace_is_not_reopened() {
+        let mut f = before();
+        f.ws.iter_mut().find(|w| w.name == "T").unwrap().windows.clear();
+        f.ws.iter_mut().find(|w| w.name == "3").unwrap().monitor = 3;
+        let mut ctx = RestoreCtx::capture(f.monitors.clone(), &f.clone_rows());
+        run_pass_moves(&mut f, &mut ctx, vec![mv("3", 3, 2)]);
+        let nonempty = set(&["A", "1", "3", "2"]);
+        let (cmds, _) = plan_restore(&ctx, &f.monitors.clone(), &f.clone_rows(), &nonempty);
+        assert_eq!(cmds, [Cmd::Focus { ws: "3".into() }]);
+    }
+
+    #[test]
+    fn missing_focused_snapshot_skips_restore() {
+        let f = before();
+        let mut ctx = RestoreCtx::capture(f.monitors.clone(), &f.clone_rows());
+        ctx.focused = None;
+        ctx.moves = vec![mv("1", 2, 1)];
+        let (cmds, skips) = plan_restore(&ctx, &f.monitors.clone(), &f.clone_rows(), &set(&["A", "1", "3", "T", "2"]));
+        assert!(cmds.is_empty());
+        assert!(skips.iter().any(|s| s.contains("not visible in the snapshot")));
     }
 
     #[test]
@@ -164,9 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn a_monitor_the_user_switched_mid_pass_is_left_alone() {
-        // S3.3: M was disturbed by the pass, but what it shows now is not what the pass left.
-        // X gives the user somewhere else to go on the landscape monitor.
+    fn another_monitors_visibility_is_left_untouched() {
         let mut f = FakeAero::new(
             &desk3(),
             &[
@@ -182,12 +228,12 @@ mod tests {
         let mut ctx = RestoreCtx::capture(f.monitors.clone(), &f.clone_rows());
         run_pass_moves(&mut f, &mut ctx, vec![mv("1", 2, 1), mv("3", 2, 3)]);
         f.run(&Cmd::Focus { ws: "X".into() }).unwrap(); // the user picks X on the landscape monitor
-        f.focused = "T".into(); // ... then focus lands back where the pass had it
+        f.focused = "T".into();
         let nonempty = set(&["A", "1", "3", "T", "2", "X"]);
         let (cmds, skips) = plan_restore(&ctx, &f.monitors.clone(), &f.clone_rows(), &nonempty);
-        assert!(!cmds.contains(&Cmd::Focus { ws: "2".into() }), "the user's choice must stand");
-        assert!(skips.iter().any(|s| s.contains("the user changed what this monitor shows")), "{skips:?}");
-        assert!(cmds.contains(&Cmd::Focus { ws: "A".into() }), "untouched-by-user monitors still restore");
+        assert!(cmds.is_empty(), "the original monitor is already correct");
+        assert_eq!(world::visible_on(&f.clone_rows(), 3), Some("X"));
+        assert!(skips.iter().all(|s| s.contains("focus already correct")), "{skips:?}");
     }
 
     #[test]
@@ -197,8 +243,8 @@ mod tests {
         run_pass_moves(&mut f, &mut ctx, vec![mv("1", 2, 1)]);
         apply(&mut f, &[mv("A", 1, 3)]); // the user, not the pass
         let (cmds, skips) = plan_restore(&ctx, &f.monitors.clone(), &f.clone_rows(), &set(&["A", "1", "3", "T", "2"]));
-        assert!(!cmds.contains(&Cmd::Focus { ws: "A".into() }));
-        assert!(skips.iter().any(|s| s.contains("no longer assigned here")));
+        assert!(cmds.is_empty());
+        assert!(skips.iter().any(|s| s.contains("focus already correct")));
     }
 
     #[test]
