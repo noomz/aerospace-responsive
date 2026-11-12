@@ -143,7 +143,9 @@ pub fn pre_layout(rules: &[Rule], memory: &mut TilingMemory, known: &mut BTreeMa
         }
         let visible: Vec<WinInfo> = windows
             .iter()
-            .filter(|x| x.id == *id || !pending.contains(&x.id) || seen.contains(&x.id))
+            // V22, as on the event path: a batch member counts once judged in this batch; anyone
+            // else only when the daemon already knows it there (a queued arrival does not count).
+            .filter(|x| x.id == *id || if pending.contains(&x.id) { seen.contains(&x.id) } else { known.get(&x.id) == Some(&x.workspace) })
             .map(|x| {
                 let mut y = x.clone();
                 if let Some(l) = layout.get(&y.id) {
@@ -710,6 +712,21 @@ tiling-allowlist = [
         let removed = view(&[], &mem, Some(&[win(1, "T", "a", "", "floating")]));
         assert_eq!(removed[0].converge, "pending: rule removed, re-tiles 1");
         assert!(removed[0].rule.is_none());
+    }
+
+    #[test]
+    fn pre_layout_ignores_a_queued_arrival_it_does_not_know_yet() {
+        // Kitty 2 sits on T in the census, but its own arrival is still queued (not known): the
+        // one slot goes to kitty 3, as on the event path (V22).
+        let r = kitty_rule();
+        let a = win(2, "T", KITTY, "a", "h_tiles");
+        let b = win(3, "T", KITTY, "b", "h_tiles");
+        let cmds = pre_layout(std::slice::from_ref(&r), &mut TilingMemory::default(), &mut BTreeMap::new(), &[a, b], &[3]);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        let known = BTreeMap::from([(2, "T".to_string())]);
+        let a = win(2, "T", KITTY, "a", "h_tiles");
+        let b = win(3, "T", KITTY, "b", "h_tiles");
+        assert_eq!(pre_layout(std::slice::from_ref(&r), &mut TilingMemory::default(), &mut known.clone(), &[a, b], &[3]), [Cmd::Float { id: 3 }]);
     }
 
     #[test]

@@ -112,6 +112,9 @@ pub struct Worker<A: Aero, S: FnMut() -> Vec<Screen>> {
     /// Where the daemon has seen each window (connect resync, then every event): an arrival is
     /// judged only against windows it already knew there, so arrival order wins a burst (V22).
     known: std::collections::BTreeMap<u32, String>,
+    /// `pre-layout` answers not yet confirmed. AeroSpace stops waiting after 100ms and draws as
+    /// before, so memory changes only when the next `window-moved` shows the verdict applied.
+    pre_verdicts: std::collections::BTreeMap<u32, Cmd>,
     /// Where AeroSpace's config lives: its own lookup in production (`paths::aerospace_config`),
     /// a temp file in a test.
     aero_config: Box<dyn Fn() -> Result<PathBuf, String> + Send>,
@@ -167,6 +170,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             inert: None,
             last_ds: None,
             known: Default::default(),
+            pre_verdicts: Default::default(),
             tiling_on_disk,
         };
         let _ = w.load_config();
@@ -726,6 +730,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             Err(e) => return crate::log!("exclusive tiling: resync read failed: {e:#}"),
         };
         self.known = wins.iter().map(|w| (w.id, w.workspace.clone())).collect();
+        self.pre_verdicts.clear();
         let live: Vec<(u32, &str)> = wins.iter().map(|w| (w.id, w.app.as_str())).collect();
         let mut changed = self.persisted.exclusive_tiling.prune(&live);
         let rules = self.current_rules();
@@ -767,6 +772,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let (id, workspace, app) = match ev {
             WindowEvent::WindowClosed { id, app, .. } => {
                 self.known.remove(&id);
+                self.pre_verdicts.remove(&id);
                 if self.persisted.exclusive_tiling.floated_on(id, &app).is_some() && self.persisted.exclusive_tiling.remove(id) {
                     self.save_state();
                 }
@@ -802,6 +808,23 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         // V22: a window whose own arrival here is still queued does not count yet.
         let wins: Vec<WinInfo> = wins.iter().filter(|x| x.id == id || self.known.get(&x.id) == Some(&x.workspace)).cloned().collect();
         let Some(w) = wins.iter().find(|x| x.id == id) else { return };
+        if let Some(verdict) = self.pre_verdicts.remove(&id) {
+            let floating = w.layout == "floating";
+            match verdict {
+                Cmd::Float { .. } if floating => {
+                    crate::log!("exclusive tiling: {verdict} applied before the draw (arrived on {workspace})");
+                    self.persisted.exclusive_tiling.insert(workspace, id, &w.app);
+                    return self.save_state();
+                }
+                Cmd::Tile { .. } if !floating => {
+                    crate::log!("exclusive tiling: {verdict} applied before the draw (left for {workspace})");
+                    self.persisted.exclusive_tiling.remove(id);
+                    return self.save_state();
+                }
+                // Not applied (AeroSpace stopped waiting): decide as if pre-layout never ran.
+                _ => crate::log!("exclusive tiling: {verdict} from pre-layout was not applied; deciding now"),
+            }
+        }
         let mut changed = false;
         if left {
             changed = true;
@@ -860,10 +883,13 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             return Response::ok("", json!([]));
         };
         let rules = rules::resolve(&self.config, &ds, self.persisted.lock.as_deref()).exclusive_tiling;
-        let before = self.persisted.exclusive_tiling.clone();
-        let cmds = tiling::pre_layout(&rules, &mut self.persisted.exclusive_tiling, &mut self.known, &windows, &moved);
-        if self.persisted.exclusive_tiling != before {
-            self.save_state();
+        // Judged against copies: nothing here is known to have landed until its event says so.
+        let (mut memory, mut known) = (self.persisted.exclusive_tiling.clone(), self.known.clone());
+        let cmds = tiling::pre_layout(&rules, &mut memory, &mut known, &windows, &moved);
+        for cmd in &cmds {
+            if let Cmd::Float { id } | Cmd::Tile { id } = cmd {
+                self.pre_verdicts.insert(*id, cmd.clone());
+            }
         }
         Response::ok("", json!(cmds))
     }
@@ -1402,12 +1428,47 @@ mod tests {
         assert_eq!(r.exit, 0, "{}", r.text);
         assert_eq!(r.json, serde_json::json!([{ "kind": "float", "id": 700 }]));
         assert!(w.aero.log.is_empty(), "pre-layout must not call aerospace: {:?}", w.aero.log);
-        assert!(floated(&w, "T").contains(&700), "{:?}", floated(&w, "T"));
-        assert_eq!(Persisted::load(&d.path().join("state.json")).exclusive_tiling, w.persisted.exclusive_tiling);
+        assert!(!floated(&w, "T").contains(&700), "memory waits for the event: {:?}", floated(&w, "T"));
         // The fork applies the float, then broadcasts. The event sees a floating window and stops.
         w.aero.set_floating(700, true);
         w.handle(moved(700, "T", None, "com.apple.Safari"));
         assert!(w.aero.log.is_empty(), "already judged: {:?}", w.aero.log);
+        assert!(floated(&w, "T").contains(&700), "{:?}", floated(&w, "T"));
+        assert_eq!(Persisted::load(&d.path().join("state.json")).exclusive_tiling, w.persisted.exclusive_tiling);
+    }
+
+    #[test]
+    fn a_late_pre_layout_answer_changes_nothing_and_the_event_decides() {
+        // AeroSpace stopped waiting and drew the arrival tiled; the event must still float it.
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.log.clear();
+        w.aero.add_window("T", 700, "com.apple.Safari", "GitHub", false);
+        let wins = w.aero.window_details().unwrap();
+        ask(&mut w, Request::PreLayout { windows: wins, moved: vec![700] });
+        w.handle(moved(700, "T", None, "com.apple.Safari"));
+        assert_eq!(w.aero.log, [Cmd::Float { id: 700 }]);
+        assert!(floated(&w, "T").contains(&700));
+    }
+
+    #[test]
+    fn a_late_retile_answer_keeps_the_record_so_the_event_retiles() {
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.add_window("T", 700, "com.apple.Safari", "GitHub", false);
+        w.handle(moved(700, "T", None, "com.apple.Safari")); // floated by the rule, recorded
+        assert!(floated(&w, "T").contains(&700));
+        w.aero.log.clear();
+        w.aero.move_window(700, "1");
+        let wins = w.aero.window_details().unwrap();
+        let r = ask(&mut w, Request::PreLayout { windows: wins, moved: vec![700] });
+        assert_eq!(r.json, serde_json::json!([{ "kind": "tile", "id": 700 }]));
+        // Not applied: the window is still floating when its event arrives.
+        w.handle(moved(700, "1", Some("T"), "com.apple.Safari"));
+        assert_eq!(w.aero.log, [Cmd::Tile { id: 700 }]);
+        assert!(w.persisted.exclusive_tiling.floated_on(700, "com.apple.Safari").is_none());
     }
 
     #[test]

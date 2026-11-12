@@ -142,8 +142,9 @@ arriving tiled gets else-action (float). Motivating case: kitty only tiled app o
 - V37 Draw waits for the verdict. A refresh that has `window-moved` asks the daemon `pre-layout` (census + moved
   ids) and applies returned `layout floating|tiling` in the tree before it draws, then broadcasts. No daemon, no
   answer in 100ms, or `--observe` → broadcast and draw as before. Handler never calls `aerospace` (caller is inside
-  the refresh; that call deadlocks). Memory updates as if the commands landed. A later `window-moved` for the same
-  arrival sees the settled layout and does not issue a second command. See B7.
+  the refresh; that call deadlocks). Verdicts are provisional: memory and the known map change only when the next
+  `window-moved` for that window shows the verdict applied (no second command). Not applied (caller stopped waiting) →
+  that event decides as if pre-layout never ran. Census windows outside the batch count only when known there (V22). See B7.
 
 ## §T tasks
 
