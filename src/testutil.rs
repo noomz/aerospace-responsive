@@ -98,6 +98,9 @@ pub struct FakeAero {
     pub ignore_layout: bool,
     /// On the next `layout --root`, AeroSpace moves this workspace to this monitor by itself.
     pub drift_on_layout: Option<(String, u32)>,
+    /// When a window on this workspace floats, its root turns accordion (AeroSpace promotes a
+    /// lone accordion child container once its tiled sibling leaves).
+    pub accordion_on_float: Option<String>,
     /// Make `windows()` fail, as a socket blip does mid-pass.
     pub fail_windows: bool,
     /// One flag per `subscribe` call: true while that Subscription is alive.
@@ -138,6 +141,7 @@ impl FakeAero {
             refuse: BTreeSet::new(),
             ignore_layout: false,
             drift_on_layout: None,
+            accordion_on_float: None,
             fail_windows: false,
             subs: vec![],
             fail_subscribe: false,
@@ -295,7 +299,13 @@ impl Aero for FakeAero {
                 self.focused = ws.clone();
                 Ok(())
             }
-            Cmd::Float { id } => self.win_mut(*id).map(|w| w.floating = true),
+            Cmd::Float { id } => {
+                if let Some(ws) = self.accordion_on_float.take() {
+                    let i = self.idx(&ws)?;
+                    self.ws[i].accordion = true;
+                }
+                self.win_mut(*id).map(|w| w.floating = true)
+            }
             Cmd::Tile { id } => self.win_mut(*id).map(|w| w.floating = false),
             Cmd::ReloadConfig => Ok(()),
         }

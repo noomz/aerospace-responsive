@@ -227,8 +227,11 @@ pub fn run_pass(
             rep.converged.push(plan.workspace.clone());
         }
     }
+    // Floating a root sibling can make AeroSpace change the root's kind or axis; layout decides
+    // from what converge left, not from before it.
+    let s_layout = if rep.converged.is_empty() { s1.clone() } else { aero.windows()? };
 
-    for cmd in plan_layout(r, &s1, pinned) {
+    for cmd in plan_layout(r, &s_layout, pinned) {
         // 4. LAYOUT
         if abort.load(Ordering::SeqCst) {
             rep.aborted = true;
@@ -504,6 +507,22 @@ mod tests {
         let r = resolve(cfg, &ds, None);
         let pinned = pinned.iter().map(|s| s.to_string()).collect();
         run_pass(f, &r, &ds, &pinned, &AtomicBool::new(abort), Some(mem), true).unwrap()
+    }
+
+    #[test]
+    fn layout_sees_the_kind_converge_left() {
+        // T's rule wants tiles; floating a window there turns its root accordion mid-pass.
+        let old = "orientation = \"h\"\nflatten     = false";
+        let cfg = cfg_with(RULE);
+        let toml = format!("{}{RULE}", include_str!("../aerospace-responsive.example.toml")).replacen(old, &format!("{old}\nkind = \"tiles\""), 1);
+        let cfg_tiles = parse(&toml).unwrap().config;
+        assert_eq!(cfg.layout.len(), cfg_tiles.layout.len());
+        let mut f = docked_kitty();
+        f.accordion_on_float = Some("T".into());
+        let mut mem = TilingMemory::default();
+        let rep = tiling_pass(&mut f, &cfg_tiles, &mut mem, &[], false);
+        assert!(f.log.contains(&Cmd::LayoutKind { ws: "T".into(), layout: Kind::Tiles }), "{:?}", f.log);
+        assert!(rep.mismatches.is_empty(), "{:?}", rep.mismatches);
     }
 
     #[test]
