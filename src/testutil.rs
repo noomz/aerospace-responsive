@@ -83,7 +83,7 @@ pub struct FakeWs {
     pub visible: bool,
     pub windows: Vec<FakeWin>,
     pub root: Axis,
-    /// `v_accordion` / `h_accordion` instead of tiles. `layout tiles` clears it.
+    /// `v_accordion` / `h_accordion` instead of tiles. `layout --root ... tiles|accordion` sets it.
     pub accordion: bool,
 }
 
@@ -268,10 +268,10 @@ impl Aero for FakeAero {
                 Ok(())
             }
             Cmd::Flatten { ws } => self.idx(ws).map(|_| ()),
-            Cmd::Tiles { ws } => {
+            Cmd::LayoutKind { ws, layout } => {
                 let i = self.idx(ws)?;
                 if !self.ignore_layout {
-                    self.ws[i].accordion = false;
+                    self.ws[i].accordion = *layout == crate::config::Kind::Accordion;
                 }
                 Ok(())
             }

@@ -59,7 +59,10 @@ commands it would have run. This is how to try a config against the live system 
 ## Config
 
 See `aerospace-responsive.example.toml`. Layout rules: first match wins; no match means orientation
-from aspect ratio and **never** flatten. Placement rules: first *satisfiable* match wins, so a list
+from aspect ratio and **never** flatten. A layout rule may set the root kind with
+`kind = "tiles" | "accordion"`. Without it, a flatten rule means tiles and any other rule leaves the
+kind alone (an axis change keeps an accordion). Put `kind` on a profile's layout rule to make it
+setup-specific, for example accordion on the built-in screen only while it is the only monitor. Placement rules: first *satisfiable* match wins, so a list
 reads as a preference chain; nothing satisfiable leaves the workspace where it is and warns.
 Profiles (predicates over the attached set) are consulted before the base rules.
 
@@ -190,8 +193,8 @@ memory of what it floated) stays where it is; a reinstall picks it up.
 ## Things it will never do
 
 - Read an empty workspace's root layout (that would create and freeze it).
-- Flatten unless your rule says so **and** the root needs fixing: the axis is about to change, or the
-  root is an accordion. A flatten rule always ends in tiles.
+- Flatten unless your rule says so **and** the root needs fixing: the axis or the kind is wrong.
+- Change a root's kind (tiles/accordion) unless the rule sets `kind` or flattens (flatten means tiles).
 - Poll. Or touch a pinned workspace's layout.
 - Write `outer.top` (or any other gap) when your config has no `[gaps]` block.
 

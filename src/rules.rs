@@ -1,7 +1,7 @@
 //! Predicate matching, profile selection and rule resolution (tickets 01, 02, 06).
 //! Pure: the same code answers a live pass, `explain`, and `reconcile --dry-run`.
 
-use crate::config::{Axis, Config, GapRule, Gaps, LayoutRule, MonitorSpec, PlacementRule, Pred, Profile, Rank, SetPred};
+use crate::config::{Axis, Config, Kind, GapRule, Gaps, LayoutRule, MonitorSpec, PlacementRule, Pred, Profile, Rank, SetPred};
 use crate::display::Display;
 use serde::Serialize;
 
@@ -92,6 +92,15 @@ pub struct ProfileTrace {
 pub struct Want {
     pub axis: Axis,
     pub flatten: bool,
+    /// As written in the rule; [`Want::root_kind`] is what the pass enforces.
+    pub kind: Option<Kind>,
+}
+
+impl Want {
+    /// The rule's kind, else tiles for a flatten rule (#5), else none: the kind is left alone.
+    pub fn root_kind(&self) -> Option<Kind> {
+        self.kind.or(self.flatten.then_some(Kind::Tiles))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -284,7 +293,7 @@ fn decide_layout(cfg: &Config, d: &Display, rules: &[(String, &LayoutRule)]) -> 
         } else {
             match mismatch(&r.when, d, cfg) {
                 None => {
-                    won = Some((name.clone(), Want { axis: r.orientation, flatten: r.flatten }));
+                    won = Some((name.clone(), Want { axis: r.orientation, flatten: r.flatten, kind: r.kind }));
                     "won".to_string()
                 }
                 Some(why) => format!("lost: {why}"),
@@ -294,7 +303,7 @@ fn decide_layout(cfg: &Config, d: &Display, rules: &[(String, &LayoutRule)]) -> 
     }
     let (source, want) = won.unwrap_or_else(|| {
         let axis = if d.portrait() { Axis::V } else { Axis::H };
-        (FALLBACK.to_string(), Want { axis, flatten: false })
+        (FALLBACK.to_string(), Want { axis, flatten: false, kind: None })
     });
     LayoutDecision { monitor: d.aero_id, monitor_name: d.aero_name.clone(), want, source, considered }
 }
@@ -387,10 +396,10 @@ mod tests {
     #[test]
     fn desk3_layout() {
         let r = resolve(&example(), &desk3(), None);
-        assert_eq!(r.want_for(1), Some(Want { axis: Axis::V, flatten: true }));
-        assert_eq!(r.want_for(2), Some(Want { axis: Axis::H, flatten: false }));
+        assert_eq!(r.want_for(1), Some(Want { axis: Axis::V, flatten: true, kind: None }));
+        assert_eq!(r.want_for(2), Some(Want { axis: Axis::H, flatten: false, kind: None }));
         let landscape = r.layout.iter().find(|l| l.monitor == 3).unwrap();
-        assert_eq!(landscape.want, Want { axis: Axis::H, flatten: false });
+        assert_eq!(landscape.want, Want { axis: Axis::H, flatten: false, kind: None });
         assert!(landscape.source.starts_with("fallback"));
     }
 

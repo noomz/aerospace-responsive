@@ -1,6 +1,6 @@
 //! AeroSpace's view of the world (`list-*` JSON rows) and its join to CoreGraphics.
 
-use crate::config::Axis;
+use crate::config::{Axis, Kind};
 use crate::display::{Display, Screen};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -92,10 +92,19 @@ impl Snapshot {
     pub fn root_axis(&self, ws: &str) -> Option<Axis> {
         self.windows.iter().find(|w| w.workspace == ws).and_then(|w| axis_of(&w.root_layout))
     }
-    /// Accordion is a layout, not an axis. A flatten rule still owes tiles when the axis is
-    /// already right (D18 only kept the accordion across an axis change).
-    pub fn root_is_accordion(&self, ws: &str) -> bool {
-        self.windows.iter().any(|w| w.workspace == ws && w.root_layout.contains("accordion"))
+    /// The root's kind (tiles or accordion), which is separate from its axis.
+    pub fn root_kind(&self, ws: &str) -> Option<Kind> {
+        self.windows.iter().find(|w| w.workspace == ws).and_then(|w| kind_of(&w.root_layout))
+    }
+}
+
+pub fn kind_of(layout: &str) -> Option<Kind> {
+    if layout.ends_with("accordion") {
+        Some(Kind::Accordion)
+    } else if layout.ends_with("tiles") {
+        Some(Kind::Tiles)
+    } else {
+        None
     }
 }
 
