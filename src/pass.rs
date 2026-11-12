@@ -28,9 +28,10 @@ pub fn plan_placement(r: &Resolved, s: &Snapshot, ds: &[Display]) -> Vec<Cmd> {
 
 /// Step 4: unpinned non-empty workspaces whose root differs from the rule for the monitor
 /// they are ACTUALLY on. An axis change gets `layout --root`, which keeps the layout kind (D18).
-/// A flatten rule means tiles: it acts on an axis change or an accordion root (left by a window
-/// callback's `layout accordion`), and every flatten is followed by `layout tiles`, because
-/// normalization copies a lone child container's layout onto the root.
+/// A rule's root kind (`kind`, else tiles under flatten) is enforced too: a window callback's
+/// `layout accordion` or a flatten rule on another monitor can leave the wrong one. Every flatten
+/// is followed by the kind, because normalization copies a lone child container's layout onto
+/// the root.
 pub fn plan_layout(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>) -> Vec<Cmd> {
     let mut cmds = vec![];
     for ws in s.nonempty() {
@@ -40,13 +41,18 @@ pub fn plan_layout(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>) -> Vec
         let (Some(m), Some(axis)) = (s.monitor_of(&ws), s.root_axis(&ws)) else { continue };
         let Some(want) = r.want_for(m) else { continue };
         let axis_off = axis != want.axis;
-        let accordion = want.flatten && s.root_is_accordion(&ws);
-        if !axis_off && !accordion {
+        let kind = want.root_kind();
+        let kind_off = kind.is_some_and(|k| s.root_kind(&ws) != Some(k));
+        if !axis_off && !kind_off {
             continue;
         }
         if want.flatten {
             cmds.push(Cmd::Flatten { ws: ws.clone() });
-            cmds.push(Cmd::Tiles { ws: ws.clone() });
+        }
+        if let Some(kind) = kind
+            && (want.flatten || kind_off)
+        {
+            cmds.push(Cmd::LayoutKind { ws: ws.clone(), layout: kind });
         }
         if axis_off {
             cmds.push(Cmd::Layout { ws, axis: want.axis });
@@ -74,8 +80,11 @@ pub fn diff(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, dropped: &BTr
         if want.axis != axis {
             out.push(format!("workspace {ws} root axis is {axis:?}, wanted {:?}", want.axis));
         }
-        if want.flatten && s.root_is_accordion(&ws) {
-            out.push(format!("workspace {ws} root is accordion, wanted tiles"));
+        if let Some(k) = want.root_kind()
+            && let Some(got) = s.root_kind(&ws)
+            && got != k
+        {
+            out.push(format!("workspace {ws} root is {}, wanted {}", got.as_str(), k.as_str()));
         }
     }
     out
@@ -212,7 +221,7 @@ pub fn run_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Axis, parse};
+    use crate::config::{Axis, Kind, parse};
     use crate::rules::resolve;
     use crate::testutil::{FakeAero, desk3};
 
@@ -257,10 +266,10 @@ mod tests {
                 mv("1", 1),
                 mv("3", 3),
                 Cmd::Flatten { ws: "1".into() },
-                Cmd::Tiles { ws: "1".into() },
+                Cmd::LayoutKind { ws: "1".into(), layout: Kind::Tiles },
                 Cmd::Layout { ws: "1".into(), axis: Axis::V },
                 Cmd::Flatten { ws: "A".into() },
-                Cmd::Tiles { ws: "A".into() },
+                Cmd::LayoutKind { ws: "A".into(), layout: Kind::Tiles },
                 Cmd::Layout { ws: "A".into(), axis: Axis::V },
             ]
         );
@@ -290,7 +299,7 @@ mod tests {
         let mut f = docked();
         pass(&mut f, &["1"]);
         assert!(f.log.contains(&mv("1", 1)));
-        assert!(!f.log.iter().any(|c| matches!(c, Cmd::Flatten { ws } | Cmd::Tiles { ws } | Cmd::Layout { ws, .. } if ws == "1")));
+        assert!(!f.log.iter().any(|c| matches!(c, Cmd::Flatten { ws } | Cmd::LayoutKind { ws, .. } | Cmd::Layout { ws, .. } if ws == "1")));
     }
 
     #[test]
@@ -329,7 +338,7 @@ mod tests {
         let i = f.ws.iter().position(|w| w.name == "1").unwrap();
         f.ws[i].accordion = true;
         let rep = pass(&mut f, &[]);
-        assert_eq!(f.log, vec![Cmd::Flatten { ws: "1".into() }, Cmd::Tiles { ws: "1".into() }]);
+        assert_eq!(f.log, vec![Cmd::Flatten { ws: "1".into() }, Cmd::LayoutKind { ws: "1".into(), layout: Kind::Tiles }]);
         assert!(rep.mismatches.is_empty(), "{:?}", rep.mismatches);
         f.log.clear();
         let again = pass(&mut f, &[]);
@@ -358,6 +367,51 @@ mod tests {
         assert!(f.ws[i].accordion, "a rule without flatten never asks for tiles");
         f.log.clear();
         assert!(pass(&mut f, &[]).executed.is_empty(), "an accordion on the right axis is left alone");
+    }
+
+    /// The example config with `kind` on the built-in rule (the laptop-only setup's screen).
+    fn pass_kind(f: &mut FakeAero, kind: &str) -> PassReport {
+        let toml = include_str!("../aerospace-responsive.example.toml");
+        let old = "orientation = \"h\"\nflatten     = false";
+        assert!(toml.contains(old));
+        let cfg = parse(&toml.replacen(old, &format!("{old}\nkind = \"{kind}\""), 1)).unwrap().config;
+        let ds = desk3();
+        let r = resolve(&cfg, &ds, None);
+        run_pass(f, &r, &ds, &BTreeSet::new(), &AtomicBool::new(false), None, false).unwrap()
+    }
+
+    #[test]
+    fn a_kind_rule_turns_a_tiled_arrival_into_an_accordion_once() {
+        // Undock: T left the portrait flatten rule as v_tiles; the built-in rule wants h accordion.
+        let mut f = docked();
+        let i = f.ws.iter().position(|w| w.name == "T").unwrap();
+        f.ws[i].root = Axis::V;
+        let rep = pass_kind(&mut f, "accordion");
+        let on_t: Vec<_> = f.log.iter().filter(|c| matches!(c, Cmd::LayoutKind { ws, .. } | Cmd::Layout { ws, .. } | Cmd::Flatten { ws } if ws == "T")).cloned().collect();
+        assert_eq!(on_t, vec![Cmd::LayoutKind { ws: "T".into(), layout: Kind::Accordion }, Cmd::Layout { ws: "T".into(), axis: Axis::H }]);
+        assert!(f.ws[i].accordion && f.ws[i].root == Axis::H);
+        assert!(rep.mismatches.is_empty(), "{:?}", rep.mismatches);
+        f.log.clear();
+        assert!(pass_kind(&mut f, "accordion").executed.is_empty(), "accordion on the right axis is settled");
+    }
+
+    #[test]
+    fn a_tiles_kind_undoes_a_callback_accordion_without_flattening() {
+        let mut f = docked();
+        pass_kind(&mut f, "tiles");
+        f.log.clear();
+        let i = f.ws.iter().position(|w| w.name == "T").unwrap();
+        f.ws[i].accordion = true;
+        pass_kind(&mut f, "tiles");
+        assert_eq!(f.log, vec![Cmd::LayoutKind { ws: "T".into(), layout: Kind::Tiles }]);
+    }
+
+    #[test]
+    fn stubborn_kind_shows_up_in_the_post_pass_diff() {
+        let mut f = docked();
+        f.ignore_layout = true;
+        let rep = pass_kind(&mut f, "accordion");
+        assert!(rep.mismatches.contains(&"workspace T root is tiles, wanted accordion".to_string()), "{:?}", rep.mismatches);
     }
 
     #[test]
@@ -425,10 +479,10 @@ mod tests {
                 Cmd::Float { id: 105 }, // not allowlisted
                 Cmd::Float { id: 300 }, // 200 is the lower id: it keeps the one kitty slot
                 Cmd::Flatten { ws: "1".into() },
-                Cmd::Tiles { ws: "1".into() },
+                Cmd::LayoutKind { ws: "1".into(), layout: Kind::Tiles },
                 Cmd::Layout { ws: "1".into(), axis: Axis::V },
                 Cmd::Flatten { ws: "A".into() },
-                Cmd::Tiles { ws: "A".into() },
+                Cmd::LayoutKind { ws: "A".into(), layout: Kind::Tiles },
                 Cmd::Layout { ws: "A".into(), axis: Axis::V },
             ]
         );

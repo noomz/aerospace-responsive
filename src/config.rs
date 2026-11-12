@@ -137,12 +137,32 @@ pub enum Axis {
     V,
 }
 
+/// Root layout kind. Axis is separate: `layout --root horizontal|vertical` keeps the kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Tiles,
+    Accordion,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Tiles => "tiles",
+            Kind::Accordion => "accordion",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LayoutRule {
     pub when: Pred,
     pub orientation: Axis,
     pub flatten: bool,
+    /// Absent: flatten means tiles, no flatten leaves the kind alone.
+    #[serde(default)]
+    pub kind: Option<Kind>,
 }
 
 /// A placement target: a predicate, or the one ranking string form (06 S1).
@@ -446,6 +466,7 @@ mod tests {
         assert_eq!(l.config.profile.len(), 2);
         assert_eq!(l.config.layout[0].orientation, Axis::V);
         assert!(l.config.layout[0].flatten);
+        assert_eq!(l.config.layout[0].kind, None);
         let managed: Vec<String> = l.config.managed_workspaces().into_iter().collect();
         assert_eq!(managed, ["1", "2", "3", "C", "T"]);
     }
@@ -601,5 +622,13 @@ mod tests {
         assert!(l.config.layout.is_empty() && l.config.placement.is_empty());
         assert_eq!(l.config.settings.debounce.trailing_ms, 1000);
         assert!(l.config.settings.warn_on_no_match);
+    }
+
+    #[test]
+    fn layout_kind_is_tiles_or_accordion() {
+        let rule = |k: &str| format!("[[layout]]\nwhen = {{ builtin = true }}\norientation = \"h\"\nflatten = false\nkind = \"{k}\"\n");
+        assert_eq!(parse(&rule("accordion")).unwrap().config.layout[0].kind, Some(Kind::Accordion));
+        assert_eq!(parse(&rule("tiles")).unwrap().config.layout[0].kind, Some(Kind::Tiles));
+        assert!(parse(&rule("stack")).is_err());
     }
 }

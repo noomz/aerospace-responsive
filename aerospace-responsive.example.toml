@@ -21,6 +21,8 @@ match = { name = "LEN T2364pA" }   # owned, usually unplugged: info, not an erro
 
 # ---------- layout: monitor -> root orientation (+ flatten). First match wins (02 M3). ----------
 # No match = orientation from aspect ratio, never flatten (02 M5).
+# Optional kind = "tiles" | "accordion" sets the root kind; without it flatten means tiles
+# and no flatten leaves the kind alone.
 
 [[layout]]
 when        = { portrait = true }

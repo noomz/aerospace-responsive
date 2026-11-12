@@ -115,6 +115,10 @@ pub fn explain(r: &Resolved) -> String {
     let _ = writeln!(o, "layout:");
     for l in &r.layout {
         let flat = if l.want.flatten { ", flatten" } else { "" };
+        let flat = match l.want.kind {
+            Some(k) => format!("{flat}, {}", k.as_str()),
+            None => flat.to_string(),
+        };
         let _ = writeln!(o, "  monitor {} {}  ->  {}{flat}   [{}]", l.monitor, l.monitor_name, axis(l.want.axis), l.source);
         for c in &l.considered {
             let _ = writeln!(o, "      {:<28} {}", c.rule, c.outcome);
