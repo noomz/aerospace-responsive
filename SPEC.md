@@ -139,6 +139,11 @@ arriving tiled gets else-action (float). Motivating case: kitty only tiled app o
 - V22 Arrival order wins: arrival (and leave dest check) counts only tiled windows daemon already knew on that
   workspace (seen at connect resync or via earlier handled event). Burst: later, not-yet-judged arrival never takes
   earlier arrival's slot. Known map in-process, rebuilt each (re)connect.
+- V37 Draw waits for the verdict. A refresh that has `window-moved` asks the daemon `pre-layout` (census + moved
+  ids) and applies returned `layout floating|tiling` in the tree before it draws, then broadcasts. No daemon, no
+  answer in 100ms, or `--observe` → broadcast and draw as before. Handler never calls `aerospace` (caller is inside
+  the refresh; that call deadlocks). Memory updates as if the commands landed. A later `window-moved` for the same
+  arrival sees the settled layout and does not issue a second command. See B7.
 
 ## §T tasks
 
@@ -172,6 +177,7 @@ id|date|cause|fix
 B1|2026-09-30|last rule removed → child killed (V14) → pass inert (C3) → removal converge skipped; rule-floated stay floating, record kept forever|V20
 B2|2026-09-30|V17 unfroze at unlock; windows GC'd behind lock return only in first heavy session after; light-session diff between = closed+arrival burst|V21
 B3|2026-09-30|burst: 2 windows of limited entry land before first event handled; V3 count-now sees unjudged later one → first arrival floats itself, later keeps slot (T9 misfiled as test bug)|V22
+B7|2026-11-11|window-moved broadcast, then layout draws the arrival tiled (siblings shrink), then daemon `layout floating`|V37
 
 # SPEC: top gap
 

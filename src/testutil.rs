@@ -157,6 +157,12 @@ impl FakeAero {
         self.subs.iter().filter(|a| a.load(Ordering::SeqCst)).count()
     }
 
+    pub fn set_floating(&mut self, id: u32, floating: bool) {
+        if let Ok(w) = self.win_mut(id) {
+            w.floating = floating;
+        }
+    }
+
     pub fn add_window(&mut self, ws: &str, id: u32, app: &str, title: &str, floating: bool) {
         let i = self.idx(ws).expect("no such fake workspace");
         self.ws[i].windows.push(FakeWin { id, app: app.into(), title: title.into(), floating });

@@ -22,6 +22,9 @@ pub enum Request {
     Pin { workspace: Option<String> },
     Unpin { workspace: Option<String>, all: bool },
     ProfileLock { name: String },
+    /// Judge arrivals before AeroSpace draws them. The caller is inside a refresh, so the
+    /// handler must not call `aerospace` (that call waits for the refresh: deadlock).
+    PreLayout { windows: Vec<crate::world::WinInfo>, moved: Vec<u32> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

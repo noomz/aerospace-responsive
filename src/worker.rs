@@ -850,6 +850,24 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         rules::resolve(&self.config, &ds, self.persisted.lock.as_deref()).exclusive_tiling
     }
 
+    /// The refresh asks before it draws. Answer from the census it sent. Never call AeroSpace
+    /// here: the caller is inside that refresh, and a CLI call waits for it to finish.
+    fn pre_layout(&mut self, windows: Vec<WinInfo>, moved: Vec<u32>) -> Response {
+        if self.observe {
+            return Response::ok("", json!([]));
+        }
+        let Some(ds) = self.last_ds.clone() else {
+            return Response::ok("", json!([]));
+        };
+        let rules = rules::resolve(&self.config, &ds, self.persisted.lock.as_deref()).exclusive_tiling;
+        let before = self.persisted.exclusive_tiling.clone();
+        let cmds = tiling::pre_layout(&rules, &mut self.persisted.exclusive_tiling, &mut self.known, &windows, &moved);
+        if self.persisted.exclusive_tiling != before {
+            self.save_state();
+        }
+        Response::ok("", json!(cmds))
+    }
+
     /// One rule command, or its log line in observe mode. True when it took effect.
     fn exec(&mut self, cmd: &Cmd, why: &str) -> bool {
         if self.observe {
@@ -887,6 +905,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             Request::ProfileLock { name } => self.lock(name),
             Request::ProfileUnlock => Ok(self.unlock()),
             Request::Reload => self.reload(),
+            Request::PreLayout { windows, moved } => Ok(self.pre_layout(windows, moved)),
         };
         let _ = reply.send(resp.unwrap_or_else(Response::err));
     }
@@ -1102,7 +1121,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aero::Cmd;
+    use crate::aero::{Aero, Cmd};
     use crate::config::Axis;
     use crate::testutil::{FakeAero, desk3};
     use std::sync::mpsc;
@@ -1369,6 +1388,26 @@ mod tests {
         assert_eq!(floated(&w, "T"), [500, 502]);
         assert_eq!(Persisted::load(&d.path().join("state.json")).exclusive_tiling, w.persisted.exclusive_tiling, "memory saved");
         assert!(w.pending.is_none() && !w.abort.load(Ordering::SeqCst), "events never arm a pass or abort one (V12)");
+    }
+
+    #[test]
+    fn pre_layout_answers_without_calling_aerospace_and_the_event_does_not_repeat_it() {
+        let (mut w, d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.log.clear();
+        w.aero.add_window("T", 700, "com.apple.Safari", "GitHub", false);
+        let wins = w.aero.window_details().unwrap();
+        let r = ask(&mut w, Request::PreLayout { windows: wins, moved: vec![700] });
+        assert_eq!(r.exit, 0, "{}", r.text);
+        assert_eq!(r.json, serde_json::json!([{ "kind": "float", "id": 700 }]));
+        assert!(w.aero.log.is_empty(), "pre-layout must not call aerospace: {:?}", w.aero.log);
+        assert!(floated(&w, "T").contains(&700), "{:?}", floated(&w, "T"));
+        assert_eq!(Persisted::load(&d.path().join("state.json")).exclusive_tiling, w.persisted.exclusive_tiling);
+        // The fork applies the float, then broadcasts. The event sees a floating window and stops.
+        w.aero.set_floating(700, true);
+        w.handle(moved(700, "T", None, "com.apple.Safari"));
+        assert!(w.aero.log.is_empty(), "already judged: {:?}", w.aero.log);
     }
 
     #[test]
