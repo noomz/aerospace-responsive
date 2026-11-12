@@ -860,7 +860,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
 
     /// The refresh asks before it draws. Answer from the census it sent. Never call AeroSpace
     /// here: the caller is inside that refresh, and a CLI call waits for it to finish.
-    fn pre_layout(&mut self, windows: Vec<WinInfo>, moved: Vec<u32>) -> Response {
+    fn pre_layout(&mut self, mut windows: Vec<WinInfo>, moved: Vec<u32>) -> Response {
         if self.observe {
             return Response::ok("", json!([]));
         }
@@ -869,6 +869,17 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             return Response::ok("", json!([]));
         };
         let rules = rules::resolve(&self.config, &ds, self.persisted.lock.as_deref()).exclusive_tiling;
+        // The fork's census sends "" for an app without a bundle id; events and CLI reads say
+        // NULL-APP-BUNDLE-ID. One identity, or a record made here is never matched again.
+        for w in windows.iter_mut().filter(|w| w.app.is_empty()) {
+            w.app = crate::aero::null_app();
+        }
+        // An arrival already known where the census puts it was judged by its own event (or a
+        // resync) first: this request is stale for it (AeroSpace stopped waiting). Skip it.
+        let moved: Vec<u32> = moved
+            .into_iter()
+            .filter(|id| windows.iter().find(|w| w.id == *id).is_none_or(|w| self.known.get(id) != Some(&w.workspace)))
+            .collect();
         // Judge against copies (batch order needs them), then keep only the floats handed out.
         // A float recorded at once is safe either way: if AeroSpace stopped waiting and drew the
         // window tiled, its event floats it as usual. Everything else (retile, leave, the known
@@ -1539,6 +1550,37 @@ mod tests {
         w.aero.move_window(301, "1");
         w.handle(moved(301, "1", Some("T"), KITTY));
         assert!(w.aero.log.is_empty(), "{:?}", w.aero.log);
+    }
+
+    #[test]
+    fn a_pre_layout_request_after_its_event_is_stale() {
+        // AeroSpace stopped waiting; the event for 301 was handled first and admitted it.
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.add_window("T", 300, KITTY, "incumbent", false);
+        w.aero.add_window("T", 301, KITTY, "late", false);
+        let stale = w.aero.window_details().unwrap(); // census taken while 300 was still tiled
+        w.aero.set_floating(300, true); // you float the incumbent: the slot is free
+        w.handle(moved(300, "T", None, KITTY));
+        w.handle(moved(301, "T", None, KITTY));
+        w.aero.log.clear();
+        let r = ask(&mut w, Request::PreLayout { windows: stale, moved: vec![301] });
+        assert_eq!(r.json, serde_json::json!([]), "already judged by its event");
+        assert!(w.persisted.exclusive_tiling.floated_on(301, KITTY).is_none(), "no false ownership");
+    }
+
+    #[test]
+    fn a_census_app_without_a_bundle_id_matches_its_events() {
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.add_window("T", 700, "NULL-APP-BUNDLE-ID", "", false);
+        let mut wins = w.aero.window_details().unwrap();
+        wins.iter_mut().filter(|x| x.id == 700).for_each(|x| x.app = String::new()); // as the fork sends it
+        let r = ask(&mut w, Request::PreLayout { windows: wins, moved: vec![700] });
+        assert_eq!(r.json, serde_json::json!([{ "kind": "float", "id": 700 }]));
+        assert!(w.persisted.exclusive_tiling.floated_on(700, "NULL-APP-BUNDLE-ID").is_some());
     }
 
     #[test]

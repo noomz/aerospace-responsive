@@ -145,7 +145,8 @@ arriving tiled gets else-action (float). Motivating case: kitty only tiled app o
   the refresh; that call deadlocks). A float handed out is recorded at once (a late answer still leaves a tiled window, and its
   event floats it as usual); every other memory or known-map change waits for the window's own `window-moved`, which
   sees whether the answer landed (a landed retile leaves a tiled window: the leave drops the record, no command). Census
-  windows outside the batch count only when known there (V22). No subscription → no answers (C3). See B7.
+  windows outside the batch count only when known there (V22). No subscription → no answers (C3). A moved id already known where the
+  census puts it was judged by its event first: skipped (stale request). Census `""` app = NULL-APP-BUNDLE-ID. See B7.
 
 ## §T tasks
 
