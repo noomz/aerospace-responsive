@@ -810,12 +810,20 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             }
         }
         // The arrival: only a window arriving tiled is the rule's business (V1, V2).
-        if let Some(rule) = rule
-            && let tiling::Arrival::Float(why) = tiling::arrival(rule, w, &wins)
-            && self.exec(&Cmd::Float { id }, &format!("arrived on {workspace}: {why}"))
-        {
-            self.persisted.exclusive_tiling.insert(workspace, id, &w.app);
-            changed = true;
+        match rule.map(|rule| tiling::arrival(rule, w, &wins)) {
+            Some(tiling::Arrival::Float(why)) => {
+                if self.exec(&Cmd::Float { id }, &format!("arrived on {workspace}: {why}")) {
+                    self.persisted.exclusive_tiling.insert(workspace, id, &w.app);
+                    changed = true;
+                }
+            }
+            // Admitted tiled, yet recorded here: a pre-layout float that never landed (V37). The
+            // rule does not own a tiled window, so the record goes.
+            Some(tiling::Arrival::Admit) if self.persisted.exclusive_tiling.floated_on(id, &w.app) == Some(workspace) => {
+                self.persisted.exclusive_tiling.remove(id);
+                changed = true;
+            }
+            _ => {}
         }
         if changed {
             self.save_state();
@@ -1505,6 +1513,32 @@ mod tests {
         w.handle(moved(700, "1", Some("T"), "com.apple.Safari"));
         assert!(w.aero.log.is_empty(), "{:?}", w.aero.log);
         assert!(w.persisted.exclusive_tiling.floated_on(700, "com.apple.Safari").is_none());
+    }
+
+    #[test]
+    fn a_late_float_answer_admitted_after_all_leaves_no_record() {
+        // Slot taken: pre-layout floats 301, AeroSpace stopped waiting and drew it tiled. The
+        // incumbent closes before 301's event, so the event admits it: the rule must not own it.
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.add_window("T", 300, KITTY, "incumbent", false);
+        w.handle(moved(300, "T", None, KITTY));
+        w.aero.add_window("T", 301, KITTY, "late", false);
+        let wins = w.aero.window_details().unwrap();
+        let r = ask(&mut w, Request::PreLayout { windows: wins, moved: vec![301] });
+        assert_eq!(r.json, serde_json::json!([{ "kind": "float", "id": 301 }]));
+        w.aero.close_window(300);
+        w.handle(Msg::Window(WindowEvent::WindowClosed { id: 300, workspace: "T".into(), app: KITTY.into() }));
+        w.aero.log.clear();
+        w.handle(moved(301, "T", None, KITTY));
+        assert!(w.aero.log.is_empty(), "admitted: {:?}", w.aero.log);
+        assert!(w.persisted.exclusive_tiling.floated_on(301, KITTY).is_none(), "no false ownership");
+        // You float it by hand and move it: the daemon leaves it alone.
+        w.aero.set_floating(301, true);
+        w.aero.move_window(301, "1");
+        w.handle(moved(301, "1", Some("T"), KITTY));
+        assert!(w.aero.log.is_empty(), "{:?}", w.aero.log);
     }
 
     #[test]
