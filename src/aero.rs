@@ -17,10 +17,20 @@ use std::time::{Duration, Instant};
 /// AeroSpace restarts) would otherwise block the worker, and every client behind it, for good.
 pub const CALL_DEADLINE: Duration = Duration::from_secs(5);
 
+/// A call at least this slow is logged when it returns, with its own timestamp. Pass logs print
+/// commands only after the pass, so they cannot show when AeroSpace stalled.
+const SLOW_CALL: Duration = Duration::from_secs(1);
+
 /// `aerospace <args>`, killed if it has not exited within `CALL_DEADLINE`.
 pub fn aerospace<S: AsRef<str>>(args: &[S]) -> Result<Output> {
     let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
-    bounded_output(Command::new("aerospace").args(&args), CALL_DEADLINE).map_err(|e| match e.kind() {
+    let started = Instant::now();
+    let out = bounded_output(Command::new("aerospace").args(&args), CALL_DEADLINE);
+    let took = started.elapsed();
+    if took >= SLOW_CALL {
+        crate::log!("slow call: aerospace {} took {} ms", args.join(" "), took.as_millis());
+    }
+    out.map_err(|e| match e.kind() {
         ErrorKind::TimedOut => anyhow!("aerospace {}: {e}", args.join(" ")),
         _ => anyhow!(e).context("cannot spawn `aerospace` (is it on PATH?)"),
     })

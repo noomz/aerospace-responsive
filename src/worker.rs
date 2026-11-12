@@ -429,9 +429,12 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     fn after_pass(&mut self, rep: PassReport, p: Pending) {
         for e in &rep.executed {
             match &e.error {
-                None => crate::log!("  {}", e.cmd),
-                Some(err) => crate::log!("  {}  -> FAILED: {err}", e.cmd),
+                None => crate::log!("  {}  ({} ms)", e.cmd, e.ms),
+                Some(err) => crate::log!("  {}  ({} ms) -> FAILED: {err}", e.cmd, e.ms),
             }
+        }
+        for d in &rep.drifted {
+            crate::log!("drift: {d} during the pass; this pass did not move it");
         }
         if rep.aborted || rep.empty_snapshot {
             // An abort restarts a full reconcile, which ticket 03 says owns the next run — so it
@@ -479,7 +482,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             if rep.refused.is_empty() {
                 self.warnings.clear(Class::Pass);
             }
-            format!("ok, {} command(s)", rep.executed.len())
+            format!("ok, {} command(s) in {:.1}s", rep.executed.len(), rep.ms as f64 / 1000.0)
         } else {
             let msg = format!("state still differs after one re-pass: {}", rep.mismatches.join("; "));
             self.warn(Class::Pass, "mismatch", &msg);
