@@ -83,6 +83,8 @@ pub struct FakeWs {
     pub visible: bool,
     pub windows: Vec<FakeWin>,
     pub root: Axis,
+    /// `v_accordion` / `h_accordion` instead of tiles. `layout tiles` clears it.
+    pub accordion: bool,
 }
 
 /// In-memory AeroSpace with the move semantics of MoveWorkspaceToMonitorCommand.swift:15-21
@@ -126,6 +128,7 @@ impl FakeAero {
                         })
                         .collect(),
                     root: *root,
+                    accordion: false,
                 })
                 .collect(),
             focused: focused.into(),
@@ -213,9 +216,10 @@ impl Aero for FakeAero {
         }
         let mut windows = vec![];
         for w in &self.ws {
-            let layout = if w.root == Axis::H { "h_tiles" } else { "v_tiles" };
+            let kind = if w.accordion { "accordion" } else { "tiles" };
+            let layout = if w.root == Axis::H { format!("h_{kind}") } else { format!("v_{kind}") };
             for x in &w.windows {
-                windows.push(WindowRow { id: x.id, workspace: w.name.clone(), monitor: w.monitor, root_layout: layout.into() });
+                windows.push(WindowRow { id: x.id, workspace: w.name.clone(), monitor: w.monitor, root_layout: layout.clone() });
             }
         }
         Ok(Snapshot { windows })
@@ -264,6 +268,13 @@ impl Aero for FakeAero {
                 Ok(())
             }
             Cmd::Flatten { ws } => self.idx(ws).map(|_| ()),
+            Cmd::Tiles { ws } => {
+                let i = self.idx(ws)?;
+                if !self.ignore_layout {
+                    self.ws[i].accordion = false;
+                }
+                Ok(())
+            }
             Cmd::Layout { ws, axis } => {
                 let i = self.idx(ws)?;
                 if !self.ignore_layout {

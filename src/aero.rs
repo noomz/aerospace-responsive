@@ -74,6 +74,8 @@ pub enum Cmd {
     /// `monitor` is the resolved id for bookkeeping; `target` is what AeroSpace receives (P-6).
     Move { ws: String, monitor: u32, target: String },
     Flatten { ws: String },
+    /// Root layout kind, not axis. `flatten-workspace-tree` only hoists windows; it keeps an accordion.
+    Tiles { ws: String },
     Layout { ws: String, axis: Axis },
     Focus { ws: String },
     /// Exclusive tiling's else-action, and its undo (I.aero).
@@ -90,6 +92,7 @@ impl Cmd {
         match self {
             Cmd::Move { ws, target, .. } => vec![s("move-workspace-to-monitor"), s("--workspace"), ws.clone(), s("--"), target.clone()],
             Cmd::Flatten { ws } => vec![s("flatten-workspace-tree"), s("--workspace"), ws.clone()],
+            Cmd::Tiles { ws } => vec![s("layout"), s("--root"), s("--workspace"), ws.clone(), s("tiles")],
             // horizontal|vertical only, so an accordion root keeps being an accordion (D18).
             Cmd::Layout { ws, axis } => {
                 let l = if *axis == Axis::H { "horizontal" } else { "vertical" };
@@ -337,6 +340,7 @@ mod tests {
         assert_eq!(m.to_string(), "aerospace move-workspace-to-monitor --workspace 1 -- '^Built-in Retina Display$'");
         assert_eq!(Cmd::Layout { ws: "1".into(), axis: Axis::V }.to_string(), "aerospace layout --root --workspace 1 vertical");
         assert_eq!(Cmd::Flatten { ws: "C".into() }.to_string(), "aerospace flatten-workspace-tree --workspace C");
+        assert_eq!(Cmd::Tiles { ws: "2".into() }.to_string(), "aerospace layout --root --workspace 2 tiles");
         assert_eq!(Cmd::Focus { ws: "T".into() }.to_string(), "aerospace workspace -- T");
         assert_eq!(Cmd::Float { id: 5230 }.to_string(), "aerospace layout floating --window-id 5230");
         assert_eq!(Cmd::Tile { id: 4380 }.to_string(), "aerospace layout tiling --window-id 4380");

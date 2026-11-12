@@ -190,7 +190,8 @@ memory of what it floated) stays where it is; a reinstall picks it up.
 ## Things it will never do
 
 - Read an empty workspace's root layout (that would create and freeze it).
-- Flatten unless your rule says so **and** the root axis is about to change.
+- Flatten unless your rule says so **and** the root needs fixing: the axis is about to change, or the
+  root is an accordion. A flatten rule always ends in tiles.
 - Poll. Or touch a pinned workspace's layout.
 - Write `outer.top` (or any other gap) when your config has no `[gaps]` block.
 
