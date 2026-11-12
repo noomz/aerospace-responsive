@@ -12,6 +12,7 @@ use anyhow::{Result, anyhow};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 /// Step 2: non-empty opt-in workspaces that are not on their target. Empty ones are absent
 /// from the snapshot, so they are skipped by construction (D10).
@@ -29,9 +30,8 @@ pub fn plan_placement(r: &Resolved, s: &Snapshot, ds: &[Display]) -> Vec<Cmd> {
 /// Step 4: unpinned non-empty workspaces whose root differs from the rule for the monitor
 /// they are ACTUALLY on. An axis change gets `layout --root`, which keeps the layout kind (D18).
 /// A rule's root kind (`kind`, else tiles under flatten) is enforced too: a window callback's
-/// `layout accordion` or a flatten rule on another monitor can leave the wrong one. Every flatten
-/// is followed by the kind, because normalization copies a lone child container's layout onto
-/// the root.
+/// `layout accordion` or a flatten rule on another monitor can leave the wrong one. It is sent
+/// only when wrong: a flatten leaves no child container, so it cannot change the root's kind.
 pub fn plan_layout(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>) -> Vec<Cmd> {
     let mut cmds = vec![];
     for ws in s.nonempty() {
@@ -50,7 +50,7 @@ pub fn plan_layout(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>) -> Vec
             cmds.push(Cmd::Flatten { ws: ws.clone() });
         }
         if let Some(kind) = kind
-            && (want.flatten || kind_off)
+            && kind_off
         {
             cmds.push(Cmd::LayoutKind { ws: ws.clone(), layout: kind });
         }
@@ -90,6 +90,19 @@ pub fn diff(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, dropped: &BTr
     out
 }
 
+/// Workspaces on a different monitor in `after` than in `before`, with nothing in between that
+/// moves workspaces.
+fn drifted(before: &Snapshot, after: &Snapshot) -> Vec<String> {
+    before
+        .nonempty()
+        .into_iter()
+        .filter_map(|ws| {
+            let (a, b) = (before.monitor_of(&ws)?, after.monitor_of(&ws)?);
+            (a != b).then(|| format!("workspace {ws} moved from monitor {a} to {b}"))
+        })
+        .collect()
+}
+
 /// What a pass would issue if every move lands (`reconcile --dry-run`, observe mode).
 /// `converge` = the pending exclusive-tiling plans, issued between placement and layout.
 pub fn dry_run(r: &Resolved, s: &Snapshot, ds: &[Display], pinned: &BTreeSet<String>, converge: &[Plan]) -> Vec<Cmd> {
@@ -118,6 +131,15 @@ pub struct Moved {
 pub struct Executed {
     pub cmd: String,
     pub error: Option<String>,
+    /// How long AeroSpace took to answer. Each command re-lays out every monitor.
+    pub ms: u64,
+}
+
+/// Runs `cmd`, timed.
+fn timed(aero: &mut dyn Aero, cmd: &Cmd) -> (Result<(), String>, u64) {
+    let t = Instant::now();
+    let result = aero.run(cmd);
+    (result, u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -130,12 +152,17 @@ pub struct PassReport {
     /// `list-windows` came back empty (seen right at wake, ticket 12): retry, do not act.
     pub empty_snapshot: bool,
     pub mismatches: Vec<String>,
+    /// Workspaces that changed monitor after placement: the layout step never moves one, so
+    /// something else did (seen at dock: workspace 5 left the DELL mid-pass).
+    pub drifted: Vec<String>,
     /// Workspaces whose exclusive-tiling converge completed this pass.
     pub converged: Vec<String>,
     pub nonempty: BTreeSet<String>,
     /// What this pass left visible per monitor. Ticket 13 S3.3: a monitor is restored only
     /// while it still shows what the pass put there — anything else means the user acted.
     pub left_visible: BTreeMap<u32, String>,
+    /// Wall time of the whole pass, reads included.
+    pub ms: u64,
 }
 
 /// `tiling` is exclusive tiling's memory (`None` = no converge at all); `live` = the rule gets
@@ -149,6 +176,7 @@ pub fn run_pass(
     tiling: Option<&mut TilingMemory>,
     live: bool,
 ) -> Result<PassReport> {
+    let started = Instant::now();
     let mut rep = PassReport::default();
 
     let s0 = aero.windows()?; // 1. SNAPSHOT
@@ -164,7 +192,7 @@ pub fn run_pass(
             return Ok(rep);
         }
         let Cmd::Move { ws, monitor, .. } = &cmd else { unreachable!("placement plans only moves") };
-        let result = aero.run(&cmd);
+        let (result, ms) = timed(aero, &cmd);
         match &result {
             Ok(()) => rep.moves.push(Moved { ws: ws.clone(), from: s0.monitor_of(ws).expect("planned from s0"), to: *monitor }),
             Err(e) => {
@@ -172,7 +200,7 @@ pub fn run_pass(
                 rep.refused.push((ws.clone(), e.clone()));
             }
         }
-        rep.executed.push(Executed { cmd: cmd.to_string(), error: result.err() });
+        rep.executed.push(Executed { cmd: cmd.to_string(), error: result.err(), ms });
     }
 
     let s1 = aero.windows()?; // 3. RE-READ (mandatory: placement changed which rule applies)
@@ -190,9 +218,10 @@ pub fn run_pass(
                     rep.aborted = true;
                     return Ok(rep);
                 }
-                aero.run(cmd).map_err(|e| anyhow!("{cmd}: {e}"))?;
+                let (result, ms) = timed(aero, cmd);
+                result.map_err(|e| anyhow!("{cmd}: {e}"))?;
                 tiling::note(mem, &plan.workspace, cmd, app);
-                rep.executed.push(Executed { cmd: cmd.to_string(), error: None });
+                rep.executed.push(Executed { cmd: cmd.to_string(), error: None, ms });
             }
             tiling::commit(mem, &plan);
             rep.converged.push(plan.workspace.clone());
@@ -205,16 +234,18 @@ pub fn run_pass(
             rep.aborted = true;
             return Ok(rep);
         }
-        let result = aero.run(&cmd);
-        rep.executed.push(Executed { cmd: cmd.to_string(), error: result.err() });
+        let (result, ms) = timed(aero, &cmd);
+        rep.executed.push(Executed { cmd: cmd.to_string(), error: result.err(), ms });
     }
 
     let s2 = aero.windows()?; // 5. POST-PASS DIFF
     rep.mismatches = diff(r, &s2, pinned, &dropped);
+    rep.drifted = drifted(&s1, &s2);
     rep.nonempty = s2.nonempty();
     if let Ok(rows) = aero.workspaces() {
         rep.left_visible = rows.iter().filter(|r| r.visible).map(|r| (r.monitor, r.workspace.clone())).collect();
     }
+    rep.ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(rep)
 }
 
@@ -266,10 +297,8 @@ mod tests {
                 mv("1", 1),
                 mv("3", 3),
                 Cmd::Flatten { ws: "1".into() },
-                Cmd::LayoutKind { ws: "1".into(), layout: Kind::Tiles },
                 Cmd::Layout { ws: "1".into(), axis: Axis::V },
                 Cmd::Flatten { ws: "A".into() },
-                Cmd::LayoutKind { ws: "A".into(), layout: Kind::Tiles },
                 Cmd::Layout { ws: "A".into(), axis: Axis::V },
             ]
         );
@@ -426,6 +455,17 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_that_moves_during_the_layout_step_is_reported_as_drift() {
+        let mut f = docked();
+        f.drift_on_layout = Some(("3".into(), 2)); // placed on 3, then AeroSpace puts it back on 2
+        let rep = pass(&mut f, &[]);
+        assert_eq!(rep.drifted, ["workspace 3 moved from monitor 3 to 2"]);
+        assert!(rep.executed.iter().all(|e| e.ms < 5_000), "every command carries its time");
+        f.log.clear();
+        assert!(pass(&mut f, &[]).drifted.is_empty(), "a quiet pass reports no drift");
+    }
+
+    #[test]
     fn empty_snapshot_does_nothing() {
         let mut f = FakeAero::new(&desk3(), &[("1", 2, true, 0, Axis::H)], "1");
         let rep = pass(&mut f, &[]);
@@ -479,10 +519,8 @@ mod tests {
                 Cmd::Float { id: 105 }, // not allowlisted
                 Cmd::Float { id: 300 }, // 200 is the lower id: it keeps the one kitty slot
                 Cmd::Flatten { ws: "1".into() },
-                Cmd::LayoutKind { ws: "1".into(), layout: Kind::Tiles },
                 Cmd::Layout { ws: "1".into(), axis: Axis::V },
                 Cmd::Flatten { ws: "A".into() },
-                Cmd::LayoutKind { ws: "A".into(), layout: Kind::Tiles },
                 Cmd::Layout { ws: "A".into(), axis: Axis::V },
             ]
         );

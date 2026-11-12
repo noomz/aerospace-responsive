@@ -96,6 +96,8 @@ pub struct FakeAero {
     pub log: Vec<Cmd>,
     pub refuse: BTreeSet<String>,
     pub ignore_layout: bool,
+    /// On the next `layout --root`, AeroSpace moves this workspace to this monitor by itself.
+    pub drift_on_layout: Option<(String, u32)>,
     /// Make `windows()` fail, as a socket blip does mid-pass.
     pub fail_windows: bool,
     /// One flag per `subscribe` call: true while that Subscription is alive.
@@ -135,6 +137,7 @@ impl FakeAero {
             log: vec![],
             refuse: BTreeSet::new(),
             ignore_layout: false,
+            drift_on_layout: None,
             fail_windows: false,
             subs: vec![],
             fail_subscribe: false,
@@ -276,6 +279,10 @@ impl Aero for FakeAero {
                 Ok(())
             }
             Cmd::Layout { ws, axis } => {
+                if let Some((name, to)) = self.drift_on_layout.take() {
+                    let j = self.idx(&name)?;
+                    self.ws[j].monitor = to;
+                }
                 let i = self.idx(ws)?;
                 if !self.ignore_layout {
                     self.ws[i].root = *axis;
