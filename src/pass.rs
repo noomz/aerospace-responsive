@@ -26,8 +26,11 @@ pub fn plan_placement(r: &Resolved, s: &Snapshot, ds: &[Display]) -> Vec<Cmd> {
         .collect()
 }
 
-/// Step 4: unpinned non-empty workspaces whose root axis differs from the rule for the
-/// monitor they are ACTUALLY on. Flatten only on rule policy AND an axis change (D18).
+/// Step 4: unpinned non-empty workspaces whose root differs from the rule for the monitor
+/// they are ACTUALLY on. An axis change gets `layout --root`, which keeps the layout kind (D18).
+/// A flatten rule means tiles: it acts on an axis change or an accordion root (left by a window
+/// callback's `layout accordion`), and every flatten is followed by `layout tiles`, because
+/// normalization copies a lone child container's layout onto the root.
 pub fn plan_layout(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>) -> Vec<Cmd> {
     let mut cmds = vec![];
     for ws in s.nonempty() {
@@ -36,13 +39,18 @@ pub fn plan_layout(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>) -> Vec
         }
         let (Some(m), Some(axis)) = (s.monitor_of(&ws), s.root_axis(&ws)) else { continue };
         let Some(want) = r.want_for(m) else { continue };
-        if axis == want.axis {
+        let axis_off = axis != want.axis;
+        let accordion = want.flatten && s.root_is_accordion(&ws);
+        if !axis_off && !accordion {
             continue;
         }
         if want.flatten {
             cmds.push(Cmd::Flatten { ws: ws.clone() });
+            cmds.push(Cmd::Tiles { ws: ws.clone() });
         }
-        cmds.push(Cmd::Layout { ws, axis: want.axis });
+        if axis_off {
+            cmds.push(Cmd::Layout { ws, axis: want.axis });
+        }
     }
     cmds
 }
@@ -62,10 +70,12 @@ pub fn diff(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, dropped: &BTr
             continue;
         }
         let (Some(m), Some(axis)) = (s.monitor_of(&ws), s.root_axis(&ws)) else { continue };
-        if let Some(want) = r.want_for(m)
-            && want.axis != axis
-        {
+        let Some(want) = r.want_for(m) else { continue };
+        if want.axis != axis {
             out.push(format!("workspace {ws} root axis is {axis:?}, wanted {:?}", want.axis));
+        }
+        if want.flatten && s.root_is_accordion(&ws) {
+            out.push(format!("workspace {ws} root is accordion, wanted tiles"));
         }
     }
     out
@@ -247,8 +257,10 @@ mod tests {
                 mv("1", 1),
                 mv("3", 3),
                 Cmd::Flatten { ws: "1".into() },
+                Cmd::Tiles { ws: "1".into() },
                 Cmd::Layout { ws: "1".into(), axis: Axis::V },
                 Cmd::Flatten { ws: "A".into() },
+                Cmd::Tiles { ws: "A".into() },
                 Cmd::Layout { ws: "A".into(), axis: Axis::V },
             ]
         );
@@ -278,7 +290,7 @@ mod tests {
         let mut f = docked();
         pass(&mut f, &["1"]);
         assert!(f.log.contains(&mv("1", 1)));
-        assert!(!f.log.iter().any(|c| matches!(c, Cmd::Flatten { ws } | Cmd::Layout { ws, .. } if ws == "1")));
+        assert!(!f.log.iter().any(|c| matches!(c, Cmd::Flatten { ws } | Cmd::Tiles { ws } | Cmd::Layout { ws, .. } if ws == "1")));
     }
 
     #[test]
@@ -310,11 +322,53 @@ mod tests {
     }
 
     #[test]
+    fn portrait_accordion_on_the_right_axis_gets_flattened_once() {
+        let mut f = docked();
+        pass(&mut f, &[]);
+        f.log.clear();
+        let i = f.ws.iter().position(|w| w.name == "1").unwrap();
+        f.ws[i].accordion = true;
+        let rep = pass(&mut f, &[]);
+        assert_eq!(f.log, vec![Cmd::Flatten { ws: "1".into() }, Cmd::Tiles { ws: "1".into() }]);
+        assert!(rep.mismatches.is_empty(), "{:?}", rep.mismatches);
+        f.log.clear();
+        let again = pass(&mut f, &[]);
+        assert!(again.executed.is_empty(), "flatten must not repeat: {:?}", again.executed);
+    }
+
+    #[test]
     fn stubborn_layout_shows_up_in_the_post_pass_diff() {
         let mut f = docked();
         f.ignore_layout = true;
         let rep = pass(&mut f, &[]);
         assert_eq!(rep.mismatches.len(), 2, "{:?}", rep.mismatches);
+    }
+
+    #[test]
+    fn axis_change_without_flatten_keeps_the_accordion() {
+        let mut f = docked();
+        pass(&mut f, &[]);
+        f.log.clear();
+        let i = f.ws.iter().position(|w| w.name == "T").unwrap();
+        f.ws[i].accordion = true;
+        f.ws[i].root = Axis::V;
+        let rep = pass(&mut f, &[]);
+        assert_eq!(f.log, vec![Cmd::Layout { ws: "T".into(), axis: Axis::H }]);
+        assert!(rep.mismatches.is_empty(), "{:?}", rep.mismatches);
+        assert!(f.ws[i].accordion, "a rule without flatten never asks for tiles");
+        f.log.clear();
+        assert!(pass(&mut f, &[]).executed.is_empty(), "an accordion on the right axis is left alone");
+    }
+
+    #[test]
+    fn stubborn_accordion_shows_up_in_the_post_pass_diff() {
+        let mut f = docked();
+        pass(&mut f, &[]);
+        let i = f.ws.iter().position(|w| w.name == "1").unwrap();
+        f.ws[i].accordion = true;
+        f.ignore_layout = true;
+        let rep = pass(&mut f, &[]);
+        assert_eq!(rep.mismatches, ["workspace 1 root is accordion, wanted tiles"]);
     }
 
     #[test]
@@ -371,8 +425,10 @@ mod tests {
                 Cmd::Float { id: 105 }, // not allowlisted
                 Cmd::Float { id: 300 }, // 200 is the lower id: it keeps the one kitty slot
                 Cmd::Flatten { ws: "1".into() },
+                Cmd::Tiles { ws: "1".into() },
                 Cmd::Layout { ws: "1".into(), axis: Axis::V },
                 Cmd::Flatten { ws: "A".into() },
+                Cmd::Tiles { ws: "A".into() },
                 Cmd::Layout { ws: "A".into(), axis: Axis::V },
             ]
         );

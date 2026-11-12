@@ -92,6 +92,11 @@ impl Snapshot {
     pub fn root_axis(&self, ws: &str) -> Option<Axis> {
         self.windows.iter().find(|w| w.workspace == ws).and_then(|w| axis_of(&w.root_layout))
     }
+    /// Accordion is a layout, not an axis. A flatten rule still owes tiles when the axis is
+    /// already right (D18 only kept the accordion across an axis change).
+    pub fn root_is_accordion(&self, ws: &str) -> bool {
+        self.windows.iter().any(|w| w.workspace == ws && w.root_layout.contains("accordion"))
+    }
 }
 
 pub fn axis_of(layout: &str) -> Option<Axis> {
