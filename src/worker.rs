@@ -112,10 +112,6 @@ pub struct Worker<A: Aero, S: FnMut() -> Vec<Screen>> {
     /// Where the daemon has seen each window (connect resync, then every event): an arrival is
     /// judged only against windows it already knew there, so arrival order wins a burst (V22).
     known: std::collections::BTreeMap<u32, String>,
-    /// `pre-layout` answers not yet confirmed, with the workspace each was judged for. AeroSpace
-    /// stops waiting after 100ms and draws as before, so memory changes only once a later read
-    /// (the window's next event, or a resync) shows the verdict applied.
-    pre_verdicts: std::collections::BTreeMap<u32, (Cmd, String)>,
     /// Where AeroSpace's config lives: its own lookup in production (`paths::aerospace_config`),
     /// a temp file in a test.
     aero_config: Box<dyn Fn() -> Result<PathBuf, String> + Send>,
@@ -171,7 +167,6 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             inert: None,
             last_ds: None,
             known: Default::default(),
-            pre_verdicts: Default::default(),
             tiling_on_disk,
         };
         let _ = w.load_config();
@@ -731,16 +726,8 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             Err(e) => return crate::log!("exclusive tiling: resync read failed: {e:#}"),
         };
         self.known = wins.iter().map(|w| (w.id, w.workspace.clone())).collect();
-        // Verdicts whose events never came (the connection dropped): keep what visibly landed,
-        // so the leaves below can undo a float that has since moved on.
-        let mut changed = false;
-        for (id, (verdict, origin)) in std::mem::take(&mut self.pre_verdicts) {
-            if let Some(w) = wins.iter().find(|w| w.id == id) {
-                changed |= self.commit_verdict(&verdict, &origin, w);
-            }
-        }
         let live: Vec<(u32, &str)> = wins.iter().map(|w| (w.id, w.app.as_str())).collect();
-        changed |= self.persisted.exclusive_tiling.prune(&live);
+        let mut changed = self.persisted.exclusive_tiling.prune(&live);
         let rules = self.current_rules();
         let mem = &self.persisted.exclusive_tiling;
         let left: Vec<&WinInfo> = wins.iter().filter(|w| mem.floated_on(w.id, &w.app).is_some_and(|ws| ws != w.workspace)).collect();
@@ -780,7 +767,6 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let (id, workspace, app) = match ev {
             WindowEvent::WindowClosed { id, app, .. } => {
                 self.known.remove(&id);
-                self.pre_verdicts.remove(&id);
                 if self.persisted.exclusive_tiling.floated_on(id, &app).is_some() && self.persisted.exclusive_tiling.remove(id) {
                     self.save_state();
                 }
@@ -793,8 +779,8 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let left = self.persisted.exclusive_tiling.floated_on(id, &app).is_some_and(|ws| ws != workspace);
         let rules = self.current_rules();
         let rule = rules.iter().find(|r| r.workspace == workspace).cloned();
-        if rule.is_none() && !left && !self.pre_verdicts.contains_key(&id) {
-            return; // no rule here, nothing of ours leaving or pending: no read
+        if rule.is_none() && !left {
+            return; // no rule here, nothing of ours leaving: no read
         }
         self.decide_moved(id, &workspace, rule.as_ref(), left, &rules);
     }
@@ -817,17 +803,6 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let wins: Vec<WinInfo> = wins.iter().filter(|x| x.id == id || self.known.get(&x.id) == Some(&x.workspace)).cloned().collect();
         let Some(w) = wins.iter().find(|x| x.id == id) else { return };
         let mut changed = false;
-        let mut left = left;
-        if let Some((verdict, origin)) = self.pre_verdicts.remove(&id)
-            && self.commit_verdict(&verdict, &origin, w)
-        {
-            if origin == workspace {
-                return self.save_state(); // landed where it was judged: nothing left to do
-            }
-            // Judged for `origin`, already moved on: decide here from the committed memory.
-            changed = true;
-            left = self.persisted.exclusive_tiling.floated_on(id, &w.app).is_some_and(|ws| ws != workspace);
-        }
         if left {
             changed = true;
             if self.apply_leave(w, &wins, rules) != Leave::Drop {
@@ -875,48 +850,35 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         rules::resolve(&self.config, &ds, self.persisted.lock.as_deref()).exclusive_tiling
     }
 
-    /// Records a pre-layout verdict in memory when `w` (a fresh read) shows it applied. A verdict
-    /// not applied means AeroSpace stopped waiting and drew as before; the caller decides anew.
-    fn commit_verdict(&mut self, verdict: &Cmd, origin: &str, w: &WinInfo) -> bool {
-        let floating = w.layout == "floating";
-        match verdict {
-            Cmd::Float { id } if floating => {
-                crate::log!("exclusive tiling: {verdict} applied before the draw (arrived on {origin})");
-                self.persisted.exclusive_tiling.insert(origin, *id, &w.app);
-                true
-            }
-            Cmd::Tile { id } if !floating => {
-                crate::log!("exclusive tiling: {verdict} applied before the draw (left for {origin})");
-                self.persisted.exclusive_tiling.remove(*id);
-                true
-            }
-            _ => {
-                crate::log!("exclusive tiling: {verdict} from pre-layout was not applied; deciding now");
-                false
-            }
-        }
-    }
-
     /// The refresh asks before it draws. Answer from the census it sent. Never call AeroSpace
     /// here: the caller is inside that refresh, and a CLI call waits for it to finish.
     fn pre_layout(&mut self, windows: Vec<WinInfo>, moved: Vec<u32>) -> Response {
         if self.observe {
             return Response::ok("", json!([]));
         }
-        // No subscription: no event will confirm a verdict, so give none (the rule is inert, C3).
+        // No subscription: the rule is inert (C3), and no event would follow up.
         let (Some(ds), true) = (self.last_ds.clone(), self.sub.is_some()) else {
             return Response::ok("", json!([]));
         };
         let rules = rules::resolve(&self.config, &ds, self.persisted.lock.as_deref()).exclusive_tiling;
-        // Judged against copies: nothing here is known to have landed until its event says so.
+        // Judge against copies (batch order needs them), then keep only the floats handed out.
+        // A float recorded at once is safe either way: if AeroSpace stopped waiting and drew the
+        // window tiled, its event floats it as usual. Everything else (retile, leave, the known
+        // map) waits for the window's own event, which sees whether the answer landed: a retile
+        // that landed leaves a tiled window, and its leave drops the record with no command.
         let (mut memory, mut known) = (self.persisted.exclusive_tiling.clone(), self.known.clone());
         let cmds = tiling::pre_layout(&rules, &mut memory, &mut known, &windows, &moved);
+        let mut changed = false;
         for cmd in &cmds {
-            if let Cmd::Float { id } | Cmd::Tile { id } = cmd
+            if let Cmd::Float { id } = cmd
                 && let Some(w) = windows.iter().find(|w| w.id == *id)
             {
-                self.pre_verdicts.insert(*id, (cmd.clone(), w.workspace.clone()));
+                self.persisted.exclusive_tiling.insert(&w.workspace, *id, &w.app);
+                changed = true;
             }
+        }
+        if changed {
+            self.save_state();
         }
         Response::ok("", json!(cmds))
     }
@@ -1455,17 +1417,16 @@ mod tests {
         assert_eq!(r.exit, 0, "{}", r.text);
         assert_eq!(r.json, serde_json::json!([{ "kind": "float", "id": 700 }]));
         assert!(w.aero.log.is_empty(), "pre-layout must not call aerospace: {:?}", w.aero.log);
-        assert!(!floated(&w, "T").contains(&700), "memory waits for the event: {:?}", floated(&w, "T"));
+        assert!(floated(&w, "T").contains(&700), "{:?}", floated(&w, "T"));
+        assert_eq!(Persisted::load(&d.path().join("state.json")).exclusive_tiling, w.persisted.exclusive_tiling);
         // The fork applies the float, then broadcasts. The event sees a floating window and stops.
         w.aero.set_floating(700, true);
         w.handle(moved(700, "T", None, "com.apple.Safari"));
         assert!(w.aero.log.is_empty(), "already judged: {:?}", w.aero.log);
-        assert!(floated(&w, "T").contains(&700), "{:?}", floated(&w, "T"));
-        assert_eq!(Persisted::load(&d.path().join("state.json")).exclusive_tiling, w.persisted.exclusive_tiling);
     }
 
     #[test]
-    fn a_late_pre_layout_answer_changes_nothing_and_the_event_decides() {
+    fn a_late_float_answer_is_floated_by_the_event() {
         // AeroSpace stopped waiting and drew the arrival tiled; the event must still float it.
         let (mut w, _d) = worker_cfg(docked(), RULE, None);
         w.handle(Msg::Trigger(Trigger::Startup));
@@ -1498,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn no_verdicts_while_the_subscription_is_down() {
+    fn no_answers_while_the_subscription_is_down() {
         let (mut w, _d) = worker_cfg(docked(), RULE, None);
         w.handle(Msg::Trigger(Trigger::Startup));
         w.tick(later());
@@ -1525,6 +1486,24 @@ mod tests {
         // Not applied: the window is still floating when its event arrives.
         w.handle(moved(700, "1", Some("T"), "com.apple.Safari"));
         assert_eq!(w.aero.log, [Cmd::Tile { id: 700 }]);
+        assert!(w.persisted.exclusive_tiling.floated_on(700, "com.apple.Safari").is_none());
+    }
+
+    #[test]
+    fn a_landed_retile_is_settled_by_the_event_without_a_second_command() {
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.add_window("T", 700, "com.apple.Safari", "GitHub", false);
+        w.handle(moved(700, "T", None, "com.apple.Safari"));
+        w.aero.log.clear();
+        w.aero.move_window(700, "1");
+        let wins = w.aero.window_details().unwrap();
+        ask(&mut w, Request::PreLayout { windows: wins, moved: vec![700] });
+        assert!(w.persisted.exclusive_tiling.floated_on(700, "com.apple.Safari").is_some(), "the record waits for the event");
+        w.aero.set_floating(700, false); // the fork applied `layout tiling`
+        w.handle(moved(700, "1", Some("T"), "com.apple.Safari"));
+        assert!(w.aero.log.is_empty(), "{:?}", w.aero.log);
         assert!(w.persisted.exclusive_tiling.floated_on(700, "com.apple.Safari").is_none());
     }
 
