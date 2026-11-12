@@ -116,6 +116,73 @@ pub enum Arrival {
     Float(Why),
 }
 
+/// Commands to apply before AeroSpace draws a refresh, plus the memory that goes with them.
+///
+/// Same verdicts as the subscribe path (`arrival` / `leave`), in `moved` order. A later id in
+/// `moved` does not count until its own turn (V22). Layouts change as commands are emitted, so
+/// a window floated earlier in the batch is not still tiled for the next count.
+///
+/// Must not read AeroSpace: the caller is inside a refresh, and a CLI call there deadlocks.
+pub fn pre_layout(rules: &[Rule], memory: &mut TilingMemory, known: &mut BTreeMap<u32, String>, windows: &[WinInfo], moved: &[u32]) -> Vec<Cmd> {
+    let pending: BTreeSet<u32> = moved.iter().copied().collect();
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    let mut layout: BTreeMap<u32, String> = BTreeMap::new();
+    let mut cmds = Vec::new();
+    for id in moved {
+        seen.insert(*id);
+        let Some(raw) = windows.iter().find(|w| w.id == *id) else {
+            memory.remove(*id);
+            known.remove(id);
+            continue;
+        };
+        known.insert(*id, raw.workspace.clone());
+        let left = memory.floated_on(*id, &raw.app).is_some_and(|ws| ws != raw.workspace);
+        let rule = rules.iter().find(|r| r.workspace == raw.workspace);
+        if rule.is_none() && !left {
+            continue;
+        }
+        let visible: Vec<WinInfo> = windows
+            .iter()
+            // V22, as on the event path: a batch member counts once judged in this batch; anyone
+            // else only when the daemon already knows it there (a queued arrival does not count).
+            .filter(|x| x.id == *id || if pending.contains(&x.id) { seen.contains(&x.id) } else { known.get(&x.id) == Some(&x.workspace) })
+            .map(|x| {
+                let mut y = x.clone();
+                if let Some(l) = layout.get(&y.id) {
+                    y.layout = l.clone();
+                }
+                y
+            })
+            .collect();
+        let Some(w) = visible.iter().find(|x| x.id == *id) else { continue };
+        if left {
+            match leave(w, rule, &visible) {
+                Leave::Drop => {
+                    memory.remove(w.id);
+                }
+                Leave::Retile => {
+                    cmds.push(Cmd::Tile { id: w.id });
+                    layout.insert(w.id, "h_tiles".into());
+                    memory.remove(w.id);
+                    continue;
+                }
+                Leave::StayFloated(_) => {
+                    memory.insert(&w.workspace, w.id, &w.app);
+                    continue;
+                }
+            }
+        }
+        if let Some(rule) = rule
+            && let Arrival::Float(_) = arrival(rule, w, &visible)
+        {
+            cmds.push(Cmd::Float { id: w.id });
+            layout.insert(w.id, "floating".into());
+            memory.insert(&w.workspace, w.id, &w.app);
+        }
+    }
+    cmds
+}
+
 /// V1, V2: the rule acts only on a window arriving tiled. `windows` = the whole read.
 pub fn arrival(rule: &Rule, w: &WinInfo, windows: &[WinInfo]) -> Arrival {
     if !w.tiled() {
@@ -645,5 +712,55 @@ tiling-allowlist = [
         let removed = view(&[], &mem, Some(&[win(1, "T", "a", "", "floating")]));
         assert_eq!(removed[0].converge, "pending: rule removed, re-tiles 1");
         assert!(removed[0].rule.is_none());
+    }
+
+    #[test]
+    fn pre_layout_ignores_a_queued_arrival_it_does_not_know_yet() {
+        // Kitty 2 sits on T in the census, but its own arrival is still queued (not known): the
+        // one slot goes to kitty 3, as on the event path (V22).
+        let r = kitty_rule();
+        let a = win(2, "T", KITTY, "a", "h_tiles");
+        let b = win(3, "T", KITTY, "b", "h_tiles");
+        let cmds = pre_layout(std::slice::from_ref(&r), &mut TilingMemory::default(), &mut BTreeMap::new(), &[a, b], &[3]);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        let known = BTreeMap::from([(2, "T".to_string())]);
+        let a = win(2, "T", KITTY, "a", "h_tiles");
+        let b = win(3, "T", KITTY, "b", "h_tiles");
+        assert_eq!(pre_layout(std::slice::from_ref(&r), &mut TilingMemory::default(), &mut known.clone(), &[a, b], &[3]), [Cmd::Float { id: 3 }]);
+    }
+
+    #[test]
+    fn pre_layout_floats_before_draw_and_keeps_arrival_order() {
+        let r = kitty_rule();
+        let mut mem = TilingMemory::default();
+        let mut known = BTreeMap::new();
+        let safari = win(1, "T", "com.apple.Safari", "GitHub", "h_tiles");
+        assert_eq!(pre_layout(std::slice::from_ref(&r), &mut mem, &mut known, std::slice::from_ref(&safari), &[1]), [Cmd::Float { id: 1 }]);
+        assert_eq!(mem.floated_on(1, "com.apple.Safari"), Some("T"));
+        assert_eq!(known.get(&1).map(String::as_str), Some("T"));
+
+        // Two kitties in one refresh: the first keeps the slot, the second is floated. The
+        // second must not be counted as already tiled when the first is judged.
+        let mut mem = TilingMemory::default();
+        let mut known = BTreeMap::new();
+        let a = win(2, "T", KITTY, "a", "h_tiles");
+        let b = win(3, "T", KITTY, "b", "h_tiles");
+        assert_eq!(pre_layout(std::slice::from_ref(&r), &mut mem, &mut known, &[a, b], &[2, 3]), [Cmd::Float { id: 3 }]);
+        assert!(mem.floated_on(2, KITTY).is_none());
+        assert_eq!(mem.floated_on(3, KITTY), Some("T"));
+
+        // A rule-floated window that left an exclusive workspace is tiled before the draw.
+        let mut mem = TilingMemory::default();
+        mem.insert("T", 9, "com.apple.Safari");
+        let mut known = BTreeMap::from([(9, "T".into())]);
+        let left = win(9, "1", "com.apple.Safari", "", "floating");
+        assert_eq!(pre_layout(std::slice::from_ref(&r), &mut mem, &mut known, std::slice::from_ref(&left), &[9]), [Cmd::Tile { id: 9 }]);
+        assert!(mem.floated_on(9, "com.apple.Safari").is_none());
+
+        // Already floating: nothing to do, and no memory.
+        let mut mem = TilingMemory::default();
+        let dialog = win(4, "T", "com.apple.Safari", "", "floating");
+        assert!(pre_layout(std::slice::from_ref(&r), &mut mem, &mut BTreeMap::new(), std::slice::from_ref(&dialog), &[4]).is_empty());
+        assert!(mem.rule_floated.is_empty());
     }
 }

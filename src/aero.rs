@@ -188,7 +188,7 @@ pub enum WindowEvent {
 }
 
 /// What `%{app-bundle-id}` prints for an app without one, so events and reads agree.
-fn null_app() -> String {
+pub(crate) fn null_app() -> String {
     "NULL-APP-BUNDLE-ID".into()
 }
 

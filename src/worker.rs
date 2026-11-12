@@ -810,12 +810,20 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             }
         }
         // The arrival: only a window arriving tiled is the rule's business (V1, V2).
-        if let Some(rule) = rule
-            && let tiling::Arrival::Float(why) = tiling::arrival(rule, w, &wins)
-            && self.exec(&Cmd::Float { id }, &format!("arrived on {workspace}: {why}"))
-        {
-            self.persisted.exclusive_tiling.insert(workspace, id, &w.app);
-            changed = true;
+        match rule.map(|rule| tiling::arrival(rule, w, &wins)) {
+            Some(tiling::Arrival::Float(why)) => {
+                if self.exec(&Cmd::Float { id }, &format!("arrived on {workspace}: {why}")) {
+                    self.persisted.exclusive_tiling.insert(workspace, id, &w.app);
+                    changed = true;
+                }
+            }
+            // Admitted tiled, yet recorded here: a pre-layout float that never landed (V37). The
+            // rule does not own a tiled window, so the record goes.
+            Some(tiling::Arrival::Admit) if self.persisted.exclusive_tiling.floated_on(id, &w.app) == Some(workspace) => {
+                self.persisted.exclusive_tiling.remove(id);
+                changed = true;
+            }
+            _ => {}
         }
         if changed {
             self.save_state();
@@ -848,6 +856,50 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             None => self.world().unwrap_or_default(),
         };
         rules::resolve(&self.config, &ds, self.persisted.lock.as_deref()).exclusive_tiling
+    }
+
+    /// The refresh asks before it draws. Answer from the census it sent. Never call AeroSpace
+    /// here: the caller is inside that refresh, and a CLI call waits for it to finish.
+    fn pre_layout(&mut self, mut windows: Vec<WinInfo>, moved: Vec<u32>) -> Response {
+        if self.observe {
+            return Response::ok("", json!([]));
+        }
+        // No subscription: the rule is inert (C3), and no event would follow up.
+        let (Some(ds), true) = (self.last_ds.clone(), self.sub.is_some()) else {
+            return Response::ok("", json!([]));
+        };
+        let rules = rules::resolve(&self.config, &ds, self.persisted.lock.as_deref()).exclusive_tiling;
+        // The fork's census sends "" for an app without a bundle id; events and CLI reads say
+        // NULL-APP-BUNDLE-ID. One identity, or a record made here is never matched again.
+        for w in windows.iter_mut().filter(|w| w.app.is_empty()) {
+            w.app = crate::aero::null_app();
+        }
+        // An arrival already known where the census puts it was judged by its own event (or a
+        // resync) first: this request is stale for it (AeroSpace stopped waiting). Skip it.
+        let moved: Vec<u32> = moved
+            .into_iter()
+            .filter(|id| windows.iter().find(|w| w.id == *id).is_none_or(|w| self.known.get(id) != Some(&w.workspace)))
+            .collect();
+        // Judge against copies (batch order needs them), then keep only the floats handed out.
+        // A float recorded at once is safe either way: if AeroSpace stopped waiting and drew the
+        // window tiled, its event floats it as usual. Everything else (retile, leave, the known
+        // map) waits for the window's own event, which sees whether the answer landed: a retile
+        // that landed leaves a tiled window, and its leave drops the record with no command.
+        let (mut memory, mut known) = (self.persisted.exclusive_tiling.clone(), self.known.clone());
+        let cmds = tiling::pre_layout(&rules, &mut memory, &mut known, &windows, &moved);
+        let mut changed = false;
+        for cmd in &cmds {
+            if let Cmd::Float { id } = cmd
+                && let Some(w) = windows.iter().find(|w| w.id == *id)
+            {
+                self.persisted.exclusive_tiling.insert(&w.workspace, *id, &w.app);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_state();
+        }
+        Response::ok("", json!(cmds))
     }
 
     /// One rule command, or its log line in observe mode. True when it took effect.
@@ -887,6 +939,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             Request::ProfileLock { name } => self.lock(name),
             Request::ProfileUnlock => Ok(self.unlock()),
             Request::Reload => self.reload(),
+            Request::PreLayout { windows, moved } => Ok(self.pre_layout(windows, moved)),
         };
         let _ = reply.send(resp.unwrap_or_else(Response::err));
     }
@@ -1102,7 +1155,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aero::Cmd;
+    use crate::aero::{Aero, Cmd};
     use crate::config::Axis;
     use crate::testutil::{FakeAero, desk3};
     use std::sync::mpsc;
@@ -1369,6 +1422,165 @@ mod tests {
         assert_eq!(floated(&w, "T"), [500, 502]);
         assert_eq!(Persisted::load(&d.path().join("state.json")).exclusive_tiling, w.persisted.exclusive_tiling, "memory saved");
         assert!(w.pending.is_none() && !w.abort.load(Ordering::SeqCst), "events never arm a pass or abort one (V12)");
+    }
+
+    #[test]
+    fn pre_layout_answers_without_calling_aerospace_and_the_event_does_not_repeat_it() {
+        let (mut w, d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.log.clear();
+        w.aero.add_window("T", 700, "com.apple.Safari", "GitHub", false);
+        let wins = w.aero.window_details().unwrap();
+        let r = ask(&mut w, Request::PreLayout { windows: wins, moved: vec![700] });
+        assert_eq!(r.exit, 0, "{}", r.text);
+        assert_eq!(r.json, serde_json::json!([{ "kind": "float", "id": 700 }]));
+        assert!(w.aero.log.is_empty(), "pre-layout must not call aerospace: {:?}", w.aero.log);
+        assert!(floated(&w, "T").contains(&700), "{:?}", floated(&w, "T"));
+        assert_eq!(Persisted::load(&d.path().join("state.json")).exclusive_tiling, w.persisted.exclusive_tiling);
+        // The fork applies the float, then broadcasts. The event sees a floating window and stops.
+        w.aero.set_floating(700, true);
+        w.handle(moved(700, "T", None, "com.apple.Safari"));
+        assert!(w.aero.log.is_empty(), "already judged: {:?}", w.aero.log);
+    }
+
+    #[test]
+    fn a_late_float_answer_is_floated_by_the_event() {
+        // AeroSpace stopped waiting and drew the arrival tiled; the event must still float it.
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.log.clear();
+        w.aero.add_window("T", 700, "com.apple.Safari", "GitHub", false);
+        let wins = w.aero.window_details().unwrap();
+        ask(&mut w, Request::PreLayout { windows: wins, moved: vec![700] });
+        w.handle(moved(700, "T", None, "com.apple.Safari"));
+        assert_eq!(w.aero.log, [Cmd::Float { id: 700 }]);
+        assert!(floated(&w, "T").contains(&700));
+    }
+
+    #[test]
+    fn a_float_that_moved_on_before_its_events_is_retiled() {
+        // Applied on T, then the window went to 1 (no rule) before either event was handled.
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.log.clear();
+        w.aero.add_window("T", 700, "com.apple.Safari", "GitHub", false);
+        let wins = w.aero.window_details().unwrap();
+        ask(&mut w, Request::PreLayout { windows: wins, moved: vec![700] });
+        w.aero.set_floating(700, true);
+        w.aero.move_window(700, "1");
+        w.handle(moved(700, "T", None, "com.apple.Safari"));
+        w.handle(moved(700, "1", Some("T"), "com.apple.Safari"));
+        assert_eq!(w.aero.log, [Cmd::Tile { id: 700 }]);
+        assert!(w.persisted.exclusive_tiling.floated_on(700, "com.apple.Safari").is_none());
+    }
+
+    #[test]
+    fn no_answers_while_the_subscription_is_down() {
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        exit(&mut w, 2);
+        w.aero.add_window("T", 700, "com.apple.Safari", "GitHub", false);
+        let wins = w.aero.window_details().unwrap();
+        let r = ask(&mut w, Request::PreLayout { windows: wins, moved: vec![700] });
+        assert_eq!(r.json, serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_late_retile_answer_keeps_the_record_so_the_event_retiles() {
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.add_window("T", 700, "com.apple.Safari", "GitHub", false);
+        w.handle(moved(700, "T", None, "com.apple.Safari")); // floated by the rule, recorded
+        assert!(floated(&w, "T").contains(&700));
+        w.aero.log.clear();
+        w.aero.move_window(700, "1");
+        let wins = w.aero.window_details().unwrap();
+        let r = ask(&mut w, Request::PreLayout { windows: wins, moved: vec![700] });
+        assert_eq!(r.json, serde_json::json!([{ "kind": "tile", "id": 700 }]));
+        // Not applied: the window is still floating when its event arrives.
+        w.handle(moved(700, "1", Some("T"), "com.apple.Safari"));
+        assert_eq!(w.aero.log, [Cmd::Tile { id: 700 }]);
+        assert!(w.persisted.exclusive_tiling.floated_on(700, "com.apple.Safari").is_none());
+    }
+
+    #[test]
+    fn a_landed_retile_is_settled_by_the_event_without_a_second_command() {
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.add_window("T", 700, "com.apple.Safari", "GitHub", false);
+        w.handle(moved(700, "T", None, "com.apple.Safari"));
+        w.aero.log.clear();
+        w.aero.move_window(700, "1");
+        let wins = w.aero.window_details().unwrap();
+        ask(&mut w, Request::PreLayout { windows: wins, moved: vec![700] });
+        assert!(w.persisted.exclusive_tiling.floated_on(700, "com.apple.Safari").is_some(), "the record waits for the event");
+        w.aero.set_floating(700, false); // the fork applied `layout tiling`
+        w.handle(moved(700, "1", Some("T"), "com.apple.Safari"));
+        assert!(w.aero.log.is_empty(), "{:?}", w.aero.log);
+        assert!(w.persisted.exclusive_tiling.floated_on(700, "com.apple.Safari").is_none());
+    }
+
+    #[test]
+    fn a_late_float_answer_admitted_after_all_leaves_no_record() {
+        // Slot taken: pre-layout floats 301, AeroSpace stopped waiting and drew it tiled. The
+        // incumbent closes before 301's event, so the event admits it: the rule must not own it.
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.add_window("T", 300, KITTY, "incumbent", false);
+        w.handle(moved(300, "T", None, KITTY));
+        w.aero.add_window("T", 301, KITTY, "late", false);
+        let wins = w.aero.window_details().unwrap();
+        let r = ask(&mut w, Request::PreLayout { windows: wins, moved: vec![301] });
+        assert_eq!(r.json, serde_json::json!([{ "kind": "float", "id": 301 }]));
+        w.aero.close_window(300);
+        w.handle(Msg::Window(WindowEvent::WindowClosed { id: 300, workspace: "T".into(), app: KITTY.into() }));
+        w.aero.log.clear();
+        w.handle(moved(301, "T", None, KITTY));
+        assert!(w.aero.log.is_empty(), "admitted: {:?}", w.aero.log);
+        assert!(w.persisted.exclusive_tiling.floated_on(301, KITTY).is_none(), "no false ownership");
+        // You float it by hand and move it: the daemon leaves it alone.
+        w.aero.set_floating(301, true);
+        w.aero.move_window(301, "1");
+        w.handle(moved(301, "1", Some("T"), KITTY));
+        assert!(w.aero.log.is_empty(), "{:?}", w.aero.log);
+    }
+
+    #[test]
+    fn a_pre_layout_request_after_its_event_is_stale() {
+        // AeroSpace stopped waiting; the event for 301 was handled first and admitted it.
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.add_window("T", 300, KITTY, "incumbent", false);
+        w.aero.add_window("T", 301, KITTY, "late", false);
+        let stale = w.aero.window_details().unwrap(); // census taken while 300 was still tiled
+        w.aero.set_floating(300, true); // you float the incumbent: the slot is free
+        w.handle(moved(300, "T", None, KITTY));
+        w.handle(moved(301, "T", None, KITTY));
+        w.aero.log.clear();
+        let r = ask(&mut w, Request::PreLayout { windows: stale, moved: vec![301] });
+        assert_eq!(r.json, serde_json::json!([]), "already judged by its event");
+        assert!(w.persisted.exclusive_tiling.floated_on(301, KITTY).is_none(), "no false ownership");
+    }
+
+    #[test]
+    fn a_census_app_without_a_bundle_id_matches_its_events() {
+        let (mut w, _d) = worker_cfg(docked(), RULE, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        w.tick(later());
+        w.aero.add_window("T", 700, "NULL-APP-BUNDLE-ID", "", false);
+        let mut wins = w.aero.window_details().unwrap();
+        wins.iter_mut().filter(|x| x.id == 700).for_each(|x| x.app = String::new()); // as the fork sends it
+        let r = ask(&mut w, Request::PreLayout { windows: wins, moved: vec![700] });
+        assert_eq!(r.json, serde_json::json!([{ "kind": "float", "id": 700 }]));
+        assert!(w.persisted.exclusive_tiling.floated_on(700, "NULL-APP-BUNDLE-ID").is_some());
     }
 
     #[test]
