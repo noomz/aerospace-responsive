@@ -258,7 +258,7 @@ pub fn workspace_template(views: &[crate::template::View], state: Option<&str>) 
             Some(m) => format!("on {m}: {}", if v.applies { "applies" } else { "not applied" }),
             None => "not on a monitor".into(),
         };
-        let _ = writeln!(o, "  {:<4} {}   [{}]   {on}", v.workspace, format!("root {}{when}", v.root), v.source);
+        let _ = writeln!(o, "  {:<4} root {}{when}   [{}]   {on}", v.workspace, v.root, v.source);
         let _ = writeln!(o, "       record: {}", v.record);
         o.push_str("       tree:\n");
         let label = |r: &crate::template::Row| {
