@@ -426,15 +426,15 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 return;
             }
         };
-        if let Some(prev) = self.persisted.gap_written.clone() {
-            if plan.on_disk.as_ref() != Some(&prev) {
-                let now = plan.on_disk.as_ref().map_or_else(|| "a shape this tool does not write".to_string(), |v| v.to_toml());
-                self.warn(
-                    Class::World,
-                    "gaps-writer",
-                    &format!("outer.top in {} is {now}, not the {prev:?} this tool wrote: another writer owns that line", path.display()),
-                );
-            }
+        if let Some(prev) = self.persisted.gap_written.clone()
+            && plan.on_disk.as_ref() != Some(&prev)
+        {
+            let now = plan.on_disk.as_ref().map_or_else(|| "a shape this tool does not write".to_string(), |v| v.to_toml());
+            self.warn(
+                Class::World,
+                "gaps-writer",
+                &format!("outer.top in {} is {now}, not the {prev:?} this tool wrote: another writer owns that line", path.display()),
+            );
         }
         if self.persisted.gap_written.as_ref() != Some(&want) {
             self.persisted.gap_written = Some(want.clone());
@@ -1449,7 +1449,7 @@ mod tests {
         let text = std::fs::read_to_string(&aero_cfg).unwrap();
         assert!(text.contains("outer.top = [{ monitor.2 = 20 }, 1]"), "{text}");
         assert!(text.contains("inner.horizontal = 8   # tight"), "the rest of the file is untouched: {text}");
-        assert!(w.aero.log.iter().any(|c| *c == Cmd::ReloadConfig), "AeroSpace must be told to reread");
+        assert!(w.aero.log.contains(&Cmd::ReloadConfig), "AeroSpace must be told to reread");
         // Steady state: a second pass writes nothing and never reloads.
         let n = w.aero.log.len();
         w.handle(Msg::Trigger(Trigger::Display));
@@ -1494,7 +1494,7 @@ mod tests {
         w.handle(Msg::Trigger(Trigger::Display));
         w.tick(later());
         assert_eq!(std::fs::read_to_string(&aero_cfg).unwrap(), "[gaps]\nouter.top = 42\n");
-        assert!(!w.aero.log.iter().any(|c| *c == Cmd::ReloadConfig));
+        assert!(!w.aero.log.contains(&Cmd::ReloadConfig));
         assert!(w.persisted.gap_written.is_none());
     }
 

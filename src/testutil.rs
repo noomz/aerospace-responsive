@@ -2,6 +2,7 @@
 
 use crate::display::{Display, Rect, Screen};
 
+#[allow(clippy::too_many_arguments)]
 fn screen(cg_id: u32, name: &str, bounds: Rect, px: (u64, u64), rotation: f64, main: bool, builtin: bool, notch: f64) -> Screen {
     Screen {
         cg_id,
