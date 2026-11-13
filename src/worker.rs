@@ -1135,7 +1135,20 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             j["exclusive_tiling"] = json!({ "state": state, "inert": self.inert, "workspaces": views });
         }
         if !r.templates.is_empty() {
-            let at = self.aero.workspaces().map(|rows| rows.into_iter().map(|w| (w.workspace, w.monitor)).collect()).unwrap_or_default();
+            // V42 judges `when` after placement: a non-empty workspace counts on its target.
+            let s = self.aero.windows().unwrap_or_default();
+            let at = self
+                .aero
+                .workspaces()
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|w| {
+                            let m = r.target_for(&w.workspace).filter(|_| s.is_nonempty(&w.workspace)).unwrap_or(w.monitor);
+                            (w.workspace, m)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let views = template::view(&r.templates, &self.persisted.template_records, &self.persisted.pinned_names(), &at, &ds, wins.as_deref().unwrap_or_default());
             text.push_str(&render::workspace_template(&views, note.as_deref()));
             j["workspace_template"] = json!({ "state": state, "inert": self.inert, "workspaces": views });
@@ -1288,8 +1301,13 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         }
         let t = d.template.clone();
         let details = self.aero.window_details().map_err(fmt_err)?;
-        let cmds = if dry_run {
-            pass::Rebuild::of(&t, &details, &self.persisted.template_records).cmds
+        let planned = pass::Rebuild::of(&t, &details, &self.persisted.template_records).cmds;
+        // No tiled window: nothing to build, and the record stays (V41: an empty workspace keeps it).
+        let cmds = if dry_run || planned.is_empty() || self.observe {
+            if self.observe && !dry_run && !planned.is_empty() {
+                self.rebuild(&t, &details, "arrange")?; // logs, records in-process (V49)
+            }
+            planned
         } else {
             let cmds = self.rebuild(&t, &details, "arrange")?;
             self.arrivals.remove(&ws); // V47: this rebuild already saw them
@@ -1299,6 +1317,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let text = match (cmds.is_empty(), dry_run) {
             (true, _) => format!("{ws} has no tiled window: nothing to arrange\n"),
             (false, true) => format!("commands:\n{}", lines.iter().map(|l| format!("  {l}\n")).collect::<String>()),
+            (false, false) if self.observe => format!("observe: nothing executed\ncommands:\n{}", lines.iter().map(|l| format!("  {l}\n")).collect::<String>()),
             (false, false) => format!("arranged {ws}: {} command(s)\n", cmds.len()),
         };
         Ok(Response::ok(text, json!({ "workspace": ws, "commands": lines })))
@@ -2472,6 +2491,18 @@ mod tests {
     }
 
     #[test]
+    fn arrange_with_no_tiled_window_keeps_the_record() {
+        let (mut w, d) = tpl_built();
+        for id in [44, 10, 49] {
+            w.aero.close_window(id);
+        }
+        let r = arrange(&mut w, Some("C"), false);
+        assert_eq!((r.exit, r.text.as_str()), (0, "C has no tiled window: nothing to arrange\n"));
+        assert!(disk_has_record(&d, "C") && w.persisted.template_records.contains_key("C"), "V41: an empty workspace keeps its record");
+        assert!(w.aero.log.is_empty());
+    }
+
+    #[test]
     fn arrange_rebuilds_now_even_when_the_record_is_equal() {
         let (mut w, d) = tpl_built();
         let dry = arrange(&mut w, Some("C"), true);
@@ -2537,6 +2568,12 @@ mod tests {
         assert!(ask(&mut w, Request::Explain { config: None }).text.contains("record: up to date"));
         exit(&mut w, 2);
         assert!(ask(&mut w, Request::Status).text.contains("workspace template: inert; C applied\n"));
+        // `C` on the built-in, placed on monitor 3 by the example: explain judges `when` where the
+        // pass will, after placement (V42), and agrees with dry-run.
+        let (mut w, _d) = tpl_worker("");
+        assert!(!ask(&mut w, Request::Reconcile { dry_run: true, config: None }).text.contains("workspace-template rebuild"));
+        let ex = ask(&mut w, Request::Explain { config: None });
+        assert!(ex.text.contains("on LEN T23i-10 (1): not applied\n       record: not applied: when does not match LEN T23i-10 (1)\n"), "{}", ex.text);
         let (mut w, _d) = worker(docked());
         assert!(!ask(&mut w, Request::Status).text.contains("workspace template"), "no template, no line");
         assert!(!ask(&mut w, Request::Explain { config: None }).text.contains("workspace-template"));
@@ -2550,6 +2587,7 @@ mod tests {
         w.observe = true;
         let r = arrange(&mut w, Some("C"), false);
         assert_eq!(r.exit, 0, "{}", r.text);
+        assert!(r.text.starts_with("observe: nothing executed\ncommands:\n  aerospace flatten-workspace-tree --workspace C\n"), "{}", r.text);
         assert!(w.aero.log.is_empty(), "observe runs nothing: {:?}", w.aero.log);
         assert_ne!(w.persisted.template_records["C"], old, "the record moves in-process");
         assert_eq!(ask(&mut w, Request::Pin { workspace: Some("A".into()) }).exit, 0); // a save
