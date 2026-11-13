@@ -2357,4 +2357,17 @@ mod tests {
         let p = w.pending.as_ref().expect("and arms a pass");
         assert!(p.full && p.trigger == Trigger::Unpin);
     }
+
+    #[test]
+    fn a_pre_layout_request_with_a_template_alone_answers_nothing_and_the_arrival_still_rebuilds() {
+        let (mut w, _d) = tpl_worker("");
+        assert_eq!(w.aero.live_subs(), 1, "V53: the child runs, so pre-layout takes the full path");
+        w.aero.add_window("C", 49, "msgr", "Messenger", false);
+        let wins = w.aero.window_details().unwrap();
+        let r = ask(&mut w, Request::PreLayout { windows: wins, moved: vec![49] });
+        assert_eq!(r.json, serde_json::json!([]), "no rule, no answer");
+        w.handle(moved(49, "C", None, "msgr"));
+        w.queue_drained();
+        assert_eq!(flattens(&w.aero.log), 1, "{:?}", w.aero.log);
+    }
 }
