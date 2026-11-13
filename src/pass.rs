@@ -5,7 +5,7 @@
 use crate::aero::{Aero, Cmd, monitor_target};
 use crate::display::Display;
 use crate::rules::Resolved;
-use crate::state::{TemplateRecords, TilingMemory};
+use crate::state::{TemplateRecord, TemplateRecords, TilingMemory};
 use crate::template;
 use crate::tiling::{self, Plan};
 use crate::world::{Snapshot, WinInfo};
@@ -121,9 +121,19 @@ fn drifted(before: &Snapshot, after: &Snapshot) -> Vec<String> {
         .collect()
 }
 
-/// What a pass would issue if every move lands (`reconcile --dry-run`, observe mode).
-/// `converge` = the pending exclusive-tiling plans, issued between placement and layout.
-pub fn dry_run(r: &Resolved, s: &Snapshot, ds: &[Display], pinned: &BTreeSet<String>, converge: &[Plan]) -> Vec<Cmd> {
+/// What a pass would issue if every move lands (`reconcile --dry-run`, observe mode), in pass
+/// order (V44): placement, the pending exclusive-tiling `converge` plans, template rebuilds, layout.
+/// `records` + `details` (one read of every window) feed the rebuilds, judged on the tiled set
+/// the converge would leave. Also returns the rebuilds, each with commands.
+pub fn dry_run(
+    r: &Resolved,
+    s: &Snapshot,
+    ds: &[Display],
+    pinned: &BTreeSet<String>,
+    converge: &[Plan],
+    records: &TemplateRecords,
+    details: &[WinInfo],
+) -> (Vec<Cmd>, Vec<Rebuild>) {
     let moves = plan_placement(r, s, ds);
     let mut landed = s.clone();
     for c in &moves {
@@ -133,9 +143,25 @@ pub fn dry_run(r: &Resolved, s: &Snapshot, ds: &[Display], pinned: &BTreeSet<Str
             }
         }
     }
+    let mut details = details.to_vec();
+    for (cmd, _) in converge.iter().flat_map(|p| &p.steps) {
+        let (id, layout) = match cmd {
+            Cmd::Float { id } => (id, "floating"),
+            Cmd::Tile { id } => (id, "h_tiles"),
+            _ => continue,
+        };
+        for w in details.iter_mut().filter(|w| w.id == *id) {
+            w.layout = layout.into();
+        }
+    }
+    let mut records = records.clone();
+    let converged: BTreeSet<String> = converge.iter().filter(|p| !p.steps.is_empty()).map(|p| p.workspace.clone()).collect();
+    settle_records(r, &landed, pinned, &converged, &mut records);
+    let rebuilds: Vec<Rebuild> = plan_rebuilds(r, &landed, pinned, &records, &details).into_iter().filter(|b| !b.cmds.is_empty()).collect();
     let layout = plan_layout(r, &landed, pinned);
     let conv = converge.iter().flat_map(|p| p.steps.iter().map(|(c, _)| c.clone()));
-    moves.into_iter().chain(conv).chain(layout).collect()
+    let cmds = moves.into_iter().chain(conv).chain(rebuilds.iter().flat_map(|b| b.cmds.clone())).chain(layout).collect();
+    (cmds, rebuilds)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -194,34 +220,64 @@ pub struct Memory<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rebuilt {
-    /// Record equal (and not forced), or no tiled window: no command ran.
+    /// No tiled window: no command ran, and no record is left.
     Nothing,
     Built,
     /// The abort flag stopped it before a command; the record is gone (V41).
     Aborted,
 }
 
-/// V41, V43: rebuilds `t` over its tiled windows in `details` (one read of every window).
-/// `force` rebuilds even when the record is equal: an arrival (V40 b) or `arrange`. A failed
-/// command is an error, and like an abort it leaves no record.
-#[allow(clippy::too_many_arguments)]
-pub fn rebuild_template(
+/// One template rebuild (V43) and the record it leaves (V41). `why` is `None` when the record
+/// already equals `record`: only a forced rebuild (an arrival, V40 b, or `arrange`) runs it then.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rebuild {
+    pub workspace: String,
+    pub why: Option<template::Pending>,
+    pub cmds: Vec<Cmd>,
+    pub record: TemplateRecord,
+}
+
+impl Rebuild {
+    /// `t` over its tiled windows in `details` (one read of every window).
+    pub fn of(t: &template::Template, details: &[WinInfo], records: &TemplateRecords) -> Self {
+        let wins: Vec<WinInfo> = details.iter().filter(|w| w.workspace == t.workspace).cloned().collect();
+        let record = template::wanted(t, &wins);
+        Rebuild { workspace: t.workspace.clone(), why: template::pending(records.get(&t.workspace), &record), cmds: template::rebuild(t, &wins), record }
+    }
+}
+
+/// Step 3c's record upkeep before any rebuild: V52 (a converge float or tile on an unpinned
+/// template workspace drops its record) and V41's stale records. `s` = after converge. Returns
+/// whether any record went.
+pub fn settle_records(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, converged: &BTreeSet<String>, records: &mut TemplateRecords) -> bool {
+    let dropped = converged.iter().filter(|ws| !pinned.contains(*ws)).fold(false, |acc, ws| records.remove(ws).is_some() | acc);
+    drop_stale(r, s, pinned, &r.applying(s, pinned), records) | dropped
+}
+
+/// Step 3c's decision (V40 a, V42): every applying template whose record differs from what a
+/// rebuild would leave, in template order. Records must be settled first.
+pub fn plan_rebuilds(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, records: &TemplateRecords, details: &[WinInfo]) -> Vec<Rebuild> {
+    let applying = r.applying(s, pinned);
+    r.templates
+        .iter()
+        .map(|d| &d.template)
+        .filter(|t| applying.contains(&t.workspace))
+        .map(|t| Rebuild::of(t, details, records))
+        .filter(|b| b.why.is_some())
+        .collect()
+}
+
+/// V41: runs `b` so that only a completed rebuild leaves a record. A failed command is an
+/// error, and like an abort it leaves no record.
+pub fn run_rebuild(
     aero: &mut dyn Aero,
-    t: &template::Template,
-    details: &[WinInfo],
+    b: Rebuild,
     records: &mut TemplateRecords,
     save: &mut dyn FnMut(&TemplateRecords),
     abort: &AtomicBool,
-    force: bool,
     executed: &mut Vec<Executed>,
 ) -> Result<Rebuilt> {
-    let wins: Vec<WinInfo> = details.iter().filter(|w| w.workspace == t.workspace).cloned().collect();
-    let want = template::wanted(t, &wins);
-    if !force && template::pending(records.get(&t.workspace), &want).is_none() {
-        return Ok(Rebuilt::Nothing);
-    }
-    let cmds = template::rebuild(t, &wins);
-    let done = template::execute(records, &t.workspace, want, &cmds, save, |cmd| {
+    let done = template::execute(records, &b.workspace, b.record, &b.cmds, save, |cmd| {
         if abort.load(Ordering::SeqCst) {
             return Ok(false);
         }
@@ -230,7 +286,7 @@ pub fn rebuild_template(
         executed.push(Executed { cmd: cmd.to_string(), error: None, ms });
         Ok(true)
     })?;
-    Ok(match (done, cmds.is_empty()) {
+    Ok(match (done, b.cmds.is_empty()) {
         (false, _) => Rebuilt::Aborted,
         (true, true) => Rebuilt::Nothing,
         (true, false) => Rebuilt::Built,
@@ -309,21 +365,19 @@ pub fn run_pass(
 
     // 3c. TEMPLATE REBUILD (V40 a, V41, V42): after converge, so the tiled set is final.
     if let Some(m) = mem.as_mut() {
-        let applying = r.applying(&s_layout, pinned);
-        // V52: a converge float or tile on a template workspace drops its record.
-        let converged = changed_tiling.iter().filter(|ws| !pinned.contains(*ws)).fold(false, |acc, ws| m.templates.remove(ws).is_some() | acc);
-        if drop_stale(r, &s_layout, pinned, &applying, m.templates) | converged {
+        if settle_records(r, &s_layout, pinned, &changed_tiling, m.templates) {
             (m.save)(m.templates);
         }
-        if !applying.is_empty() {
+        if !r.applying(&s_layout, pinned).is_empty() {
             let details = aero.window_details()?;
-            for t in r.templates.iter().map(|d| &d.template).filter(|t| applying.contains(&t.workspace)) {
-                match rebuild_template(aero, t, &details, m.templates, m.save, abort, false, &mut rep.executed)? {
+            for b in plan_rebuilds(r, &s_layout, pinned, m.templates, &details) {
+                let ws = b.workspace.clone();
+                match run_rebuild(aero, b, m.templates, m.save, abort, &mut rep.executed)? {
                     Rebuilt::Aborted => {
                         rep.aborted = true;
                         return Ok(rep);
                     }
-                    Rebuilt::Built => rep.rebuilt.push(t.workspace.clone()),
+                    Rebuilt::Built => rep.rebuilt.push(ws),
                     Rebuilt::Nothing => {}
                 }
             }
@@ -580,7 +634,7 @@ mod tests {
         let mut f = docked();
         let ds = desk3();
         let r = resolve(&cfg(), &ds, None);
-        let predicted = dry_run(&r, &f.windows().unwrap(), &ds, &BTreeSet::new(), &[]);
+        let (predicted, _) = dry_run(&r, &f.windows().unwrap(), &ds, &BTreeSet::new(), &[], &TemplateRecords::new(), &[]);
         pass(&mut f, &[]);
         assert_eq!(predicted, f.log);
     }
@@ -995,5 +1049,27 @@ tree = [{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]
         fn subscribe(&mut self, sink: crate::aero::Sink) -> Result<crate::aero::Subscription> {
             self.0.subscribe(sink)
         }
+    }
+
+    #[test]
+    fn dry_run_predicts_the_rebuild_after_the_converge() {
+        // C's rule floats Messenger first; the rebuild then sees LINE and IGCL only (V44, V45).
+        let cfg = tpl_cfg("\n[[exclusive-tiling]]\nworkspaces = [\"C\"]\ntiling-allowlist = [{ app = \"line\" }, { app = \"igcl\" }]\n");
+        let mut f = tpl_fake(2);
+        let ds = desk3();
+        let r = resolve(&cfg, &ds, None);
+        let details = f.window_details().unwrap();
+        let plans: Vec<Plan> =
+            tiling::plan_converge(&r.exclusive_tiling, &TilingMemory::default(), &details).into_iter().filter(|p| tiling::runnable(p, true)).collect();
+        let mut disk = Disk::default();
+        let (predicted, rebuilds) = dry_run(&r, &f.windows().unwrap(), &ds, &BTreeSet::new(), &plans, &disk.records, &details);
+        assert_eq!(rebuilds.len(), 1);
+        assert_eq!(rebuilds[0].why, Some(template::Pending::FirstRun));
+        assert_eq!(rebuilds[0].record.slots["2.2"], Vec::<u32>::new(), "Messenger floats before the rebuild");
+        ok_pass(&mut f, &cfg, &mut disk, &[]);
+        assert_eq!(predicted, f.log);
+        assert_eq!(disk.records["C"], rebuilds[0].record);
+        let (cmds, rebuilds) = dry_run(&r, &f.windows().unwrap(), &ds, &BTreeSet::new(), &[], &disk.records, &f.window_details().unwrap());
+        assert!(cmds.is_empty() && rebuilds.is_empty(), "steady state: {cmds:?}");
     }
 }

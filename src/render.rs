@@ -38,6 +38,25 @@ pub struct StatusView {
     pub observe: bool,
     /// `None` when no exclusive-tiling rule is configured.
     pub exclusive_tiling: Option<TilingStatus>,
+    /// `None` when no workspace template is configured.
+    pub workspace_template: Option<TemplateStatus>,
+}
+
+/// `status`'s workspace-template line, from memory (no window read).
+#[derive(Debug, Clone, Serialize)]
+pub struct TemplateStatus {
+    /// `live` | `inert`: whether arrivals rebuild (C24).
+    pub state: String,
+    /// Workspaces whose last rebuild completed (they hold a record).
+    pub applied: Vec<String>,
+}
+
+impl TemplateStatus {
+    /// `workspace template: live; C applied`.
+    pub fn line(&self) -> String {
+        let applied = if self.applied.is_empty() { "none".to_string() } else { self.applied.join(" ") };
+        format!("workspace template: {}; {applied} applied", self.state)
+    }
 }
 
 /// `status`'s exclusive-tiling line, from memory (no window read).
@@ -219,10 +238,67 @@ pub fn exclusive_tiling(views: &[WsView], state: Option<&str>) -> String {
     o
 }
 
+/// `explain`'s workspace-template section (I.tpl.cli.explain). `state` = `inert: <why>` or
+/// `observe`, carried in the header.
+pub fn workspace_template(views: &[crate::template::View], state: Option<&str>) -> String {
+    use crate::template::Win;
+    const APP_W: usize = 28;
+    if views.is_empty() {
+        return String::new();
+    }
+    let mut o = String::from("workspace-template:");
+    if let Some(st) = state {
+        let _ = write!(o, " ({st})");
+    }
+    o.push('\n');
+    let win = |w: &Win| format!("{} {}", w.id, w.app_name).trim_end().to_string();
+    for v in views {
+        let when = v.when.as_ref().map_or(String::new(), |w| format!("   when {w}"));
+        let on = match &v.monitor {
+            Some(m) => format!("on {m}: {}", if v.applies { "applies" } else { "not applied" }),
+            None => "not on a monitor".into(),
+        };
+        let _ = writeln!(o, "  {:<4} {}   [{}]   {on}", v.workspace, format!("root {}{when}", v.root), v.source);
+        let _ = writeln!(o, "       record: {}", v.record);
+        o.push_str("       tree:\n");
+        let label = |r: &crate::template::Row| {
+            let text = if r.label.chars().count() > APP_W { format!("{}…", r.label.chars().take(APP_W - 1).collect::<String>()) } else { r.label.clone() };
+            format!("{}{} {text}", "  ".repeat(r.depth), r.path)
+        };
+        let col = v.tree.iter().filter(|r| r.slot).map(|r| label(r).chars().count()).max().unwrap_or(0);
+        for r in &v.tree {
+            let l = label(r);
+            if !r.slot {
+                let _ = writeln!(o, "         {l}");
+                continue;
+            }
+            let pad = col - l.chars().count();
+            match r.windows.split_first() {
+                None => {
+                    let _ = writeln!(o, "         {l}{:pad$}  (no window)", "");
+                }
+                Some((first, more)) => {
+                    let _ = writeln!(o, "         {l}{:pad$}  {}", "", win(first));
+                    for w in more {
+                        let _ = writeln!(o, "         {:col$}  {}", "", win(w));
+                    }
+                }
+            }
+        }
+        if v.rest.is_empty() {
+            o.push_str("       rest: none\n");
+        } else {
+            let rest: Vec<String> = v.rest.iter().map(win).collect();
+            let _ = writeln!(o, "       rest: {}", rest.join(", "));
+        }
+    }
+    o
+}
+
 /// Placement table first — cutover step 2 compares it with `aerospace-auto-secondary.sh
-/// --detect` — then the pending exclusive-tiling converges with their reasons, then the exact
-/// commands a pass would issue. `converge` = (workspace, reason).
-pub fn dry_run(r: &Resolved, cmds: &[Cmd], converge: &[(String, String)]) -> String {
+/// --detect` — then the pending exclusive-tiling converges and template rebuilds with their
+/// reasons, then the exact commands a pass would issue. `converge`, `rebuild` = (workspace, reason).
+pub fn dry_run(r: &Resolved, cmds: &[Cmd], converge: &[(String, String)], rebuild: &[(String, String)]) -> String {
     let name = |id: u32| r.layout.iter().find(|l| l.monitor == id).map_or(String::new(), |l| l.monitor_name.clone());
     let mut o = String::from("placement (compare with aerospace-auto-secondary.sh --detect):\n");
     for p in &r.placement {
@@ -238,6 +314,12 @@ pub fn dry_run(r: &Resolved, cmds: &[Cmd], converge: &[(String, String)]) -> Str
     if !converge.is_empty() {
         o.push_str("exclusive-tiling converge:\n");
         for (ws, why) in converge {
+            let _ = writeln!(o, "  {ws:<4} {why}");
+        }
+    }
+    if !rebuild.is_empty() {
+        o.push_str("workspace-template rebuild:\n");
+        for (ws, why) in rebuild {
             let _ = writeln!(o, "  {ws:<4} {why}");
         }
     }
@@ -281,6 +363,9 @@ pub fn status(v: &StatusView) -> String {
     if let Some(t) = &v.exclusive_tiling {
         let _ = writeln!(o, "{}", t.line());
     }
+    if let Some(t) = &v.workspace_template {
+        let _ = writeln!(o, "{}", t.line());
+    }
     if v.pins.is_empty() {
         o.push_str("pins: none\n");
     } else {
@@ -307,6 +392,7 @@ mod tests {
     use crate::config::parse;
     use crate::rules::resolve;
     use crate::testutil::desk3;
+    use std::collections::BTreeSet;
 
     fn resolved() -> Resolved {
         let cfg = parse(include_str!("../aerospace-responsive.example.toml")).unwrap().config;
@@ -348,7 +434,7 @@ mod tests {
     #[test]
     fn dry_run_lists_placement_then_commands() {
         let r = resolved();
-        let text = dry_run(&r, &[], &[]);
+        let text = dry_run(&r, &[], &[], &[]);
         assert!(text.contains("1    monitor 1  LEN T23i-10 (2)"));
         assert!(text.contains("(none — already reconciled)"));
         assert!(!text.contains("exclusive-tiling"), "no block without a pending converge");
@@ -357,7 +443,7 @@ mod tests {
     #[test]
     fn dry_run_puts_the_converge_block_before_the_commands() {
         let cmds = [Cmd::Float { id: 5230 }, Cmd::Tile { id: 4380 }];
-        let text = dry_run(&resolved(), &cmds, &[("T".into(), "rule changed: tiling-allowlist (profile desk3 #1)".into())]);
+        let text = dry_run(&resolved(), &cmds, &[("T".into(), "rule changed: tiling-allowlist (profile desk3 #1)".into())], &[]);
         let block = text.find("exclusive-tiling converge:\n  T    rule changed: tiling-allowlist (profile desk3 #1)\n").expect(&text);
         let commands = text.find("commands:\n  aerospace layout floating --window-id 5230\n  aerospace layout tiling --window-id 4380").expect(&text);
         assert!(text.find("placement").unwrap() < block && block < commands);
@@ -424,13 +510,92 @@ exclusive-tiling:
             aerospace_running: true,
             observe: false,
             exclusive_tiling: None,
+            workspace_template: None,
         };
         let text = status(&v);
         assert!(text.contains("[pass] state still differs"));
         assert!(text.contains("pins: none"));
         assert!(!text.contains("exclusive tiling"), "omitted when no rule is configured");
         let t = TilingStatus { state: "live".into(), inert: None, rule_floated: BTreeMap::from([("T".to_string(), 2)]) };
-        let text = status(&StatusView { exclusive_tiling: Some(t), ..v });
+        let text = status(&StatusView { exclusive_tiling: Some(t), ..v.clone() });
         assert!(text.contains("exclusive tiling: live; rule-floated T:2\n"), "{text}");
+        assert!(!text.contains("workspace template"), "omitted when no template is configured");
+        let t = TemplateStatus { state: "inert".into(), applied: vec![] };
+        assert!(status(&StatusView { workspace_template: Some(t), ..v.clone() }).contains("workspace template: inert; none applied\n"));
+        let t = TemplateStatus { state: "live".into(), applied: vec!["C".into(), "D".into()] };
+        assert!(status(&StatusView { workspace_template: Some(t), ..v }).contains("workspace template: live; C D applied\n"));
+    }
+
+    #[test]
+    fn dry_run_puts_the_rebuild_block_after_the_converge_block() {
+        let text = dry_run(&resolved(), &[Cmd::Flatten { ws: "C".into() }], &[("T".into(), "first run".into())], &[("C".into(), "first run".into())]);
+        let converge = text.find("exclusive-tiling converge:\n").expect(&text);
+        let rebuild = text.find("workspace-template rebuild:\n  C    first run\n").expect(&text);
+        let commands = text.find("commands:\n  aerospace flatten-workspace-tree --workspace C").expect(&text);
+        assert!(converge < rebuild && rebuild < commands, "{text}");
+    }
+
+    #[test]
+    fn workspace_template_section_matches_the_mockup() {
+        use crate::state::TemplateRecords;
+        use crate::world::WinInfo;
+        let cfg = parse(
+            "[[workspace-template]]\nworkspaces = [\"C\"]\nwhen = { builtin = true }\nroot = \"h\"\n\
+             tree = [{ app = \"jp.naver.line.mac\" }, [{ app = \"com.igcl.app\" }, \
+             { app = \"com.google.Chrome.app.bbdeiblfgdokhlblpgeaokenkfknecgl\" }, { app = \"x\", title = \"Inbox\" }]]\n",
+        )
+        .unwrap()
+        .config;
+        let ds = desk3();
+        let r = resolve(&cfg, &ds, None);
+        let w = |id, app: &str, name: &str, layout: &str| WinInfo {
+            id,
+            workspace: "C".into(),
+            app: app.into(),
+            app_name: name.into(),
+            title: String::new(),
+            layout: layout.into(),
+        };
+        let wins = [
+            w(44, "jp.naver.line.mac", "LINE", "h_tiles"),
+            w(10, "com.igcl.app", "IGCL", "v_tiles"),
+            w(49, "com.google.Chrome.app.bbdeiblfgdokhlblpgeaokenkfknecgl", "Messenger", "v_tiles"),
+            w(50, "com.google.Chrome.app.bbdeiblfgdokhlblpgeaokenkfknecgl", "Messenger", "v_tiles"),
+            w(12, "com.apple.finder", "Finder", "h_tiles"),
+            w(13, "com.apple.Preview", "Preview", "floating"),
+        ];
+        let mut records = TemplateRecords::new();
+        let t = &r.templates[0].template;
+        records.insert("C".into(), crate::template::wanted(t, &wins));
+        let on = |m: u32| BTreeMap::from([("C".to_string(), m)]);
+        let none = BTreeSet::new();
+        let text = workspace_template(&crate::template::view(&r.templates, &records, &none, &on(2), &ds, &wins), None);
+        let want = "\
+workspace-template:
+  C    root h   when builtin   [top-level #1]   on Built-in Retina Display: applies
+       record: up to date
+       tree:
+         1 jp.naver.line.mac                 44 LINE
+         2 v
+           2.1 com.igcl.app                  10 IGCL
+           2.2 com.google.Chrome.app.bbdei…  49 Messenger
+                                             50 Messenger
+           2.3 x title~\"Inbox\"               (no window)
+       rest: 12 Finder
+";
+        assert_eq!(text, want, "\n{text}");
+        // Off its monitor, pinned, or after an edit: the record line says which.
+        let views = |m, pinned: &BTreeSet<String>, recs: &TemplateRecords| crate::template::view(&r.templates, recs, pinned, &on(m), &ds, &wins);
+        let off = workspace_template(&views(3, &none, &records), Some("inert: aerospace subscribe exited 2"));
+        assert!(off.starts_with("workspace-template: (inert: aerospace subscribe exited 2)\n"), "{off}");
+        assert!(off.contains("on LEN T23i-10 (1): not applied\n       record: not applied: when does not match LEN T23i-10 (1)\n"), "{off}");
+        let pinned = BTreeSet::from(["C".to_string()]);
+        assert_eq!(views(2, &pinned, &records)[0].record, "not applied: pinned");
+        assert_eq!(views(2, &none, &TemplateRecords::new())[0].record, "pending: first run");
+        let mut stale = records.clone();
+        stale.get_mut("C").unwrap().rest.clear();
+        assert_eq!(views(2, &none, &stale)[0].record, "pending: windows changed");
+        stale.get_mut("C").unwrap().fingerprint.push('!');
+        assert_eq!(views(2, &none, &stale)[0].record, "pending: template changed");
     }
 }

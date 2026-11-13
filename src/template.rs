@@ -6,6 +6,7 @@ use crate::config::{Axis, Config, Kind, Node, Pred, Profile, TemplateBlock};
 use crate::state::{TemplateRecord, TemplateRecords};
 use crate::world::WinInfo;
 use anyhow::Result;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -236,13 +237,20 @@ pub enum Pending {
     WindowsChanged,
 }
 
+impl Pending {
+    /// The dry-run block's reason: `first run`, `template changed`, `windows changed`.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Pending::FirstRun => "first run",
+            Pending::TemplateChanged => "template changed",
+            Pending::WindowsChanged => "windows changed",
+        }
+    }
+}
+
 impl fmt::Display for Pending {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Pending::FirstRun => "pending: first run",
-            Pending::TemplateChanged => "pending: template changed",
-            Pending::WindowsChanged => "pending: windows changed",
-        })
+        write!(f, "pending: {}", self.reason())
     }
 }
 
@@ -312,6 +320,126 @@ pub fn forget(records: &mut TemplateRecords, id: u32) -> bool {
         }
     }
     changed
+}
+
+/// `explain`'s view of one workspace's template (I.tpl.cli.explain). Plain strings, so it
+/// serializes as is for `--json`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct View {
+    pub workspace: String,
+    pub root: &'static str,
+    /// The `when` predicate in words (`builtin`), `None` when absent.
+    pub when: Option<String>,
+    pub source: String,
+    /// The monitor the workspace is on now, `None` when AeroSpace lists no such workspace.
+    pub monitor: Option<String>,
+    pub applies: bool,
+    /// `up to date` | `pending: <reason>` | `not applied: when does not match <monitor>` |
+    /// `not applied: pinned`.
+    pub record: String,
+    pub tree: Vec<Row>,
+    pub rest: Vec<Win>,
+}
+
+/// One node of the template tree: a container (`label` = its axis) or a slot (`label` = its app,
+/// plus the title pattern) with the windows assigned to it now.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Row {
+    /// `1`, `2`, `2.1`: the record's slot paths.
+    pub path: String,
+    pub depth: usize,
+    pub slot: bool,
+    pub label: String,
+    pub windows: Vec<Win>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Win {
+    pub id: u32,
+    pub app_name: String,
+}
+
+/// Every effective template against where its workspace is now. `monitor_of` = each
+/// workspace's monitor id (AeroSpace's workspace rows, so an empty workspace has one too).
+pub fn view(
+    decisions: &[crate::rules::TemplateDecision],
+    records: &TemplateRecords,
+    pinned: &std::collections::BTreeSet<String>,
+    monitor_of: &BTreeMap<String, u32>,
+    displays: &[crate::display::Display],
+    details: &[WinInfo],
+) -> Vec<View> {
+    fn rows(nodes: &[Node], axis: Axis, prefix: &str, depth: usize, slots: &mut std::slice::Iter<'_, Vec<u32>>, win: &dyn Fn(u32) -> Win, out: &mut Vec<Row>) {
+        for (i, n) in nodes.iter().enumerate() {
+            let path = if prefix.is_empty() { (i + 1).to_string() } else { format!("{prefix}.{}", i + 1) };
+            match n {
+                Node::Slot(s) => {
+                    let label = s.title.as_ref().map_or(s.app.clone(), |t| format!("{} title~{:?}", s.app, t.as_str()));
+                    let windows = slots.next().map_or(vec![], |ids| ids.iter().map(|&id| win(id)).collect());
+                    out.push(Row { path, depth, slot: true, label, windows });
+                }
+                Node::Container(c) => {
+                    let sub = axis.opposite();
+                    out.push(Row { path: path.clone(), depth, slot: false, label: axis_word(sub).into(), windows: vec![] });
+                    rows(c, sub, &path, depth + 1, slots, win, out);
+                }
+            }
+        }
+    }
+    decisions
+        .iter()
+        .map(|d| {
+            let t = &d.template;
+            let wins: Vec<WinInfo> = details.iter().filter(|w| w.workspace == t.workspace).cloned().collect();
+            let win = |id: u32| Win { id, app_name: wins.iter().find(|w| w.id == id).map_or(String::new(), |w| w.app_name.clone()) };
+            let want = wanted(t, &wins);
+            let at = monitor_of.get(&t.workspace).copied();
+            let name = at.map(|m| displays.iter().find(|x| x.aero_id == m).map_or(format!("monitor {m}"), |x| x.aero_name.clone()));
+            let when_ok = at.is_some_and(|m| d.monitors.contains(&m));
+            let record = if !when_ok {
+                format!("not applied: when does not match {}", name.as_deref().unwrap_or("(no monitor)"))
+            } else if pinned.contains(&t.workspace) {
+                "not applied: pinned".into()
+            } else {
+                pending(records.get(&t.workspace), &want).map_or("up to date".into(), |p| p.to_string())
+            };
+            let mut tree = vec![];
+            let a = assign(&t.tree, &wins); // depth-first, unlike the record's path-keyed map
+            rows(&t.tree, t.root, "", 0, &mut a.slots.iter(), &win, &mut tree);
+            View {
+                workspace: t.workspace.clone(),
+                root: axis_word(t.root),
+                when: t.when.as_ref().map(pred_words),
+                source: t.source.clone(),
+                monitor: name,
+                applies: when_ok && !pinned.contains(&t.workspace),
+                record,
+                tree,
+                rest: a.rest.iter().map(|&id| win(id)).collect(),
+            }
+        })
+        .collect()
+}
+
+fn axis_word(a: Axis) -> &'static str {
+    match a {
+        Axis::H => "h",
+        Axis::V => "v",
+    }
+}
+
+/// `{ builtin = true, portrait = false }` → `builtin !portrait`; other values as `key value`.
+fn pred_words(p: &Pred) -> String {
+    let Ok(serde_json::Value::Object(m)) = serde_json::to_value(p) else { return String::new() };
+    let words: Vec<String> = m
+        .iter()
+        .map(|(k, v)| match v {
+            serde_json::Value::Bool(true) => k.clone(),
+            serde_json::Value::Bool(false) => format!("!{k}"),
+            v => format!("{k} {v}"),
+        })
+        .collect();
+    words.join(" ")
 }
 
 impl Tree {
