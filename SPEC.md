@@ -439,7 +439,7 @@ T36|x|pass: rebuild step, `plan_layout` + `diff` skip, verify-only skip, `when` 
 T37|x|worker: judge all queued window events then rebuild once; close prunes record; daemon float/tile drops record; worker tests (burst of arrivals, arrival then rule-float, event during rebuild)|V40,V45,V47,V52
 T38|x|worker lifecycle: subscribe child gated on rule OR template; template-only config test; resync record check; `AeroSocket(true)` drops records; `unpin` drops record + arms pass; inert warning|V46,V51,V53,C24
 T39|x|surfaces: `arrange` command + ipc, explain section, dry-run block, status line, `--json`; observe keeps disk records through pin / gap saves; render tests|I.tpl.cli.arrange,I.tpl.cli.explain,I.tpl.cli.dryrun,I.tpl.cli.status,V49
-T40|.|docs: README section + commented example block guarded by parse test; `CONTEXT.md` terms|I.tpl.docs,V50
+T40|x|docs: README section + commented example block guarded by parse test; `CONTEXT.md` terms|I.tpl.docs,V50
 T41|.|acceptance at the desk: `C` template on built-in; LINE / IGCL / Messenger quit + reopen; dock to DELL (flatten rule wins) and back; AeroSpace restart rebuilds; pin keeps a hand-made tree, unpin rebuilds; `cargo test` + clippy green; then live deploy|T31-T40
 
 ## §B bugs

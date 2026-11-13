@@ -672,22 +672,47 @@ mod tests {
 
     #[test]
     fn the_commented_example_block_parses_when_uncommented() {
-        let start = EXAMPLE.find("# [[exclusive-tiling]]").expect("example has the block");
-        let block: String = EXAMPLE[start..].lines().map(|l| format!("{}\n", l.strip_prefix("# ").unwrap_or(l))).collect();
-        let l = parse(&block).unwrap();
+        let l = parse(&uncomment("# [[exclusive-tiling]]")).unwrap();
         let r = crate::tiling::effective(&l.config, None);
         assert_eq!((r.len(), r[0].workspace.as_str(), r[0].tiling_allowlist.len()), (1, "T", 2));
     }
 
+    /// The example's commented block that starts at `marker`, up to its first non-comment line.
+    fn uncomment(marker: &str) -> String {
+        let start = EXAMPLE.find(marker).expect("example has the block");
+        EXAMPLE[start..]
+            .lines()
+            .take_while(|l| l.starts_with('#'))
+            .map(|l| format!("{}\n", l.strip_prefix("# ").unwrap_or(l)))
+            .collect()
+    }
+
+    /// `h[ line, v[ igcl, messenger ] ]` with `when = { builtin = true }` on `C`.
+    fn assert_the_c_template(cfg: &Config) {
+        let t = crate::template::effective(cfg, None);
+        assert_eq!((t.len(), t[0].workspace.as_str(), t[0].root), (1, "C", Axis::H));
+        assert_eq!(t[0].when.as_ref().and_then(|w| w.builtin), Some(true));
+        let [Node::Slot(line), Node::Container(v)] = t[0].tree.as_slice() else { panic!("{:?}", t[0].tree) };
+        assert_eq!(line.app, "jp.naver.line.mac");
+        assert!(matches!(v.as_slice(), [Node::Slot(a), Node::Slot(b)] if a.app == "com.igcl.app" && b.app.starts_with("com.google.Chrome.app.")));
+    }
+
+    #[test]
+    fn the_commented_workspace_template_block_parses_when_uncommented() {
+        assert_the_c_template(&parse(&uncomment("# [[workspace-template]]")).unwrap().config);
+    }
+
+    #[test]
+    fn the_readme_workspace_template_example_parses() {
+        let readme = include_str!("../README.md");
+        let section = &readme[readme.find("### Workspace template").expect("README section")..];
+        let block = section.split("```toml\n").nth(1).and_then(|b| b.split("```").next()).expect("toml block");
+        assert_the_c_template(&parse(block).unwrap().config);
+    }
+
     #[test]
     fn the_commented_gaps_block_parses_when_uncommented() {
-        let start = EXAMPLE.find("# [gaps]").expect("example has the block");
-        let block: String = EXAMPLE[start..]
-            .lines()
-            .take_while(|l| l.starts_with("# ") || l.starts_with('#'))
-            .map(|l| format!("{}\n", l.strip_prefix("# ").unwrap_or(l)))
-            .collect();
-        let l = parse(&block).unwrap();
+        let l = parse(&uncomment("# [gaps]")).unwrap();
         assert!(l.config.owns_gaps());
         let g = l.config.gaps.unwrap();
         assert_eq!((g.top_default, g.notch_compensation, g.top.len()), (1, true, 1));
