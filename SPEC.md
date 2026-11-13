@@ -425,7 +425,7 @@ T31 gates T34. T33 needs nothing live and may run beside T31.
 id|status|task|cites
 -|-|-|-
 T31|x|spike, live, scratch ws `X` (TextEdit windows, style T15): prove a recipe builds `h[A, v[B, C]]`, `v[A, h[B, C, D]]`, a 3-level tree and a 6-window tree, from any start order and any most-recent window, with `X` focused and with `X` hidden, under both normalization settings; ordering by push-to-edge moves (`--boundaries-action stop`); focus unchanged; count commands, wall time, visible flicker; record in `.scratch/workspace-template/`. Fails → amend C19 (fork command)|C19,C20,V43,V54
-T32|.|config: `[[workspace-template]]` + profile variant, untagged `tree` parse, last-block-wins resolve w/ source, load errors incl. unknown key in slot|V48,I.tpl.cfg
+T32|x|config: `[[workspace-template]]` + profile variant, untagged `tree` parse, last-block-wins resolve w/ source, load errors incl. unknown key in slot|V48,I.tpl.cfg
 T33|.|core: pure assignment + canonical shape fns + tests (first slot wins, title, many windows in a slot, rest, empty container, one-child collapse, same-axis merge, root promotion, single window)|V38,V39
 T34|.|core: pure rebuild plan `-> Vec<Cmd>` per T31 recipe; `Cmd::MoveWindow`, `Cmd::JoinWith`; `FakeAero` gains a tree model that applies them with fork semantics (swap, enter container at most-recent child, join = opposite axis) + tests: canonical tree reached from every start order and most-recent choice, twice = same|V43,V54,I.tpl.aero
 T35|.|state: per-slot-path record in `state.json`, serde default; wanted-record compare; remove-before-rebuild, save-after-success|V41,I.tpl.state

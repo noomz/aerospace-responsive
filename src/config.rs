@@ -23,6 +23,8 @@ pub struct Config {
     pub profile: Vec<Profile>,
     #[serde(default, rename = "exclusive-tiling")]
     pub exclusive_tiling: Vec<TilingBlock>,
+    #[serde(default, rename = "workspace-template")]
+    pub workspace_template: Vec<TemplateBlock>,
     /// The top gap this tool owns. Absent = it never touches `outer.top`; present = every
     /// pass makes AeroSpace's value match what the rules and the measured notches say.
     #[serde(default)]
@@ -211,6 +213,52 @@ pub struct Profile {
     pub placement: Vec<PlacementRule>,
     #[serde(default, rename = "exclusive-tiling")]
     pub exclusive_tiling: Vec<TilingBlock>,
+    #[serde(default, rename = "workspace-template")]
+    pub workspace_template: Vec<TemplateBlock>,
+}
+
+/// One `[[workspace-template]]` block. Per workspace the last block wins whole (V48); see
+/// `template::effective`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct TemplateBlock {
+    pub workspaces: Vec<String>,
+    /// Absent = every monitor.
+    #[serde(default)]
+    pub when: Option<Pred>,
+    pub root: Axis,
+    pub tree: Vec<Node>,
+}
+
+/// A tree item: a table is a slot, an array is a container of the opposite orientation (C22).
+/// Dispatched on shape, not `untagged`, so a bad slot reports its own error and a positional
+/// array never parses as a slot.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(try_from = "toml::Value")]
+pub enum Node {
+    Slot(Slot),
+    Container(Vec<Node>),
+}
+
+impl TryFrom<toml::Value> for Node {
+    type Error = String;
+    fn try_from(v: toml::Value) -> Result<Self, String> {
+        match v {
+            toml::Value::Table(t) => Slot::deserialize(toml::Value::Table(t)).map(Node::Slot).map_err(|e| format!("slot: {}", e.message())),
+            toml::Value::Array(a) if a.is_empty() => Err("empty nested array in `tree`".into()),
+            toml::Value::Array(a) => a.into_iter().map(Node::try_from).collect::<Result<_, _>>().map(Node::Container),
+            other => Err(format!("`tree` item must be a slot table or an array, not {}", other.type_str())),
+        }
+    }
+}
+
+/// One leaf of a template: exact bundle id, optional title regex (same as a tiling entry).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Slot {
+    pub app: String,
+    #[serde(default)]
+    pub title: Option<TitleRegex>,
 }
 
 /// One `[[exclusive-tiling]]` block. Blocks cascade per workspace and per field, last wins
@@ -401,7 +449,27 @@ fn validate(c: &Config) -> Result<()> {
         }
         check_rules(&p.layout, &p.placement, &at)?;
     }
-    validate_tiling(c)
+    validate_tiling(c)?;
+    for (at, b) in template_blocks(c) {
+        let at = format!("[[workspace-template]] {at}");
+        if b.workspaces.is_empty() {
+            bail!("{at}: `workspaces` is empty");
+        }
+        if b.tree.is_empty() {
+            bail!("{at}: `tree` is empty");
+        }
+        if let Some(w) = &b.when {
+            check_per_monitor(w, &format!("{at}: when"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Every `[[workspace-template]]` block with its source name, top-level then each profile's.
+fn template_blocks(c: &Config) -> impl Iterator<Item = (String, &TemplateBlock)> {
+    let top = c.workspace_template.iter().enumerate().map(|(i, b)| (format!("top-level #{}", i + 1), b));
+    let prof = c.profile.iter().flat_map(|p| p.workspace_template.iter().enumerate().map(move |(i, b)| (format!("profile {} #{}", p.name, i + 1), b)));
+    top.chain(prof)
 }
 
 fn validate_tiling(c: &Config) -> Result<()> {
@@ -622,6 +690,77 @@ mod tests {
         assert!(l.config.layout.is_empty() && l.config.placement.is_empty());
         assert_eq!(l.config.settings.debounce.trailing_ms, 1000);
         assert!(l.config.settings.warn_on_no_match);
+    }
+
+    /// The I.tpl.cfg snippet, verbatim: comments, multi-line array, trailing comma, mixed items.
+    const SPEC_TEMPLATE: &str = r#"
+[[workspace-template]]
+workspaces = ["C"]
+when = { builtin = true }       # optional monitor Pred; absent = every monitor; `nth` is a load error
+root = "h"                      # required: "h" | "v"
+tree = [                        # required; item = slot table, or array = container (opposite orientation)
+  { app = "jp.naver.line.mac" },
+  [ { app = "com.igcl.app" },
+    { app = "com.google.Chrome.app.bbdeiblfgdokhlblpgeaokenkfknecgl" } ],
+]
+"#;
+
+    fn slot(app: &str) -> Node {
+        Node::Slot(Slot { app: app.into(), title: None })
+    }
+
+    #[test]
+    fn the_spec_template_snippet_parses() {
+        let c = parse(SPEC_TEMPLATE).unwrap().config;
+        let b = &c.workspace_template[0];
+        assert_eq!((b.workspaces.as_slice(), b.root, b.when.as_ref().and_then(|w| w.builtin)), (&["C".to_string()][..], Axis::H, Some(true)));
+        let nested = Node::Container(vec![slot("com.igcl.app"), slot("com.google.Chrome.app.bbdeiblfgdokhlblpgeaokenkfknecgl")]);
+        assert_eq!(b.tree, vec![slot("jp.naver.line.mac"), nested]);
+    }
+
+    #[test]
+    fn template_profile_variant_title_and_one_item_nesting_parse() {
+        let text = "[[profile]]\nname = \"p\"\nwhen = {}\n[[profile.workspace-template]]\nworkspaces = [\"C\"]\nroot = \"v\"\n\
+            tree = [[{ app = \"a\", title = \"^Inbox\" }]]\n";
+        let c = parse(text).unwrap().config;
+        let b = &c.profile[0].workspace_template[0];
+        assert!(b.when.is_none(), "absent when = every monitor");
+        let Node::Container(inner) = &b.tree[0] else { panic!("{:?}", b.tree) };
+        let Node::Slot(s) = &inner[0] else { panic!("{inner:?}") };
+        assert!(s.title.as_ref().unwrap().is_match("inbox (3)"), "case-insensitive, like a tiling entry");
+    }
+
+    fn template_err(body: &str) -> String {
+        tiling_err(&format!("[[workspace-template]]\n{body}"))
+    }
+
+    #[test]
+    fn workspace_template_load_errors() {
+        let ws = "workspaces = [\"C\"]\n";
+        let tree = "tree = [{ app = \"a\" }]\n";
+        let cases = [
+            (format!("workspaces = []\nroot = \"h\"\n{tree}"), "top-level #1: `workspaces` is empty"),
+            (format!("{ws}{tree}"), "missing field `root`"),
+            (format!("{ws}root = \"x\"\n{tree}"), "unknown variant `x`"),
+            (format!("{ws}root = \"h\"\n"), "missing field `tree`"),
+            (format!("{ws}root = \"h\"\ntree = []\n"), "top-level #1: `tree` is empty"),
+            (format!("{ws}root = \"h\"\ntree = [{{ app = \"a\" }}, []]\n"), "empty nested array"),
+            (format!("{ws}root = \"h\"\ntree = [[{{ app = \"a\" }}, [[]]]]\n"), "empty nested array"),
+            (format!("{ws}root = \"h\"\ntree = [{{ title = \"x\" }}]\n"), "missing field `app`"),
+            (format!("{ws}root = \"h\"\ntree = [{{ app = \"a\", title = \"(\" }}]\n"), "invalid title regex"),
+            (format!("{ws}when = {{ builtin = true, nth = 1 }}\nroot = \"h\"\n{tree}"), "nth is only valid in [[placement]] monitor"),
+            (format!("{ws}when = {{ label = \"nope\" }}\nroot = \"h\"\n{tree}"), "label \"nope\" has no [[monitor]] block"),
+            (format!("{ws}root = \"h\"\n{tree}flatten = true\n"), "unknown field `flatten`"),
+            (format!("{ws}root = \"h\"\ntree = [{{ app = \"a\", max-tiled = 1 }}]\n"), "unknown field `max-tiled`"),
+            (format!("{ws}root = \"h\"\ntree = [\"a\"]\n"), "must be a slot table or an array, not string"),
+            (format!("{ws}root = \"h\"\ntree = [[\"a\", \"b\"]]\n"), "must be a slot table or an array, not string"),
+        ];
+        for (body, want) in cases {
+            let err = template_err(&body);
+            assert!(err.contains(want), "{body}\n=> {err}\nwant {want}");
+        }
+        let prof = tiling_err("[[profile]]\nname = \"p\"\nwhen = {}\n[[profile.workspace-template]]\nworkspaces = [\"C\"]\nroot = \"h\"\ntree = []\n");
+        assert!(prof.contains("[[workspace-template]] profile p #1: `tree` is empty"), "{prof}");
     }
 
     #[test]
