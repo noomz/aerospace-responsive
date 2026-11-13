@@ -285,6 +285,19 @@ pub fn execute(
     Ok(true)
 }
 
+/// V41: a closed window leaves every record it is in; no commands. True when one changed.
+pub fn forget(records: &mut TemplateRecords, id: u32) -> bool {
+    let mut changed = false;
+    for rec in records.values_mut() {
+        for list in rec.slots.values_mut().chain([&mut rec.rest]) {
+            let before = list.len();
+            list.retain(|x| *x != id);
+            changed |= list.len() != before;
+        }
+    }
+    changed
+}
+
 impl Tree {
     /// Window ids, depth-first.
     pub fn leaves(&self) -> Vec<u32> {

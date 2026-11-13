@@ -12,6 +12,7 @@ use crate::render::{self, LastPass, MonitorView, PinView, StatusView, TilingStat
 use crate::restore::{self, RestoreCtx};
 use crate::rules::{self, ProfileMode, Resolved};
 use crate::state::{self, Class, Persisted, Pin, TemplateRecords, TilingMemory, Warnings};
+use crate::template;
 use crate::tiling::{self, Leave, Plan, Rule};
 use crate::world::{self, WinInfo};
 use serde_json::{Value, json};
@@ -118,6 +119,9 @@ pub struct Worker<A: Aero, S: FnMut() -> Vec<Screen>> {
     /// Exclusive tiling's memory as `state.json` had it: observe mode keeps its own changes
     /// in-process and writes this back instead (V15).
     tiling_on_disk: TilingMemory,
+    /// Arrivals (`window-moved`) per workspace since the queue was last drained: a template
+    /// rebuild waits until every queued event is judged (V45, V47).
+    arrivals: std::collections::BTreeMap<String, BTreeSet<u32>>,
 }
 
 fn reply_all(waiters: Vec<Sender<Response>>, r: Response) {
@@ -168,6 +172,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             last_ds: None,
             known: Default::default(),
             tiling_on_disk,
+            arrivals: Default::default(),
         };
         let _ = w.load_config();
         w
@@ -190,6 +195,11 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 // A steady stream of window events must not postpone a due pass or retry.
                 Ok(m) => {
                     self.handle(m);
+                    // V45, V47: judge everything already queued, then rebuild once.
+                    while let Ok(m) = rx.try_recv() {
+                        self.handle(m);
+                    }
+                    self.queue_drained();
                     self.tick(Instant::now());
                 }
                 Err(RecvTimeoutError::Timeout) => self.tick(Instant::now()),
@@ -759,6 +769,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             Leave::Retile => {
                 if self.exec(&Cmd::Tile { id: w.id }, &format!("left for {}", w.workspace)) {
                     self.persisted.exclusive_tiling.remove(w.id);
+                    self.drop_template_record(&w.workspace);
                 }
             }
             Leave::StayFloated(why) => {
@@ -776,7 +787,8 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let (id, workspace, app) = match ev {
             WindowEvent::WindowClosed { id, app, .. } => {
                 self.known.remove(&id);
-                if self.persisted.exclusive_tiling.floated_on(id, &app).is_some() && self.persisted.exclusive_tiling.remove(id) {
+                let floated = self.persisted.exclusive_tiling.floated_on(id, &app).is_some() && self.persisted.exclusive_tiling.remove(id);
+                if template::forget(&mut self.persisted.template_records, id) | floated {
                     self.save_state();
                 }
                 return;
@@ -785,6 +797,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             WindowEvent::WindowDetected {} => unreachable!("handle routes window-detected to a verify"),
         };
         self.known.insert(id, workspace.clone()); // judged below; later arrivals count it
+        self.arrivals.entry(workspace.clone()).or_default().insert(id);
         let left = self.persisted.exclusive_tiling.floated_on(id, &app).is_some_and(|ws| ws != workspace);
         let rules = self.current_rules();
         let rule = rules.iter().find(|r| r.workspace == workspace).cloned();
@@ -823,6 +836,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             Some(tiling::Arrival::Float(why)) => {
                 if self.exec(&Cmd::Float { id }, &format!("arrived on {workspace}: {why}")) {
                     self.persisted.exclusive_tiling.insert(workspace, id, &w.app);
+                    self.drop_template_record(workspace);
                     changed = true;
                 }
             }
@@ -836,6 +850,76 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         }
         if changed {
             self.save_state();
+        }
+    }
+
+    /// V52: a float or tile the daemon sent changed a template workspace's tiled set (an
+    /// arrival verdict, which also catches a late pre-layout answer, or a retile on a leave). Dropping
+    /// its record makes the queue drain or the next pass rebuild. A pinned workspace keeps its
+    /// record (V46). The caller saves.
+    fn drop_template_record(&mut self, ws: &str) {
+        if !self.persisted.pins.iter().any(|p| p.workspace == ws) && self.persisted.template_records.remove(ws).is_some() {
+            crate::log!("workspace template: {ws} record dropped (the daemon changed its tiled windows)");
+        }
+    }
+
+    /// V40 (b), V45, V47: every queued window event is judged; now each workspace an arrival
+    /// landed on rebuilds once, if its template applies and an arrived window is still tiled
+    /// there. One read of the monitors' windows, one of window details. Never debounced.
+    pub fn queue_drained(&mut self) {
+        let arrivals = std::mem::take(&mut self.arrivals);
+        // Before the first gated pass, that pass decides (V40 a).
+        let (false, Some(ds), true) = (arrivals.is_empty(), self.last_ds.clone(), self.aero_up) else { return };
+        let r = rules::resolve(&self.config, &ds, self.persisted.lock.as_deref());
+        if !r.templates.iter().any(|d| arrivals.contains_key(&d.template.workspace)) {
+            return; // no read for a workspace without a template
+        }
+        let (s, details) = match (self.aero.windows(), self.aero.window_details()) {
+            (Ok(s), Ok(d)) => (s, d),
+            (Err(e), _) | (_, Err(e)) => return crate::log!("workspace template: window read failed; the next pass decides: {e:#}"),
+        };
+        let applying = r.applying(&s, &self.persisted.pinned_names());
+        let due = r.templates.iter().map(|d| &d.template).filter(|t| {
+            applying.contains(&t.workspace)
+                && arrivals.get(&t.workspace).is_some_and(|ids| details.iter().any(|w| ids.contains(&w.id) && w.workspace == t.workspace && w.tiled()))
+        });
+        let due: Vec<template::Template> = due.cloned().collect();
+        for t in &due {
+            self.rebuild(t, &details);
+        }
+    }
+
+    /// One forced rebuild outside a pass (V41: the record only after the last command). A
+    /// failure leaves no record, so the next pass rebuilds. Observe logs, records in-process.
+    fn rebuild(&mut self, t: &template::Template, details: &[WinInfo]) {
+        let (observe, base, path) = (self.observe, self.persisted.clone(), self.state_path.clone());
+        let mut save = |recs: &TemplateRecords| {
+            if observe {
+                return;
+            }
+            if let Err(e) = (Persisted { template_records: recs.clone(), ..base.clone() }).save(&path) {
+                crate::log!("cannot save state: {e:#}");
+            }
+        };
+        let mut executed = vec![];
+        let result = if observe {
+            let wins: Vec<WinInfo> = details.iter().filter(|w| w.workspace == t.workspace).cloned().collect();
+            for c in template::rebuild(t, &wins) {
+                crate::log!("workspace template: would run: {c}");
+            }
+            self.persisted.template_records.insert(t.workspace.clone(), template::wanted(t, &wins));
+            Ok(pass::Rebuilt::Built)
+        } else {
+            pass::rebuild_template(&mut self.aero, t, details, &mut self.persisted.template_records, &mut save, &self.abort, true, &mut executed)
+        };
+        for e in &executed {
+            crate::log!("  {}  ({} ms)", e.cmd, e.ms);
+        }
+        match result {
+            Ok(pass::Rebuilt::Built) => crate::log!("workspace template: {} rebuilt (window arrived)", t.workspace),
+            Ok(pass::Rebuilt::Aborted) => crate::log!("workspace template: {} rebuild aborted; the next pass rebuilds", t.workspace),
+            Ok(pass::Rebuilt::Nothing) => {}
+            Err(e) => crate::log!("workspace template: {} rebuild failed; the next pass rebuilds: {e:#}", t.workspace),
         }
     }
 
@@ -1166,6 +1250,7 @@ mod tests {
     use super::*;
     use crate::aero::{Aero, Cmd};
     use crate::config::Axis;
+    use crate::template::Tree;
     use crate::testutil::{FakeAero, desk3};
     use std::sync::mpsc;
 
@@ -1989,5 +2074,176 @@ mod tests {
         assert!(r.text.contains("move-workspace-to-monitor --workspace 1"));
         assert_eq!(ask(&mut w, Request::Explain { config: None }).exit, 0);
         assert!(w.aero.log.is_empty());
+    }
+
+    // ---------- workspace template: window events (T37) ----------
+
+    /// `C` on the built-in: `h[line, v[igcl, msgr]]`.
+    const TPL: &str = "\n[[workspace-template]]\nworkspaces = [\"C\"]\nwhen = { builtin = true }\nroot = \"h\"\ntree = [{ app = \"line\" }, [{ app = \"igcl\" }, { app = \"msgr\" }]]\n";
+
+    /// A worker with LINE 44 and IGCL 10 tiled on `C` (built-in), gated against desk3.
+    fn tpl_worker(extra: &str) -> (TestWorker, tempfile::TempDir) {
+        let mut f = docked();
+        f.add_window("C", 44, "line", "LINE", false);
+        f.add_window("C", 10, "igcl", "IGCL", false);
+        let (mut w, d) = live(f, &format!("{TPL}{extra}"));
+        w.last_ds = Some(desk3());
+        (w, d)
+    }
+
+    fn flattens(log: &[Cmd]) -> usize {
+        log.iter().filter(|c| matches!(c, Cmd::Flatten { ws } if ws == "C")).count()
+    }
+
+    #[test]
+    fn a_burst_of_arrivals_rebuilds_once_after_the_queue_is_judged() {
+        let (mut w, d) = tpl_worker("");
+        for id in [49, 50] {
+            w.aero.add_window("C", id, "msgr", "Messenger", false);
+            w.handle(moved(id, "C", None, "msgr"));
+        }
+        assert!(w.aero.log.is_empty(), "no rebuild before the queue is drained: {:?}", w.aero.log);
+        w.queue_drained();
+        assert_eq!(flattens(&w.aero.log), 1, "{:?}", w.aero.log);
+        assert_eq!(
+            w.aero.tree("C"),
+            Tree::Split(Axis::H, vec![Tree::Win(44), Tree::Split(Axis::V, vec![Tree::Win(10), Tree::Win(49), Tree::Win(50)])])
+        );
+        let rec = &Persisted::load(&d.path().join("state.json")).template_records["C"];
+        assert_eq!(rec.slots["2.2"], [49, 50], "record saved after the last command");
+        assert!(w.pending.is_none(), "V47: never arms a pass");
+        w.aero.log.clear();
+        w.queue_drained();
+        assert!(w.aero.log.is_empty(), "nothing queued, nothing rebuilt");
+    }
+
+    #[test]
+    fn arrivals_elsewhere_or_on_a_pinned_template_workspace_send_nothing() {
+        let (mut w, _d) = tpl_worker("");
+        w.aero.add_window("T", 77, KITTY, "", false);
+        w.handle(moved(77, "T", None, KITTY));
+        w.queue_drained();
+        assert!(w.aero.log.is_empty(), "T has no template: {:?}", w.aero.log);
+        w.persisted.pin(Pin { workspace: "C".into(), cg_id: 0, monitor_name: String::new() });
+        w.aero.add_window("C", 49, "msgr", "Messenger", false);
+        w.handle(moved(49, "C", None, "msgr"));
+        w.queue_drained();
+        assert!(w.aero.log.is_empty(), "V46: pinned: {:?}", w.aero.log);
+    }
+
+    #[test]
+    fn an_arrival_the_rule_floats_triggers_no_rebuild_and_drops_the_record() {
+        let rule = "\n[[exclusive-tiling]]\nworkspaces = [\"C\"]\ntiling-allowlist = [{ app = \"line\", max-tiled = 1 }, { app = \"igcl\", max-tiled = 1 }]\n";
+        let (mut w, d) = tpl_worker(rule);
+        w.handle(moved(44, "C", None, "line"));
+        w.queue_drained();
+        assert!(w.persisted.template_records.contains_key("C"), "first rebuild leaves a record");
+        w.aero.log.clear();
+        w.aero.add_window("C", 49, "msgr", "Messenger", false);
+        w.handle(moved(49, "C", None, "msgr"));
+        w.queue_drained();
+        assert_eq!(w.aero.log, [Cmd::Float { id: 49 }], "floated, then not tiled: no rebuild (V40 b)");
+        assert!(!w.persisted.template_records.contains_key("C"), "V52: the daemon's float drops the record");
+        assert!(!Persisted::load(&d.path().join("state.json")).template_records.contains_key("C"), "and saves");
+    }
+
+    #[test]
+    fn a_closed_window_leaves_the_record_without_commands() {
+        let (mut w, d) = tpl_worker("");
+        w.aero.add_window("C", 49, "msgr", "Messenger", false);
+        w.handle(moved(49, "C", None, "msgr"));
+        w.queue_drained();
+        w.aero.log.clear();
+        w.aero.close_window(49);
+        w.handle(Msg::Window(WindowEvent::WindowClosed { id: 49, workspace: "C".into(), app: "msgr".into() }));
+        w.queue_drained();
+        assert!(w.aero.log.is_empty(), "{:?}", w.aero.log);
+        let rec = &Persisted::load(&d.path().join("state.json")).template_records["C"];
+        assert!(rec.slots["2.2"].is_empty() && rec.slots["1"] == [44], "{rec:?}");
+        // The next pass compares equal: the record follows the close (V41).
+        let wins = w.aero.window_details().unwrap();
+        let t = &rules::resolve(&w.config, &desk3(), None).templates[0].template;
+        assert_eq!(template::pending(Some(rec), &template::wanted(t, &wins.into_iter().filter(|x| x.workspace == "C").collect::<Vec<_>>())), None);
+    }
+
+    #[test]
+    fn a_retile_on_leave_drops_the_record_and_the_arrival_rebuilds() {
+        let (mut w, _d) = tpl_worker(RULE);
+        w.handle(moved(44, "C", None, "line"));
+        w.queue_drained();
+        assert!(w.persisted.template_records.contains_key("C"));
+        // Kitty 77 was floated by T's rule; the user moves it to C, where no rule holds it.
+        w.aero.add_window("T", 77, KITTY, "", true);
+        w.persisted.exclusive_tiling.insert("T", 77, KITTY);
+        w.aero.move_window(77, "C");
+        w.aero.log.clear();
+        w.handle(moved(77, "C", Some("T"), KITTY));
+        assert_eq!(w.aero.log, [Cmd::Tile { id: 77 }]);
+        assert!(!w.persisted.template_records.contains_key("C"), "V52: the daemon's tile drops the record");
+        w.queue_drained();
+        assert_eq!(flattens(&w.aero.log), 1, "now tiled on C: the arrival rebuilds");
+        assert_eq!(w.persisted.template_records["C"].rest, [77]);
+    }
+
+    /// Sends `inject` into the worker's inbox when the first `C` flatten runs: events that
+    /// arrive during a rebuild.
+    struct Inject {
+        f: FakeAero,
+        inject: Option<(Sender<Msg>, Vec<Msg>)>,
+        log: std::sync::Arc<std::sync::Mutex<Vec<Cmd>>>,
+    }
+
+    impl Aero for Inject {
+        fn monitors(&mut self) -> anyhow::Result<Vec<crate::world::AeroMonitor>> {
+            self.f.monitors()
+        }
+        fn windows(&mut self) -> anyhow::Result<crate::world::Snapshot> {
+            self.f.windows()
+        }
+        fn workspaces(&mut self) -> anyhow::Result<Vec<crate::world::WorkspaceRow>> {
+            self.f.workspaces()
+        }
+        fn window_details(&mut self) -> anyhow::Result<Vec<WinInfo>> {
+            self.f.window_details()
+        }
+        fn run(&mut self, cmd: &Cmd) -> Result<(), String> {
+            self.log.lock().unwrap().push(cmd.clone());
+            if matches!(cmd, Cmd::Flatten { ws } if ws == "C")
+                && let Some((tx, msgs)) = self.inject.take()
+            {
+                for id in [50, 51] {
+                    self.f.add_window("C", id, "msgr", "Messenger", false);
+                }
+                for m in msgs {
+                    tx.send(m).unwrap();
+                }
+            }
+            self.f.run(cmd)
+        }
+        fn subscribe(&mut self, sink: crate::aero::Sink) -> anyhow::Result<crate::aero::Subscription> {
+            self.f.subscribe(sink)
+        }
+    }
+
+    #[test]
+    fn events_during_a_rebuild_are_judged_together_and_rebuild_once_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg.toml");
+        std::fs::write(&cfg, format!("{EXAMPLE}{TPL}")).unwrap();
+        let mut f = docked();
+        f.add_window("C", 44, "line", "LINE", false);
+        f.add_window("C", 10, "igcl", "IGCL", false);
+        f.add_window("C", 49, "msgr", "Messenger", false);
+        let (tx, rx) = mpsc::channel();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let inject = Inject { f, inject: Some((tx.clone(), vec![moved(50, "C", None, "msgr"), moved(51, "C", None, "msgr")])), log: log.clone() };
+        let mut w = Worker::new(inject, all_screens(), cfg, dir.path().join("state.json"), true, false);
+        w.last_ds = Some(desk3());
+        tx.send(moved(49, "C", None, "msgr")).unwrap();
+        drop(tx);
+        w.run(rx); // returns once the inbox is drained and every sender is gone
+        assert_eq!(flattens(&log.lock().unwrap()), 2, "one rebuild, then one for both events queued during it: {:?}", log.lock().unwrap());
+        let rec = &Persisted::load(&dir.path().join("state.json")).template_records["C"];
+        assert_eq!(rec.slots["2.2"], [49, 50, 51]);
     }
 }

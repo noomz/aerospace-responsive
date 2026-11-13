@@ -192,6 +192,51 @@ pub struct Memory<'a> {
     pub save: &'a mut dyn FnMut(&TemplateRecords),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rebuilt {
+    /// Record equal (and not forced), or no tiled window: no command ran.
+    Nothing,
+    Built,
+    /// The abort flag stopped it before a command; the record is gone (V41).
+    Aborted,
+}
+
+/// V41, V43: rebuilds `t` over its tiled windows in `details` (one read of every window).
+/// `force` rebuilds even when the record is equal: an arrival (V40 b) or `arrange`. A failed
+/// command is an error, and like an abort it leaves no record.
+#[allow(clippy::too_many_arguments)]
+pub fn rebuild_template(
+    aero: &mut dyn Aero,
+    t: &template::Template,
+    details: &[WinInfo],
+    records: &mut TemplateRecords,
+    save: &mut dyn FnMut(&TemplateRecords),
+    abort: &AtomicBool,
+    force: bool,
+    executed: &mut Vec<Executed>,
+) -> Result<Rebuilt> {
+    let wins: Vec<WinInfo> = details.iter().filter(|w| w.workspace == t.workspace).cloned().collect();
+    let want = template::wanted(t, &wins);
+    if !force && template::pending(records.get(&t.workspace), &want).is_none() {
+        return Ok(Rebuilt::Nothing);
+    }
+    let cmds = template::rebuild(t, &wins);
+    let done = template::execute(records, &t.workspace, want, &cmds, save, |cmd| {
+        if abort.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let (result, ms) = timed(aero, cmd);
+        result.map_err(|e| anyhow!("{cmd}: {e}"))?;
+        executed.push(Executed { cmd: cmd.to_string(), error: None, ms });
+        Ok(true)
+    })?;
+    Ok(match (done, cmds.is_empty()) {
+        (false, _) => Rebuilt::Aborted,
+        (true, true) => Rebuilt::Nothing,
+        (true, false) => Rebuilt::Built,
+    })
+}
+
 /// `mem` = persisted memory (`None` = no converge and no template rebuild at all); `live` = the
 /// rule gets window events. While inert only removals converge (C3, V20).
 pub fn run_pass(
@@ -235,6 +280,7 @@ pub fn run_pass(
     // 3b. CONVERGE (V7, V10): before layout, so flatten and the root axis see the final tiled
     // set. Pins do not stop it (V11). A workspace's record moves only when its converge
     // completes, so an abort redoes it; a failed command is a pass error.
+    let mut changed_tiling = BTreeSet::new(); // V52: converged with at least one command
     if let Some(mem) = mem.as_mut().map(|m| &mut *m.tiling)
         && (!r.exclusive_tiling.is_empty() || !mem.records.is_empty())
     {
@@ -251,6 +297,9 @@ pub fn run_pass(
                 rep.executed.push(Executed { cmd: cmd.to_string(), error: None, ms });
             }
             tiling::commit(mem, &plan);
+            if !plan.steps.is_empty() {
+                changed_tiling.insert(plan.workspace.clone());
+            }
             rep.converged.push(plan.workspace.clone());
         }
     }
@@ -261,33 +310,21 @@ pub fn run_pass(
     // 3c. TEMPLATE REBUILD (V40 a, V41, V42): after converge, so the tiled set is final.
     if let Some(m) = mem.as_mut() {
         let applying = r.applying(&s_layout, pinned);
-        if drop_stale(r, &s_layout, pinned, &applying, m.templates) {
+        // V52: a converge float or tile on a template workspace drops its record.
+        let converged = changed_tiling.iter().filter(|ws| !pinned.contains(*ws)).fold(false, |acc, ws| m.templates.remove(ws).is_some() | acc);
+        if drop_stale(r, &s_layout, pinned, &applying, m.templates) | converged {
             (m.save)(m.templates);
         }
         if !applying.is_empty() {
             let details = aero.window_details()?;
             for t in r.templates.iter().map(|d| &d.template).filter(|t| applying.contains(&t.workspace)) {
-                let wins: Vec<WinInfo> = details.iter().filter(|w| w.workspace == t.workspace).cloned().collect();
-                let want = template::wanted(t, &wins);
-                if template::pending(m.templates.get(&t.workspace), &want).is_none() {
-                    continue;
-                }
-                let cmds = template::rebuild(t, &wins);
-                let done = template::execute(m.templates, &t.workspace, want, &cmds, m.save, |cmd| {
-                    if abort.load(Ordering::SeqCst) {
-                        return Ok(false);
+                match rebuild_template(aero, t, &details, m.templates, m.save, abort, false, &mut rep.executed)? {
+                    Rebuilt::Aborted => {
+                        rep.aborted = true;
+                        return Ok(rep);
                     }
-                    let (result, ms) = timed(aero, cmd);
-                    result.map_err(|e| anyhow!("{cmd}: {e}"))?;
-                    rep.executed.push(Executed { cmd: cmd.to_string(), error: None, ms });
-                    Ok(true)
-                })?;
-                if !done {
-                    rep.aborted = true;
-                    return Ok(rep);
-                }
-                if !cmds.is_empty() {
-                    rep.rebuilt.push(t.workspace.clone());
+                    Rebuilt::Built => rep.rebuilt.push(t.workspace.clone()),
+                    Rebuilt::Nothing => {}
                 }
             }
         }
@@ -776,6 +813,23 @@ tree = [{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]
         f.log.clear();
         ok_pass(&mut f, &tpl_cfg(""), &mut restarted, &[]);
         assert!(f.log.is_empty() && restarted.saves.is_empty(), "{:?}", f.log);
+    }
+
+    #[test]
+    fn a_converge_with_commands_drops_the_record_and_one_without_keeps_it() {
+        let mut f = tpl_fake(2);
+        let mut disk = Disk::default();
+        ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        let ruled = tpl_cfg("[[exclusive-tiling]]\nworkspaces = [\"C\"]\ntiling-allowlist = [{ app = \"line\" }, { app = \"igcl\" }]\n");
+        f.log.clear();
+        let rep = ok_pass(&mut f, &ruled, &mut disk, &[]);
+        assert!(f.log.contains(&Cmd::Float { id: 49 }) && rep.rebuilt == ["C"], "V52: {:?}", f.log);
+        assert_eq!(f.tree("C"), Tree::Split(Axis::V, vec![Tree::Win(44), Tree::Win(10)]));
+        // A fresh memory makes the rule converge again, now with nothing to float or tile.
+        f.log.clear();
+        let rep = ok_pass(&mut f, &ruled, &mut disk, &[]);
+        assert_eq!(rep.converged, ["C"]);
+        assert!(f.log.is_empty() && rep.rebuilt.is_empty(), "no command, no drop: {:?}", f.log);
     }
 
     #[test]
