@@ -3,8 +3,11 @@
 
 use crate::aero::{Cmd, Dir};
 use crate::config::{Axis, Config, Kind, Node, Pred, Profile, TemplateBlock};
+use crate::state::{TemplateRecord, TemplateRecords};
 use crate::world::WinInfo;
+use anyhow::Result;
 use std::collections::BTreeMap;
+use std::fmt;
 
 /// A workspace's effective template. Rule identity = workspace name (V48).
 #[derive(Debug, Clone, PartialEq)]
@@ -172,6 +175,114 @@ fn nest(parent: Axis, kids: &[Tree], cmds: &mut Vec<Cmd>) {
         cmds.extend(leaves[2..].iter().map(|&id| Cmd::MoveWindow { id, dir: Dir::neg(parent) }));
         nest(*axis, sub, cmds);
     }
+}
+
+/// The parts of `t` that decide the built tree: `root` and `tree`, titles included. `when` and
+/// the source block are left out, so moving a template between blocks, or narrowing its
+/// monitor, rebuilds nothing. Plain text, so it stays stable across builds of this tool.
+pub fn fingerprint(t: &Template) -> String {
+    fn node(n: &Node, axis: Axis, out: &mut String) {
+        match n {
+            Node::Slot(s) => {
+                out.push_str(&s.app);
+                if let Some(re) = &s.title {
+                    out.push_str(&format!(" title {:?}", re.as_str()));
+                }
+            }
+            Node::Container(c) => nodes(axis.opposite(), c, out),
+        }
+    }
+    fn nodes(axis: Axis, ns: &[Node], out: &mut String) {
+        out.push_str(match axis {
+            Axis::H => "h[",
+            Axis::V => "v[",
+        });
+        for (i, n) in ns.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            node(n, axis, out);
+        }
+        out.push(']');
+    }
+    let mut out = String::new();
+    nodes(t.root, &t.tree, &mut out);
+    out
+}
+
+/// V41: the record a rebuild of `t` over `windows` would leave. Slot paths are 1-based and
+/// dotted by depth (`2.1`), in the depth-first order `assign` uses.
+pub fn wanted(t: &Template, windows: &[WinInfo]) -> TemplateRecord {
+    fn paths(nodes: &[Node], prefix: &str, out: &mut Vec<String>) {
+        for (i, n) in nodes.iter().enumerate() {
+            let p = if prefix.is_empty() { (i + 1).to_string() } else { format!("{prefix}.{}", i + 1) };
+            match n {
+                Node::Slot(_) => out.push(p),
+                Node::Container(c) => paths(c, &p, out),
+            }
+        }
+    }
+    let mut keys = Vec::new();
+    paths(&t.tree, "", &mut keys);
+    let a = assign(&t.tree, windows);
+    TemplateRecord { fingerprint: fingerprint(t), slots: keys.into_iter().zip(a.slots).collect(), rest: a.rest }
+}
+
+/// Why a pass would rebuild (V40 (a)); the text is explain's `record:` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pending {
+    FirstRun,
+    TemplateChanged,
+    WindowsChanged,
+}
+
+impl fmt::Display for Pending {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Pending::FirstRun => "pending: first run",
+            Pending::TemplateChanged => "pending: template changed",
+            Pending::WindowsChanged => "pending: windows changed",
+        })
+    }
+}
+
+/// V41 pass rule: no record → rebuild; equal → nothing; differs → rebuild.
+pub fn pending(have: Option<&TemplateRecord>, want: &TemplateRecord) -> Option<Pending> {
+    match have {
+        None => Some(Pending::FirstRun),
+        Some(h) if h.fingerprint != want.fingerprint => Some(Pending::TemplateChanged),
+        Some(h) if h != want => Some(Pending::WindowsChanged),
+        Some(_) => None,
+    }
+}
+
+/// V41: runs a rebuild of `ws` so that only a completed one leaves a record. The old record is
+/// removed and saved before the first command; `want` is stored and saved after the last
+/// command succeeds. `run` executes one command and returns `Ok(false)` when it stopped before
+/// running it (abort). A failure or abort halfway leaves no record, so the next pass rebuilds.
+/// Returns true when every command ran. No commands (empty workspace) → no record.
+pub fn execute(
+    records: &mut TemplateRecords,
+    ws: &str,
+    want: TemplateRecord,
+    cmds: &[Cmd],
+    save: &mut dyn FnMut(&TemplateRecords),
+    mut run: impl FnMut(&Cmd) -> Result<bool>,
+) -> Result<bool> {
+    if records.remove(ws).is_some() {
+        save(records);
+    }
+    if cmds.is_empty() {
+        return Ok(true);
+    }
+    for cmd in cmds {
+        if !run(cmd)? {
+            return Ok(false);
+        }
+    }
+    records.insert(ws.to_string(), want);
+    save(records);
+    Ok(true)
 }
 
 impl Tree {
@@ -551,5 +662,105 @@ tree = [{ app = "p" }]
     #[test]
     fn no_blocks_no_templates() {
         assert!(effective(&parse("").unwrap().config, None).is_empty());
+    }
+
+    // --- V41 record (T35) ---
+
+    const C: &str = r#"[{ app = "line" }, [{ app = "igcl" }, { app = "msgr", title = "^Messenger" }], { app = "none" }]"#;
+
+    #[test]
+    fn wanted_keeps_one_list_per_slot_path_empty_slots_included() {
+        let t = tpl("h", C);
+        let ws = [tiled(49, "msgr"), tiled(10, "igcl"), tiled(44, "line"), tiled(7, "kitty"), win(8, "msgr", "Messenger", "floating")];
+        let mut r = wanted(&t, &ws);
+        assert_eq!(r.fingerprint, r#"h[line, v[igcl, msgr title "^Messenger"], none]"#);
+        let slots: Vec<(&str, Vec<u32>)> = r.slots.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        // msgr 49 has an empty title, so its slot misses it: it is a rest window.
+        assert_eq!(slots, [("1", vec![44]), ("2.1", vec![10]), ("2.2", vec![]), ("3", vec![])]);
+        assert_eq!(r.rest, [7, 49]);
+        r = wanted(&t, &[]);
+        assert_eq!(r.slots.len(), 4, "an empty workspace still names every slot");
+    }
+
+    #[test]
+    fn fingerprint_sees_the_tree_not_when_or_source() {
+        let t = tpl("h", C);
+        let moved = Template { when: Some(Pred { builtin: Some(true), ..Pred::default() }), source: "profile desk3 #1".into(), ..t.clone() };
+        assert_eq!(fingerprint(&moved), fingerprint(&t));
+        for other in [tpl("v", C), tpl("h", r#"[{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }], { app = "none" }]"#), tpl("h", r#"[{ app = "line" }, { app = "igcl" }]"#)] {
+            assert_ne!(fingerprint(&other), fingerprint(&t));
+        }
+    }
+
+    #[test]
+    fn pass_compares_the_record_with_the_wanted_one() {
+        let t = tpl("h", C);
+        let ws = [tiled(44, "line"), tiled(10, "igcl")];
+        let want = wanted(&t, &ws);
+        assert_eq!(pending(None, &want), Some(Pending::FirstRun));
+        assert_eq!(pending(Some(&want), &want), None);
+        let arrived = wanted(&t, &[tiled(44, "line"), tiled(10, "igcl"), tiled(12, "igcl")]);
+        assert_eq!(pending(Some(&want), &arrived), Some(Pending::WindowsChanged));
+        let edited = wanted(&tpl("v", C), &ws);
+        assert_eq!(pending(Some(&want), &edited), Some(Pending::TemplateChanged));
+        assert_eq!(Pending::TemplateChanged.to_string(), "pending: template changed");
+    }
+
+    fn rec(fp: &str) -> TemplateRecord {
+        TemplateRecord { fingerprint: fp.into(), slots: BTreeMap::new(), rest: vec![] }
+    }
+
+    /// Runs `execute` for `X` over three commands; `stop_at` = (index, fails?) aborts or fails there.
+    fn exec(stop_at: Option<(usize, bool)>) -> (Result<bool>, TemplateRecords, Vec<Option<String>>, usize) {
+        let mut records = TemplateRecords::from([("X".into(), rec("old")), ("Y".into(), rec("y"))]);
+        let cmds = vec![Cmd::Flatten { ws: "X".into() }; 3];
+        let mut saves = vec![];
+        let mut ran = 0;
+        let out = execute(
+            &mut records,
+            "X",
+            rec("new"),
+            &cmds,
+            &mut |r| saves.push(r.get("X").map(|x| x.fingerprint.clone())),
+            |_| match stop_at {
+                Some((i, fail)) if i == ran => if fail { anyhow::bail!("refused") } else { Ok(false) },
+                _ => {
+                    ran += 1;
+                    Ok(true)
+                }
+            },
+        );
+        (out, records, saves, ran)
+    }
+
+    #[test]
+    fn record_is_removed_before_the_first_command_and_saved_after_the_last() {
+        let (out, records, saves, ran) = exec(None);
+        assert!(out.unwrap());
+        assert_eq!((ran, saves), (3, vec![None, Some("new".into())]));
+        assert_eq!(records["X"].fingerprint, "new");
+        assert_eq!(records["Y"].fingerprint, "y", "other workspaces keep theirs");
+    }
+
+    #[test]
+    fn a_rebuild_that_fails_or_aborts_halfway_leaves_no_record() {
+        for fail in [true, false] {
+            let (out, records, saves, ran) = exec(Some((1, fail)));
+            assert_eq!(out.is_err(), fail);
+            assert_eq!(out.ok(), (!fail).then_some(false));
+            assert_eq!((ran, saves), (1, vec![None]), "saved without a record before the first command, never after");
+            assert!(!records.contains_key("X") && records.contains_key("Y"));
+        }
+    }
+
+    #[test]
+    fn an_empty_workspace_gets_no_commands_and_no_record() {
+        let t = tpl("h", C);
+        assert!(rebuild(&t, &[]).is_empty());
+        let mut records = TemplateRecords::from([("X".into(), rec("old"))]);
+        let mut saves = 0;
+        assert!(execute(&mut records, "X", wanted(&t, &[]), &[], &mut |_| saves += 1, |_| unreachable!()).unwrap());
+        assert!(records.is_empty());
+        assert_eq!(saves, 1);
     }
 }
