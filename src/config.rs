@@ -139,6 +139,15 @@ pub enum Axis {
     V,
 }
 
+impl Axis {
+    pub fn opposite(self) -> Axis {
+        match self {
+            Axis::H => Axis::V,
+            Axis::V => Axis::H,
+        }
+    }
+}
+
 /// Root layout kind. Axis is separate: `layout --root horizontal|vertical` keeps the kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
