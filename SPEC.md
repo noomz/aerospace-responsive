@@ -361,6 +361,10 @@ Reviewed by codex 2026-11-12 (R1–R10 below name its findings). V51–V54 and t
   aborted halfway leaves no record, the partial tree stays, and the next pass rebuilds. Pass: no record →
   rebuild; equal → nothing; differs → rebuild. `window-closed` removes the id from the record, no commands; the
   tree may then hold a one-child container until the next rebuild (same picture, sizes may differ: accepted).
+  Stale record: a full pass removes a workspace's record (save, no commands, V50) when no effective template
+  exists for it, or when it is non-empty, not pinned, and `when` fails on its monitor after placement. Else the
+  `[[layout]]` rule flattens it there and the old record still compares equal on return (dock → undock → dock).
+  Pinned keeps its record (V46: `unpin` removes it). Empty workspace keeps its record.
 - V42 Applies = effective template exists for the workspace AND (`when` absent OR `when` matches the monitor the
   workspace is on after placement) AND not pinned. While it applies, `plan_layout` and the layout checks in
   `diff` skip that workspace, in a verify-only pass too (R4): `orientation`, `flatten` and `kind` of the matching
@@ -429,7 +433,7 @@ T32|x|config: `[[workspace-template]]` + profile variant, untagged `tree` parse,
 T33|x|core: pure assignment + canonical shape fns + tests (first slot wins, title, many windows in a slot, rest, empty container, one-child collapse, same-axis merge, root promotion, single window)|V38,V39
 T34|x|core: pure rebuild plan `-> Vec<Cmd>` per T31 recipe; `Cmd::MoveWindow`, `Cmd::JoinWith`; `FakeAero` gains a tree model that applies them with fork semantics (swap, enter container at most-recent child, join = opposite axis) + tests: canonical tree reached from every start order and most-recent choice, twice = same|V43,V54,I.tpl.aero
 T35|x|state: per-slot-path record in `state.json`, serde default; wanted-record compare; remove-before-rebuild, save-after-success|V41,I.tpl.state
-T36|.|pass: rebuild step, `plan_layout` + `diff` skip, verify-only skip, `when` vs landed monitor, pin skip, abort, tests (first run, template edit, dock → undock → dock for `C`, daemon restart = no commands, pinned, command fails halfway → repass rebuilds, no mismatch warning for an applied template)|V40,V41,V42,V44
+T36|x|pass: rebuild step, `plan_layout` + `diff` skip, verify-only skip, `when` vs landed monitor, pin skip, abort, tests (first run, template edit, dock → undock → dock for `C`, daemon restart = no commands, pinned, command fails halfway → repass rebuilds, no mismatch warning for an applied template)|V40,V41,V42,V44
 T37|.|worker: judge all queued window events then rebuild once; close prunes record; daemon float/tile drops record; worker tests (burst of arrivals, arrival then rule-float, event during rebuild)|V40,V45,V47,V52
 T38|.|worker lifecycle: subscribe child gated on rule OR template; template-only config test; resync record check; `AeroSocket(true)` drops records; `unpin` drops record + arms pass; inert warning|V46,V51,V53,C24
 T39|.|surfaces: `arrange` command + ipc, explain section, dry-run block, status line, `--json`; observe keeps disk records through pin / gap saves; render tests|I.tpl.cli.arrange,I.tpl.cli.explain,I.tpl.cli.dryrun,I.tpl.cli.status,V49

@@ -11,7 +11,7 @@ use crate::pass::{self, PassReport};
 use crate::render::{self, LastPass, MonitorView, PinView, StatusView, TilingStatus};
 use crate::restore::{self, RestoreCtx};
 use crate::rules::{self, ProfileMode, Resolved};
-use crate::state::{self, Class, Persisted, Pin, TilingMemory, Warnings};
+use crate::state::{self, Class, Persisted, Pin, TemplateRecords, TilingMemory, Warnings};
 use crate::tiling::{self, Leave, Plan, Rule};
 use crate::world::{self, WinInfo};
 use serde_json::{Value, json};
@@ -337,7 +337,16 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         }
         let before = self.persisted.exclusive_tiling.clone();
         let live = self.sub.is_some(); // inert: only removals converge (C3, V20)
-        let result = pass::run_pass(&mut self.aero, &r, &ds, &pinned, &self.abort, Some(&mut self.persisted.exclusive_tiling), live);
+        // V41 saves template records mid-pass, from a pre-pass copy for the rest; the save below
+        // brings converged tiling memory up to date.
+        let (base, path) = (self.persisted.clone(), self.state_path.clone());
+        let mut save = |recs: &TemplateRecords| {
+            if let Err(e) = (Persisted { template_records: recs.clone(), ..base.clone() }).save(&path) {
+                crate::log!("cannot save state: {e:#}");
+            }
+        };
+        let mem = pass::Memory { tiling: &mut self.persisted.exclusive_tiling, templates: &mut self.persisted.template_records, save: &mut save };
+        let result = pass::run_pass(&mut self.aero, &r, &ds, &pinned, &self.abort, Some(mem), live);
         if self.persisted.exclusive_tiling != before {
             self.save_state(); // also after an error: memory follows each executed command
         }
