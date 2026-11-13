@@ -378,11 +378,13 @@ Reviewed by codex 2026-11-12 (R1–R10 below name its findings). V51–V54 and t
   `join-with --window-id <K's 2nd leaf> neg(p)`. The joiner is bound last, so it is K's most-recent child.
   Then each further leaf: `move --window-id <leaf> neg(p)`. It enters K after its most-recent child, which is
   the previous leaf (`bind` marks most-recent). Recurse into K's sub-containers.
-  Join direction matters: joining toward pos leaves the first leaf most-recent and the next move lands wrong.
+  Join direction matters (from source): joining toward pos leaves the first leaf most-recent, so the next move
+  lands in the wrong slot. Not isolated live: the negative control reversed joins and moves together.
   No intermediate step has a one-child container or same-axis nesting, so neither normalization setting changes
   anything between commands. Commands = 3 + (n-1)² + Σ containers (leaves − 1); 6 windows = 33.
-  Evidence: 80/80 live builds (desk off/off; mac_jr on/on, on/off, off/on). Focus unchanged with the workspace
-  focused and hidden. Desk: ~36 ms/cmd, 0.26 s (3 windows) to 1.2 s (6 windows). A focused workspace redraws
+  Evidence: 96/96 live builds. mac_jr: all four normalization settings, workspace focused and hidden. Desk
+  (off/off): 12 focused + 12 hidden (a first desk hidden batch ran visible by mistake; rerun). Focus same before
+  and after every build. Desk: ~36 ms/cmd, 0.26 s (3 windows) to 1.2 s (6 windows). A focused workspace redraws
   once per command; flicker not yet judged by eye (T41). Record `.scratch/workspace-template/RESULT.md`, script
   `scripts/spike-workspace-template.py`.
 - V44 Pass order in `run_pass`: placement → converge (V10) → template rebuild → flatten + layout (non-template

@@ -250,6 +250,8 @@ def main():
     a = ap.parse_args()
     h = Host(a)
     home = focus_state(h)["workspace"]
+    if home in (WS, STAGE):
+        sys.exit(f"focused workspace is {home}; focus another workspace first, or the hidden cases run visible")
     cfg = h.aero("config", "--config-path")[0].stdout.strip()
     norm = h.sh(f"grep -h '^enable-normalization' {shlex.quote(cfg)}", check=False).stdout.split("\n")[:-1]
     textedit_was_running = h.sh("pgrep -x TextEdit", check=False).returncode == 0
