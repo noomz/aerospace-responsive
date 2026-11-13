@@ -31,6 +31,21 @@ pub struct Persisted {
     /// which is worth saying out loud because that writer will fight every pass.
     #[serde(default)]
     pub gap_written: Option<crate::gaps::TopValue>,
+    /// Workspace-template records by workspace (V41): what the last completed rebuild built.
+    #[serde(default)]
+    pub template_records: TemplateRecords,
+}
+
+pub type TemplateRecords = BTreeMap<String, TemplateRecord>;
+
+/// What a completed rebuild built (V41, I.tpl.state). Valid for one AeroSpace server run (V51).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateRecord {
+    /// The parts of the template that decide the tree (`template::fingerprint`).
+    pub fingerprint: String,
+    /// Window ids per slot path (`1`, `2.1`), empty slots included.
+    pub slots: BTreeMap<String, Vec<u32>>,
+    pub rest: Vec<u32>,
 }
 
 /// Exclusive tiling's memory (I.state): the windows the rule floated, and per workspace the
@@ -259,6 +274,8 @@ mod tests {
         assert_eq!(Persisted::load(&path), Persisted::default());
         let mut p = Persisted { pins: vec![pin("1")], lock: Some("desk".into()), ..Persisted::default() };
         p.exclusive_tiling.insert("T", 4380, "net.kovidgoyal.kitty");
+        let slots = BTreeMap::from([("1".to_string(), vec![44]), ("2.1".to_string(), vec![]), ("2.2".to_string(), vec![10, 49])]);
+        p.template_records.insert("C".into(), TemplateRecord { fingerprint: "h[a, v[b, c]]".into(), slots, rest: vec![7] });
         p.save(&path).unwrap();
         assert_eq!(Persisted::load(&path), p);
         std::fs::write(&path, "{not json").unwrap();
@@ -273,6 +290,7 @@ mod tests {
         let p = Persisted::load(&path);
         assert_eq!(p.lock.as_deref(), Some("desk"));
         assert_eq!(p.exclusive_tiling, TilingMemory::default());
+        assert!(p.template_records.is_empty());
     }
 
     #[test]

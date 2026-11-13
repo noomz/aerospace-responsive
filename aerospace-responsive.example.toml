@@ -102,3 +102,23 @@ description = "defaults are correct here; the profile exists to say so deliberat
 #   { app = "net.kovidgoyal.kitty", title = "Settings", max-tiled = 0 },
 #   { app = "net.kovidgoyal.kitty", max-tiled = 1 },
 # ]
+
+# ---------- workspace template: rebuild a nested tiling tree on a workspace ----------
+# A template names the tree to build; on its triggers (first run, template or window change, a
+# tiled window moving in, `arrange`) the workspace is flattened and built again. Hand-made changes
+# stay until the next trigger; pin the workspace to keep them. Arrivals need the fork events
+# (README, Requirements); without them only passes and `arrange` rebuild, and `status` warns.
+# `tree` item = slot { app, title? } (title as in exclusive tiling) or an array = a container of
+# the opposite orientation. Rest windows (no slot matches) go to the end of the root.
+# While it applies, the [[layout]] rule's orientation/flatten/kind do nothing on that workspace.
+# Per workspace the last block wins whole (then [[profile.workspace-template]]).
+#
+# [[workspace-template]]
+# workspaces = ["C"]
+# when = { builtin = true }     # optional; any monitor predicate except nth; absent = every monitor
+# root = "h"                    # "h" | "v"
+# tree = [                      # -> h[ LINE, v[ IGCL, Messenger ] ]
+#   { app = "jp.naver.line.mac" },
+#   [ { app = "com.igcl.app" },
+#     { app = "com.google.Chrome.app.bbdeiblfgdokhlblpgeaokenkfknecgl" } ],
+# ]

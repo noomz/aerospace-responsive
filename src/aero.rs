@@ -91,6 +91,10 @@ pub enum Cmd {
     /// Exclusive tiling's else-action, and its undo (I.aero).
     Float { id: u32 },
     Tile { id: u32 },
+    /// Workspace-template rebuild (I.tpl.aero). `stop` makes a push past the workspace edge a
+    /// no-op success, which is what the ordering step relies on (V43).
+    MoveWindow { id: u32, dir: Dir },
+    JoinWith { id: u32, dir: Dir },
     /// The only way AeroSpace picks up a changed `outer.top`: it reads its config on reload,
     /// and `--no-gui` keeps that silent (the daemon has no GUI to answer one).
     ReloadConfig,
@@ -112,7 +116,49 @@ impl Cmd {
             Cmd::Focus { ws } => vec![s("workspace"), s("--"), ws.clone()],
             Cmd::Float { id } => vec![s("layout"), s("floating"), s("--window-id"), id.to_string()],
             Cmd::Tile { id } => vec![s("layout"), s("tiling"), s("--window-id"), id.to_string()],
+            Cmd::MoveWindow { id, dir } => {
+                vec![s("move"), s("--window-id"), id.to_string(), s("--boundaries"), s("workspace"), s("--boundaries-action"), s("stop"), s(dir.as_str())]
+            }
+            Cmd::JoinWith { id, dir } => vec![s("join-with"), s("--window-id"), id.to_string(), s(dir.as_str())],
             Cmd::ReloadConfig => vec![s("reload-config"), s("--no-gui")],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Dir {
+    /// Toward the end of an `axis` container: right or down.
+    pub fn pos(axis: Axis) -> Dir {
+        if axis == Axis::H { Dir::Right } else { Dir::Down }
+    }
+
+    /// Toward the start of an `axis` container: left or up.
+    pub fn neg(axis: Axis) -> Dir {
+        if axis == Axis::H { Dir::Left } else { Dir::Up }
+    }
+
+    pub fn axis(self) -> Axis {
+        if matches!(self, Dir::Left | Dir::Right) { Axis::H } else { Axis::V }
+    }
+
+    pub fn is_pos(self) -> bool {
+        matches!(self, Dir::Right | Dir::Down)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dir::Left => "left",
+            Dir::Right => "right",
+            Dir::Up => "up",
+            Dir::Down => "down",
         }
     }
 }
@@ -356,6 +402,12 @@ mod tests {
         assert_eq!(Cmd::Float { id: 5230 }.to_string(), "aerospace layout floating --window-id 5230");
         assert_eq!(Cmd::Tile { id: 4380 }.to_string(), "aerospace layout tiling --window-id 4380");
         assert_eq!(Cmd::ReloadConfig.to_string(), "aerospace reload-config --no-gui");
+        // The argv T31 proved live (scripts/spike-workspace-template.py).
+        assert_eq!(
+            Cmd::MoveWindow { id: 44, dir: Dir::Right }.to_string(),
+            "aerospace move --window-id 44 --boundaries workspace --boundaries-action stop right"
+        );
+        assert_eq!(Cmd::JoinWith { id: 49, dir: Dir::Up }.to_string(), "aerospace join-with --window-id 49 up");
     }
 
     #[test]

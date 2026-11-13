@@ -1,13 +1,14 @@
 //! The reconcile pass (D17, ticket 03): snapshot → placement → mandatory re-read →
-//! exclusive-tiling converge → layout → post-pass diff. Idempotence comes from desired-vs-observed diffing: a steady state issues
+//! exclusive-tiling converge → template rebuild → layout → post-pass diff (V44). Idempotence comes from desired-vs-observed diffing: a steady state issues
 //! no commands, so repetition can never destroy manual sizing.
 
 use crate::aero::{Aero, Cmd, monitor_target};
 use crate::display::Display;
 use crate::rules::Resolved;
-use crate::state::TilingMemory;
+use crate::state::{TemplateRecord, TemplateRecords, TilingMemory};
+use crate::template;
 use crate::tiling::{self, Plan};
-use crate::world::Snapshot;
+use crate::world::{Snapshot, WinInfo};
 use anyhow::{Result, anyhow};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,10 +33,12 @@ pub fn plan_placement(r: &Resolved, s: &Snapshot, ds: &[Display]) -> Vec<Cmd> {
 /// A rule's root kind (`kind`, else tiles under flatten) is enforced too: a window callback's
 /// `layout accordion` or a flatten rule on another monitor can leave the wrong one. It is sent
 /// only when wrong: a flatten leaves no child container, so it cannot change the root's kind.
+/// A workspace under an applying template is the template's (V42).
 pub fn plan_layout(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>) -> Vec<Cmd> {
+    let skip = r.hands_off(s, pinned);
     let mut cmds = vec![];
     for ws in s.nonempty() {
-        if pinned.contains(&ws) {
+        if skip.contains(&ws) {
             continue;
         }
         let (Some(m), Some(axis)) = (s.monitor_of(&ws), s.root_axis(&ws)) else { continue };
@@ -62,7 +65,8 @@ pub fn plan_layout(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>) -> Vec
 }
 
 /// Step 5: re-diff the FULL managed set — stub pulls and gcMonitors touch workspaces that
-/// received no command. `dropped` = refused moves, unsatisfiable for this pass.
+/// received no command. `dropped` = refused moves, unsatisfiable for this pass. Layout checks
+/// skip pinned workspaces and those under an applying template (V42); placement checks do not.
 pub fn diff(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, dropped: &BTreeSet<String>) -> Vec<String> {
     let mut out = vec![];
     for p in &r.placement {
@@ -71,8 +75,9 @@ pub fn diff(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, dropped: &BTr
             out.push(format!("workspace {} is on monitor {m}, wanted {t}", p.workspace));
         }
     }
+    let skip = r.hands_off(s, pinned);
     for ws in s.nonempty() {
-        if pinned.contains(&ws) {
+        if skip.contains(&ws) {
             continue;
         }
         let (Some(m), Some(axis)) = (s.monitor_of(&ws), s.root_axis(&ws)) else { continue };
@@ -90,6 +95,19 @@ pub fn diff(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, dropped: &BTr
     out
 }
 
+/// V41 stale record: removes the record of a workspace with no effective template, or of a
+/// non-empty, unpinned one whose template's `when` fails where it is (the `[[layout]]` rule owns
+/// it there). Pinned and empty workspaces keep theirs. Returns whether any went.
+fn drop_stale(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, applying: &BTreeSet<String>, records: &mut TemplateRecords) -> bool {
+    let nonempty = s.nonempty();
+    let before = records.len();
+    records.retain(|ws, _| {
+        let has_template = r.templates.iter().any(|d| &d.template.workspace == ws);
+        has_template && (!nonempty.contains(ws) || pinned.contains(ws) || applying.contains(ws))
+    });
+    records.len() != before
+}
+
 /// Workspaces on a different monitor in `after` than in `before`, with nothing in between that
 /// moves workspaces.
 fn drifted(before: &Snapshot, after: &Snapshot) -> Vec<String> {
@@ -103,9 +121,19 @@ fn drifted(before: &Snapshot, after: &Snapshot) -> Vec<String> {
         .collect()
 }
 
-/// What a pass would issue if every move lands (`reconcile --dry-run`, observe mode).
-/// `converge` = the pending exclusive-tiling plans, issued between placement and layout.
-pub fn dry_run(r: &Resolved, s: &Snapshot, ds: &[Display], pinned: &BTreeSet<String>, converge: &[Plan]) -> Vec<Cmd> {
+/// What a pass would issue if every move lands (`reconcile --dry-run`, observe mode), in pass
+/// order (V44): placement, the pending exclusive-tiling `converge` plans, template rebuilds, layout.
+/// `records` + `details` (one read of every window) feed the rebuilds, judged on the tiled set
+/// the converge would leave. Also returns the rebuilds, each with commands.
+pub fn dry_run(
+    r: &Resolved,
+    s: &Snapshot,
+    ds: &[Display],
+    pinned: &BTreeSet<String>,
+    converge: &[Plan],
+    records: &TemplateRecords,
+    details: &[WinInfo],
+) -> (Vec<Cmd>, Vec<Rebuild>) {
     let moves = plan_placement(r, s, ds);
     let mut landed = s.clone();
     for c in &moves {
@@ -115,9 +143,25 @@ pub fn dry_run(r: &Resolved, s: &Snapshot, ds: &[Display], pinned: &BTreeSet<Str
             }
         }
     }
+    let mut details = details.to_vec();
+    for (cmd, _) in converge.iter().flat_map(|p| &p.steps) {
+        let (id, layout) = match cmd {
+            Cmd::Float { id } => (id, "floating"),
+            Cmd::Tile { id } => (id, "h_tiles"),
+            _ => continue,
+        };
+        for w in details.iter_mut().filter(|w| w.id == *id) {
+            w.layout = layout.into();
+        }
+    }
+    let mut records = records.clone();
+    let converged: BTreeSet<String> = converge.iter().filter(|p| !p.steps.is_empty()).map(|p| p.workspace.clone()).collect();
+    settle_records(r, &landed, pinned, &converged, &mut records);
+    let rebuilds: Vec<Rebuild> = plan_rebuilds(r, &landed, pinned, &records, &details).into_iter().filter(|b| !b.cmds.is_empty()).collect();
     let layout = plan_layout(r, &landed, pinned);
     let conv = converge.iter().flat_map(|p| p.steps.iter().map(|(c, _)| c.clone()));
-    moves.into_iter().chain(conv).chain(layout).collect()
+    let cmds = moves.into_iter().chain(conv).chain(rebuilds.iter().flat_map(|b| b.cmds.clone())).chain(layout).collect();
+    (cmds, rebuilds)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -157,6 +201,8 @@ pub struct PassReport {
     pub drifted: Vec<String>,
     /// Workspaces whose exclusive-tiling converge completed this pass.
     pub converged: Vec<String>,
+    /// Workspaces whose template rebuild completed this pass.
+    pub rebuilt: Vec<String>,
     pub nonempty: BTreeSet<String>,
     /// What this pass left visible per monitor. Ticket 13 S3.3: a monitor is restored only
     /// while it still shows what the pass put there — anything else means the user acted.
@@ -165,15 +211,97 @@ pub struct PassReport {
     pub ms: u64,
 }
 
-/// `tiling` is exclusive tiling's memory (`None` = no converge at all); `live` = the rule gets
-/// window events. While inert only removals converge (C3, V20).
+/// What a pass may change in persisted state, and how it saves template records mid-pass (V41).
+pub struct Memory<'a> {
+    pub tiling: &'a mut TilingMemory,
+    pub templates: &'a mut TemplateRecords,
+    pub save: &'a mut dyn FnMut(&TemplateRecords),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rebuilt {
+    /// No tiled window: no command ran, and no record is left.
+    Nothing,
+    Built,
+    /// The abort flag stopped it before a command; the record is gone (V41).
+    Aborted,
+}
+
+/// One template rebuild (V43) and the record it leaves (V41). `why` is `None` when the record
+/// already equals `record`: only a forced rebuild (an arrival, V40 b, or `arrange`) runs it then.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rebuild {
+    pub workspace: String,
+    pub why: Option<template::Pending>,
+    pub cmds: Vec<Cmd>,
+    pub record: TemplateRecord,
+}
+
+impl Rebuild {
+    /// `t` over its tiled windows in `details` (one read of every window).
+    pub fn of(t: &template::Template, details: &[WinInfo], records: &TemplateRecords) -> Self {
+        let wins: Vec<WinInfo> = details.iter().filter(|w| w.workspace == t.workspace).cloned().collect();
+        let record = template::wanted(t, &wins);
+        Rebuild { workspace: t.workspace.clone(), why: template::pending(records.get(&t.workspace), &record), cmds: template::rebuild(t, &wins), record }
+    }
+}
+
+/// Step 3c's record upkeep before any rebuild: V52 (a converge float or tile on an unpinned
+/// template workspace drops its record) and V41's stale records. `s` = after converge. Returns
+/// whether any record went.
+pub fn settle_records(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, converged: &BTreeSet<String>, records: &mut TemplateRecords) -> bool {
+    let dropped = converged.iter().filter(|ws| !pinned.contains(*ws)).fold(false, |acc, ws| records.remove(ws).is_some() | acc);
+    drop_stale(r, s, pinned, &r.applying(s, pinned), records) | dropped
+}
+
+/// Step 3c's decision (V40 a, V42): every applying template whose record differs from what a
+/// rebuild would leave, in template order. Records must be settled first.
+pub fn plan_rebuilds(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, records: &TemplateRecords, details: &[WinInfo]) -> Vec<Rebuild> {
+    let applying = r.applying(s, pinned);
+    r.templates
+        .iter()
+        .map(|d| &d.template)
+        .filter(|t| applying.contains(&t.workspace))
+        .map(|t| Rebuild::of(t, details, records))
+        .filter(|b| b.why.is_some())
+        .collect()
+}
+
+/// V41: runs `b` so that only a completed rebuild leaves a record. A failed command is an
+/// error, and like an abort it leaves no record.
+pub fn run_rebuild(
+    aero: &mut dyn Aero,
+    b: Rebuild,
+    records: &mut TemplateRecords,
+    save: &mut dyn FnMut(&TemplateRecords),
+    abort: &AtomicBool,
+    executed: &mut Vec<Executed>,
+) -> Result<Rebuilt> {
+    let done = template::execute(records, &b.workspace, b.record, &b.cmds, save, |cmd| {
+        if abort.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let (result, ms) = timed(aero, cmd);
+        result.map_err(|e| anyhow!("{cmd}: {e}"))?;
+        executed.push(Executed { cmd: cmd.to_string(), error: None, ms });
+        Ok(true)
+    })?;
+    Ok(match (done, b.cmds.is_empty()) {
+        (false, _) => Rebuilt::Aborted,
+        (true, true) => Rebuilt::Nothing,
+        (true, false) => Rebuilt::Built,
+    })
+}
+
+/// `mem` = persisted memory (`None` = no converge and no template rebuild at all); `live` = the
+/// rule gets window events. While inert only removals converge (C3, V20).
 pub fn run_pass(
     aero: &mut dyn Aero,
     r: &Resolved,
     ds: &[Display],
     pinned: &BTreeSet<String>,
     abort: &AtomicBool,
-    tiling: Option<&mut TilingMemory>,
+    mut mem: Option<Memory>,
     live: bool,
 ) -> Result<PassReport> {
     let started = Instant::now();
@@ -208,7 +336,8 @@ pub fn run_pass(
     // 3b. CONVERGE (V7, V10): before layout, so flatten and the root axis see the final tiled
     // set. Pins do not stop it (V11). A workspace's record moves only when its converge
     // completes, so an abort redoes it; a failed command is a pass error.
-    if let Some(mem) = tiling
+    let mut changed_tiling = BTreeSet::new(); // V52: converged with at least one command
+    if let Some(mem) = mem.as_mut().map(|m| &mut *m.tiling)
         && (!r.exclusive_tiling.is_empty() || !mem.records.is_empty())
     {
         let details = aero.window_details()?;
@@ -224,12 +353,36 @@ pub fn run_pass(
                 rep.executed.push(Executed { cmd: cmd.to_string(), error: None, ms });
             }
             tiling::commit(mem, &plan);
+            if !plan.steps.is_empty() {
+                changed_tiling.insert(plan.workspace.clone());
+            }
             rep.converged.push(plan.workspace.clone());
         }
     }
     // Floating a root sibling can make AeroSpace change the root's kind or axis; layout decides
     // from what converge left, not from before it.
     let s_layout = if rep.converged.is_empty() { s1.clone() } else { aero.windows()? };
+
+    // 3c. TEMPLATE REBUILD (V40 a, V41, V42): after converge, so the tiled set is final.
+    if let Some(m) = mem.as_mut() {
+        if settle_records(r, &s_layout, pinned, &changed_tiling, m.templates) {
+            (m.save)(m.templates);
+        }
+        if !r.applying(&s_layout, pinned).is_empty() {
+            let details = aero.window_details()?;
+            for b in plan_rebuilds(r, &s_layout, pinned, m.templates, &details) {
+                let ws = b.workspace.clone();
+                match run_rebuild(aero, b, m.templates, m.save, abort, &mut rep.executed)? {
+                    Rebuilt::Aborted => {
+                        rep.aborted = true;
+                        return Ok(rep);
+                    }
+                    Rebuilt::Built => rep.rebuilt.push(ws),
+                    Rebuilt::Nothing => {}
+                }
+            }
+        }
+    }
 
     for cmd in plan_layout(r, &s_layout, pinned) {
         // 4. LAYOUT
@@ -257,6 +410,7 @@ mod tests {
     use super::*;
     use crate::config::{Axis, Kind, parse};
     use crate::rules::resolve;
+    use crate::template::Tree;
     use crate::testutil::{FakeAero, desk3};
 
     fn cfg() -> crate::config::Config {
@@ -480,7 +634,7 @@ mod tests {
         let mut f = docked();
         let ds = desk3();
         let r = resolve(&cfg(), &ds, None);
-        let predicted = dry_run(&r, &f.windows().unwrap(), &ds, &BTreeSet::new(), &[]);
+        let (predicted, _) = dry_run(&r, &f.windows().unwrap(), &ds, &BTreeSet::new(), &[], &TemplateRecords::new(), &[]);
         pass(&mut f, &[]);
         assert_eq!(predicted, f.log);
     }
@@ -502,11 +656,16 @@ mod tests {
         f
     }
 
+    /// Tiling memory alone: no template records kept, saves dropped.
+    fn tmem(mem: &mut TilingMemory) -> Memory<'_> {
+        Memory { tiling: mem, templates: Box::leak(Box::default()), save: Box::leak(Box::new(|_: &TemplateRecords| {})) }
+    }
+
     fn tiling_pass(f: &mut FakeAero, cfg: &crate::config::Config, mem: &mut TilingMemory, pinned: &[&str], abort: bool) -> PassReport {
         let ds = desk3();
         let r = resolve(cfg, &ds, None);
         let pinned = pinned.iter().map(|s| s.to_string()).collect();
-        run_pass(f, &r, &ds, &pinned, &AtomicBool::new(abort), Some(mem), true).unwrap()
+        run_pass(f, &r, &ds, &pinned, &AtomicBool::new(abort), Some(tmem(mem)), true).unwrap()
     }
 
     #[test]
@@ -565,12 +724,12 @@ mod tests {
         let ds = desk3();
         let mut mem = TilingMemory::default();
         let r = resolve(&cfg_with(RULE), &ds, None);
-        run_pass(&mut f, &r, &ds, &BTreeSet::new(), &AtomicBool::new(false), Some(&mut mem), false).unwrap();
+        run_pass(&mut f, &r, &ds, &BTreeSet::new(), &AtomicBool::new(false), Some(tmem(&mut mem)), false).unwrap();
         assert!(!f.log.iter().any(|c| matches!(c, Cmd::Float { .. } | Cmd::Tile { .. })), "inert: no first run");
         tiling_pass(&mut f, &cfg_with(RULE), &mut mem, &[], false); // live: first run floats 105 and 300
         let n = f.log.len();
         let removed = resolve(&cfg(), &ds, None);
-        run_pass(&mut f, &removed, &ds, &BTreeSet::new(), &AtomicBool::new(false), Some(&mut mem), false).unwrap();
+        run_pass(&mut f, &removed, &ds, &BTreeSet::new(), &AtomicBool::new(false), Some(tmem(&mut mem)), false).unwrap();
         assert_eq!(f.log[n..], [Cmd::Tile { id: 105 }, Cmd::Tile { id: 300 }], "V20: removal needs no events");
         assert_eq!(mem, TilingMemory::default());
     }
@@ -612,9 +771,258 @@ mod tests {
         let ds = desk3();
         let r = resolve(&cfg_with(RULE), &ds, None);
         let mut fake_err = FailTile(docked_kitty()); // e.g. the window closed after the read
-        let err = run_pass(&mut fake_err, &r, &ds, &BTreeSet::new(), &AtomicBool::new(false), Some(&mut mem), true).unwrap_err();
+        let err = run_pass(&mut fake_err, &r, &ds, &BTreeSet::new(), &AtomicBool::new(false), Some(tmem(&mut mem)), true).unwrap_err();
         assert!(format!("{err:#}").contains("layout floating --window-id 105"), "{err:#}");
         assert!(mem.records.is_empty());
+    }
+
+    // ---------- workspace template rebuild (T36) ----------
+
+    /// Built-in wants `h`, the portrait flattens to `v`; `C` on the built-in gets `v[LINE, h[IGCL, Msgr]]`,
+    /// so a layout check that looked at `C` would report its root.
+    const TPL: &str = r#"
+[[layout]]
+when = { portrait = true }
+orientation = "v"
+flatten = true
+[[layout]]
+when = { builtin = true }
+orientation = "h"
+flatten = false
+[[workspace-template]]
+workspaces = ["C"]
+when = { builtin = true }
+root = "v"
+tree = [{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]
+"#;
+
+    fn tpl_cfg(extra: &str) -> crate::config::Config {
+        parse(&format!("{TPL}{extra}")).unwrap().config
+    }
+
+    /// `C` on the built-in (2) with LINE 44, IGCL 10, Messenger 49, flat under an `h` root.
+    fn tpl_fake(monitor: u32) -> FakeAero {
+        let mut f = FakeAero::new(&desk3(), &[("C", monitor, true, 0, Axis::H)], "C");
+        f.add_window("C", 44, "line", "LINE", false);
+        f.add_window("C", 10, "igcl", "IGCL", false);
+        f.add_window("C", 49, "msgr", "Messenger", false);
+        f
+    }
+
+    fn built() -> Tree {
+        Tree::Split(Axis::V, vec![Tree::Win(44), Tree::Split(Axis::H, vec![Tree::Win(10), Tree::Win(49)])])
+    }
+
+    /// Persisted template records plus every save the pass made, newest last.
+    #[derive(Default)]
+    struct Disk {
+        records: TemplateRecords,
+        saves: Vec<TemplateRecords>,
+    }
+
+    fn tpass(f: &mut dyn Aero, cfg: &crate::config::Config, disk: &mut Disk, pinned: &[&str], abort: &AtomicBool) -> Result<PassReport> {
+        let ds = desk3();
+        let r = resolve(cfg, &ds, None);
+        let pinned = pinned.iter().map(|s| s.to_string()).collect();
+        let mut tiling = TilingMemory::default();
+        let saves = &mut disk.saves;
+        let mut save = |recs: &TemplateRecords| saves.push(recs.clone());
+        let mem = Memory { tiling: &mut tiling, templates: &mut disk.records, save: &mut save };
+        run_pass(f, &r, &ds, &pinned, abort, Some(mem), true)
+    }
+
+    fn ok_pass(f: &mut FakeAero, cfg: &crate::config::Config, disk: &mut Disk, pinned: &[&str]) -> PassReport {
+        tpass(f, cfg, disk, pinned, &AtomicBool::new(false)).unwrap()
+    }
+
+    fn template_cmds(log: &[Cmd]) -> usize {
+        log.iter().filter(|c| matches!(c, Cmd::MoveWindow { .. } | Cmd::JoinWith { .. })).count()
+    }
+
+    #[test]
+    fn first_run_rebuilds_and_the_layout_rule_leaves_the_workspace_alone() {
+        let mut f = tpl_fake(2);
+        let mut disk = Disk::default();
+        let rep = ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        assert_eq!(f.tree("C"), built());
+        assert_eq!(rep.rebuilt, ["C"]);
+        assert!(rep.mismatches.is_empty(), "no mismatch for an applied template: {:?}", rep.mismatches);
+        assert!(!f.log.contains(&Cmd::Layout { ws: "C".into(), axis: Axis::H }), "the h rule must not touch C: {:?}", f.log);
+        assert_eq!(disk.saves.last(), Some(&disk.records), "saved after the last command");
+        assert!(disk.records.contains_key("C"));
+        // Verify-only uses the same diff: the v root on an h monitor is not a mismatch there either.
+        let r = resolve(&tpl_cfg(""), &desk3(), None);
+        assert!(diff(&r, &f.windows().unwrap(), &BTreeSet::new(), &BTreeSet::new()).is_empty());
+        f.log.clear();
+        let again = ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        assert!(f.log.is_empty() && again.rebuilt.is_empty(), "equal record: nothing to do: {:?}", f.log);
+    }
+
+    #[test]
+    fn a_daemon_restart_sends_no_commands() {
+        let mut f = tpl_fake(2);
+        let mut disk = Disk::default();
+        ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        let mut restarted = Disk { records: disk.saves.last().unwrap().clone(), saves: vec![] };
+        f.log.clear();
+        ok_pass(&mut f, &tpl_cfg(""), &mut restarted, &[]);
+        assert!(f.log.is_empty() && restarted.saves.is_empty(), "{:?}", f.log);
+    }
+
+    #[test]
+    fn a_converge_with_commands_drops_the_record_and_one_without_keeps_it() {
+        let mut f = tpl_fake(2);
+        let mut disk = Disk::default();
+        ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        let ruled = tpl_cfg("[[exclusive-tiling]]\nworkspaces = [\"C\"]\ntiling-allowlist = [{ app = \"line\" }, { app = \"igcl\" }]\n");
+        f.log.clear();
+        let rep = ok_pass(&mut f, &ruled, &mut disk, &[]);
+        assert!(f.log.contains(&Cmd::Float { id: 49 }) && rep.rebuilt == ["C"], "V52: {:?}", f.log);
+        assert_eq!(f.tree("C"), Tree::Split(Axis::V, vec![Tree::Win(44), Tree::Win(10)]));
+        // A fresh memory makes the rule converge again, now with nothing to float or tile.
+        f.log.clear();
+        let rep = ok_pass(&mut f, &ruled, &mut disk, &[]);
+        assert_eq!(rep.converged, ["C"]);
+        assert!(f.log.is_empty() && rep.rebuilt.is_empty(), "no command, no drop: {:?}", f.log);
+    }
+
+    #[test]
+    fn a_template_edit_rebuilds() {
+        let mut f = tpl_fake(2);
+        let mut disk = Disk::default();
+        ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        let edited = parse(&TPL.replace(r#"tree = [{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]"#, r#"tree = [[{ app = "igcl" }, { app = "msgr" }], { app = "line" }]"#)).unwrap().config;
+        f.log.clear();
+        let rep = ok_pass(&mut f, &edited, &mut disk, &[]);
+        assert_eq!(rep.rebuilt, ["C"]);
+        assert_eq!(f.tree("C"), Tree::Split(Axis::V, vec![Tree::Split(Axis::H, vec![Tree::Win(10), Tree::Win(49)]), Tree::Win(44)]));
+    }
+
+    #[test]
+    fn dock_undock_dock_rebuilds_on_every_return_to_the_builtin() {
+        let mut f = tpl_fake(2);
+        let mut disk = Disk::default();
+        ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        let i = f.ws.iter().position(|w| w.name == "C").unwrap();
+        for _ in 0..2 {
+            f.ws[i].monitor = 1; // dock: C on the portrait, whose layout rule owns it
+            f.log.clear();
+            let rep = ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+            assert_eq!(template_cmds(&f.log), 0, "{:?}", f.log);
+            assert!(rep.rebuilt.is_empty() && rep.mismatches.is_empty(), "{:?}", rep.mismatches);
+            assert!(disk.records.is_empty() && disk.saves.last() == Some(&TemplateRecords::new()), "stale record removed and saved");
+            f.run(&Cmd::Flatten { ws: "C".into() }).unwrap(); // the user, or the rule on an h template
+            f.ws[i].monitor = 2; // undock
+            let rep = ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+            assert_eq!(rep.rebuilt, ["C"]);
+            assert_eq!(f.tree("C"), built());
+        }
+    }
+
+    #[test]
+    fn when_is_judged_on_the_monitor_placement_lands_on() {
+        let mut f = tpl_fake(1);
+        let mut disk = Disk::default();
+        let rep = ok_pass(&mut f, &tpl_cfg("[[placement]]\nworkspaces = [\"C\"]\nmonitor = { builtin = true }\n"), &mut disk, &[]);
+        assert!(matches!(&f.log[0], Cmd::Move { ws, monitor: 2, .. } if ws == "C"), "{:?}", f.log);
+        assert_eq!(rep.rebuilt, ["C"]);
+        assert_eq!(f.tree("C"), built());
+    }
+
+    #[test]
+    fn a_pinned_workspace_is_neither_rebuilt_nor_laid_out() {
+        let mut f = tpl_fake(2);
+        let mut disk = Disk::default();
+        let rep = ok_pass(&mut f, &tpl_cfg(""), &mut disk, &["C"]);
+        assert!(f.log.is_empty() && rep.rebuilt.is_empty(), "{:?}", f.log);
+        assert!(disk.records.is_empty());
+        // A pin made after a rebuild keeps the record (V46: unpin removes it).
+        ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        f.log.clear();
+        let i = f.ws.iter().position(|w| w.name == "C").unwrap();
+        f.ws[i].tree = None; // hand-made change
+        ok_pass(&mut f, &tpl_cfg(""), &mut disk, &["C"]);
+        assert!(f.log.is_empty() && disk.records.contains_key("C"));
+    }
+
+    #[test]
+    fn removing_the_template_drops_the_record_without_commands() {
+        let mut f = tpl_fake(2);
+        let mut disk = Disk::default();
+        ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        f.log.clear();
+        let gone = parse(&TPL[..TPL.find("[[workspace-template]]").unwrap()]).unwrap().config;
+        ok_pass(&mut f, &gone, &mut disk, &[]);
+        assert_eq!(template_cmds(&f.log), 0, "V50: {:?}", f.log);
+        assert!(disk.records.is_empty());
+    }
+
+    #[test]
+    fn a_command_failing_halfway_leaves_no_record_and_the_repass_rebuilds() {
+        let mut f = Trip { f: tpl_fake(2), on: |c| matches!(c, Cmd::JoinWith { .. }), trap: Trap::Fail, abort: None };
+        let mut disk = Disk::default();
+        let err = tpass(&mut f, &tpl_cfg(""), &mut disk, &[], &AtomicBool::new(false)).unwrap_err();
+        assert!(format!("{err:#}").contains("join-with"), "{err:#}");
+        assert!(disk.records.is_empty() && disk.saves.iter().all(|s| s.is_empty()));
+        let mut f = f.f;
+        f.log.clear();
+        let rep = ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        assert_eq!(rep.rebuilt, ["C"]);
+        assert_eq!(f.log[0], Cmd::Flatten { ws: "C".into() }, "a full rebuild from the top");
+        assert_eq!(f.tree("C"), built());
+    }
+
+    #[test]
+    fn an_abort_mid_rebuild_stops_and_leaves_no_record() {
+        let abort = AtomicBool::new(false);
+        let mut f = Trip { f: tpl_fake(2), on: |c| matches!(c, Cmd::MoveWindow { .. }), trap: Trap::Abort, abort: Some(&abort) };
+        let mut disk = Disk::default();
+        ok_pass(&mut f.f, &tpl_cfg(""), &mut disk, &[]);
+        disk.records.clear(); // force a rebuild
+        f.f.log.clear();
+        let rep = tpass(&mut f, &tpl_cfg(""), &mut disk, &[], &abort).unwrap();
+        assert!(rep.aborted && rep.rebuilt.is_empty());
+        assert_eq!(template_cmds(&f.f.log), 1, "nothing after the abort: {:?}", f.f.log);
+        assert!(disk.records.is_empty());
+    }
+
+    enum Trap {
+        Fail,
+        Abort,
+    }
+
+    /// FakeAero that fails, or raises the abort flag, on the commands `on` picks.
+    struct Trip<'a> {
+        f: FakeAero,
+        on: fn(&Cmd) -> bool,
+        trap: Trap,
+        abort: Option<&'a AtomicBool>,
+    }
+    impl Aero for Trip<'_> {
+        fn monitors(&mut self) -> Result<Vec<crate::world::AeroMonitor>> {
+            self.f.monitors()
+        }
+        fn windows(&mut self) -> Result<Snapshot> {
+            self.f.windows()
+        }
+        fn workspaces(&mut self) -> Result<Vec<crate::world::WorkspaceRow>> {
+            self.f.workspaces()
+        }
+        fn window_details(&mut self) -> Result<Vec<crate::world::WinInfo>> {
+            self.f.window_details()
+        }
+        fn run(&mut self, cmd: &Cmd) -> Result<(), String> {
+            if (self.on)(cmd) {
+                match self.trap {
+                    Trap::Fail => return Err("Invalid window-id".into()),
+                    Trap::Abort => self.abort.unwrap().store(true, Ordering::SeqCst),
+                }
+            }
+            self.f.run(cmd)
+        }
+        fn subscribe(&mut self, sink: crate::aero::Sink) -> Result<crate::aero::Subscription> {
+            self.f.subscribe(sink)
+        }
     }
 
     /// FakeAero whose window-id commands fail.
@@ -641,5 +1049,27 @@ mod tests {
         fn subscribe(&mut self, sink: crate::aero::Sink) -> Result<crate::aero::Subscription> {
             self.0.subscribe(sink)
         }
+    }
+
+    #[test]
+    fn dry_run_predicts_the_rebuild_after_the_converge() {
+        // C's rule floats Messenger first; the rebuild then sees LINE and IGCL only (V44, V45).
+        let cfg = tpl_cfg("\n[[exclusive-tiling]]\nworkspaces = [\"C\"]\ntiling-allowlist = [{ app = \"line\" }, { app = \"igcl\" }]\n");
+        let mut f = tpl_fake(2);
+        let ds = desk3();
+        let r = resolve(&cfg, &ds, None);
+        let details = f.window_details().unwrap();
+        let plans: Vec<Plan> =
+            tiling::plan_converge(&r.exclusive_tiling, &TilingMemory::default(), &details).into_iter().filter(|p| tiling::runnable(p, true)).collect();
+        let mut disk = Disk::default();
+        let (predicted, rebuilds) = dry_run(&r, &f.windows().unwrap(), &ds, &BTreeSet::new(), &plans, &disk.records, &details);
+        assert_eq!(rebuilds.len(), 1);
+        assert_eq!(rebuilds[0].why, Some(template::Pending::FirstRun));
+        assert_eq!(rebuilds[0].record.slots["2.2"], Vec::<u32>::new(), "Messenger floats before the rebuild");
+        ok_pass(&mut f, &cfg, &mut disk, &[]);
+        assert_eq!(predicted, f.log);
+        assert_eq!(disk.records["C"], rebuilds[0].record);
+        let (cmds, rebuilds) = dry_run(&r, &f.windows().unwrap(), &ds, &BTreeSet::new(), &[], &disk.records, &f.window_details().unwrap());
+        assert!(cmds.is_empty() && rebuilds.is_empty(), "steady state: {cmds:?}");
     }
 }

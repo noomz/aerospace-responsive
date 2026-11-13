@@ -9,10 +9,11 @@ reconfiguration — no polling — and every command is a client of that one dae
 
 - macOS
 - [AeroSpace](https://github.com/nikitabobko/AeroSpace) 0.21.0-Beta or later (for `layout --root`)
-- For exclusive tiling only: an AeroSpace whose `subscribe` has `window-moved` and `window-closed`,
+- For exclusive tiling, and for a workspace template to rebuild when a window arrives: an AeroSpace whose `subscribe` has `window-moved` and `window-closed`,
   from the [`feat/window-events`](https://github.com/noomz/AeroSpace/tree/feat/window-events) branch
   of the noomz/AeroSpace fork. Restart AeroSpace after installing it (client and server must match).
-  On stock AeroSpace the rule is inert and `status` warns; nothing else changes.
+  On stock AeroSpace the exclusive-tiling rule is inert, a template rebuilds only on a pass or
+  `arrange`, and `status` warns; nothing else changes.
 
 ## Install
 
@@ -38,14 +39,15 @@ After updating the binary with `cargo install`, restart the agent with `launchct
 | Command | Does |
 |---|---|
 | `reconcile [--dry-run] [--config F]` | Run a pass now, or print the exact `aerospace` commands it would run |
-| `explain [--config F]` | Every rule considered and why it won or lost; each exclusive-tiling workspace with its windows' verdicts |
+| `explain [--config F]` | Every rule considered and why it won or lost; each exclusive-tiling workspace with its windows' verdicts; each workspace template with the window in every slot |
 | `monitors` | Attached displays as predicates see them (roles, pixels, notch, serial, labels) |
-| `status` | Profile, last pass, pins, exclusive tiling (live/inert), pending warnings — exits 4 while warnings are pending |
+| `status` | Profile, last pass, pins, exclusive tiling and workspace template (live/inert), pending warnings — exits 4 while warnings are pending |
+| `arrange [ws] [--dry-run]` | Rebuild a workspace's template now (default: the focused workspace); errors when none applies there |
 | `pin [ws]` / `unpin [ws\|--all]` / `pins` | Protect a hand-tuned workspace's layout (placement still follows) |
 | `profile [lock <name> \| unlock]` | Show, lock or unlock the setup profile |
 | `reload` | Reload the config now (it is also watched) |
 
-`--json` on `status`, `explain`, `monitors`, `pins`, `profile`, `reconcile --dry-run`.
+`--json` on `status`, `explain`, `monitors`, `pins`, `profile`, `reconcile --dry-run`, `arrange`.
 Exit codes: 0 ok, 1 error, 2 usage, 3 daemon not running, 4 warnings pending.
 
 After placement, cosmetic restore issues at most one workspace-focus command on the originally
@@ -181,14 +183,99 @@ exclusive-tiling:
 `reconcile --dry-run` lists a pending converge and its `layout floating|tiling --window-id` commands;
 `daemon --observe` logs the rule's would-be commands without running them.
 
+### Workspace template
+
+A `[[layout]]` rule sets a workspace's root only. A workspace template names the whole tiling tree,
+so a nested layout you would otherwise arrange by hand comes back by itself, e.g. `C` on the
+built-in display as `h[ LINE, v[ IGCL, Messenger ] ]`:
+
+```toml
+[[workspace-template]]
+workspaces = ["C"]
+when = { builtin = true }        # optional; absent = on every monitor
+root = "h"
+tree = [
+  { app = "jp.naver.line.mac" },
+  [ { app = "com.igcl.app" },
+    { app = "com.google.Chrome.app.bbdeiblfgdokhlblpgeaokenkfknecgl" } ],
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `workspaces` | Workspaces the template applies to (non-empty) |
+| `when` | Optional monitor predicate, judged against the monitor the workspace lands on after placement. Any field except `nth` |
+| `root` | Root orientation: `"h"` or `"v"` (required) |
+| `tree` | The root's children in order (non-empty). A table is a **slot**; an array is a container with the opposite orientation of its parent |
+| `app` | Slot: exact bundle id (required) |
+| `title` | Slot: optional regex on the window title, case-insensitive and unanchored (as in exclusive tiling) |
+
+How windows are placed:
+
+- Only tiled windows count. A floating window is never moved, and exclusive tiling decides what floats
+  before the template runs.
+- Each window goes to the first slot, in tree order, that matches it. A slot holds every window it
+  matches, lowest window id first, side by side. Windows no slot matches (**rest windows**) go to the
+  end of the root, lowest id first.
+- Empty slots and containers are dropped, and a container left with one child is replaced by that
+  child: with IGCL and Messenger closed, `C` above is just `h[ LINE ]`.
+- Nesting always alternates (`h` inside `v` inside `h`). A rebuild resets container sizes.
+
+When it rebuilds — flatten the workspace, then build the tree again with `move` and `join-with` by
+window id, so focus does not move and a hidden workspace is rebuilt the same way:
+
+- On a pass, the first time, and whenever the template or the workspace's tiled windows differ from
+  what was last built (a tiled window opened, floated, tiled, or retitled into another slot).
+  A closed window only leaves a gap in the record; it rebuilds nothing.
+- When a tiled window arrives on the workspace (needs the fork events, see Requirements). A burst of
+  arrivals causes one rebuild.
+- On `aerospace-responsive arrange [ws]`, always (default: the focused workspace).
+- After AeroSpace restarts (its window ids restart). A daemon restart alone rebuilds nothing.
+
+Between triggers your hand-made changes stay; a trigger overwrites them. `pin` the workspace to keep a
+hand-made tree; `unpin` rebuilds it.
+While a template applies, the matching `[[layout]]` rule's `orientation`, `flatten` and `kind` do
+nothing on that workspace; placement still applies. When `when` does not match — say `C` docked to an
+external monitor — the `[[layout]]` rule owns the workspace there, and docking back rebuilds the tree.
+Removing a template sends no commands; the `[[layout]]` rule takes the workspace back on the next pass.
+
+Per workspace, the last block wins whole: top-level `[[workspace-template]]` in file order, then the
+active profile's `[[profile.workspace-template]]`. Load errors: empty `workspaces`, missing or bad
+`root`, missing or empty `tree`, an empty nested array, a slot without `app`, a bad `title` regex,
+`nth` in `when`, and unknown keys.
+
+Each command takes about 36 ms: a 3-window tree builds in ~0.3 s, a 6-window tree in ~1.2 s. A
+focused workspace redraws once per command.
+
+`status` gets one line (`workspace template: live; C applied`, or `inert`). `explain` shows each
+template, whether it applies on the monitor its workspace is on, and the window in every slot:
+
+```
+workspace-template:
+  C    root h   when builtin   [top-level #1]   on Built-in Retina Display: applies
+       record: up to date
+       tree:
+         1 jp.naver.line.mac                 44 LINE
+         2 v
+           2.1 com.igcl.app                  10 IGCL
+           2.2 com.google.Chrome.app.bbdei…  49 Messenger
+       rest: none
+```
+
+`record:` says what the next pass would do: `up to date`, `pending: first run | template changed |
+windows changed`, or `not applied: pinned | when does not match <monitor>`. `reconcile --dry-run`
+lists pending rebuilds and their commands; `arrange --dry-run` prints one workspace's commands; and
+`daemon --observe` logs them without running them.
+
 ## Rollback
 
 ```sh
 aerospace-responsive uninstall --yes
 ```
 
-Windows exclusive tiling floated stay floating, and `state.json` (pins, the lock, the rule's
-memory of what it floated) stays where it is; a reinstall picks it up.
+Windows exclusive tiling floated stay floating, a workspace a template built keeps its tree, and
+`state.json` (pins, the lock, the rule's memory of what it floated, what each template last built)
+stays where it is; a reinstall picks it up.
 
 ## Things it will never do
 

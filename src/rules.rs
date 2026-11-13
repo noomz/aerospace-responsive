@@ -3,7 +3,9 @@
 
 use crate::config::{Axis, Config, Kind, GapRule, Gaps, LayoutRule, MonitorSpec, PlacementRule, Pred, Profile, Rank, SetPred};
 use crate::display::Display;
+use crate::world::Snapshot;
 use serde::Serialize;
+use std::collections::BTreeSet;
 
 /// Why `p` rejects `d`, or `None` when every present field holds. Ignores `nth`: that is an
 /// ordinal over the set of matches, applied by `select`.
@@ -163,6 +165,16 @@ pub struct Resolved {
     /// One per attached display when the config has a `[gaps]` block; empty means `outer.top`
     /// is not this tool's to write.
     pub gaps: Vec<GapDecision>,
+    /// Effective workspace templates (V48), each with the attached monitors its `when` matches.
+    #[serde(skip)]
+    pub templates: Vec<TemplateDecision>,
+}
+
+/// A workspace's effective template and the aero ids of the monitors it applies on (V42).
+#[derive(Debug, Clone)]
+pub struct TemplateDecision {
+    pub template: crate::template::Template,
+    pub monitors: BTreeSet<u32>,
 }
 
 impl Resolved {
@@ -171,6 +183,22 @@ impl Resolved {
     }
     pub fn target_for(&self, ws: &str) -> Option<u32> {
         self.placement.iter().find(|p| p.workspace == ws).and_then(|p| p.target)
+    }
+
+    /// V42: the non-empty workspaces of `s` whose template applies on the monitor they are on,
+    /// pinned ones left out.
+    pub fn applying(&self, s: &Snapshot, pinned: &BTreeSet<String>) -> BTreeSet<String> {
+        s.nonempty()
+            .into_iter()
+            .filter(|ws| !pinned.contains(ws))
+            .filter(|ws| s.monitor_of(ws).is_some_and(|m| self.templates.iter().any(|d| &d.template.workspace == ws && d.monitors.contains(&m))))
+            .collect()
+    }
+
+    /// Workspaces whose root the `[[layout]]` rules leave alone: pinned (V11) or under an
+    /// applying template (V42).
+    pub fn hands_off(&self, s: &Snapshot, pinned: &BTreeSet<String>) -> BTreeSet<String> {
+        pinned.union(&self.applying(s, pinned)).cloned().collect()
     }
 
     /// Whether this setup makes the tool write `outer.top`.
@@ -219,6 +247,13 @@ pub fn resolve(cfg: &Config, ds: &[Display], lock: Option<&str>) -> Resolved {
         info,
         exclusive_tiling: crate::tiling::effective(cfg, profile),
         gaps,
+        templates: crate::template::effective(cfg, profile)
+            .into_iter()
+            .map(|t| {
+                let monitors = ds.iter().filter(|d| t.when.as_ref().is_none_or(|w| matches(w, d, cfg))).map(|d| d.aero_id).collect();
+                TemplateDecision { template: t, monitors }
+            })
+            .collect(),
     }
 }
 

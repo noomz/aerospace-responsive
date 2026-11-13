@@ -8,10 +8,11 @@ use crate::gaps;
 use crate::ipc::{Request, Response};
 use crate::paths;
 use crate::pass::{self, PassReport};
-use crate::render::{self, LastPass, MonitorView, PinView, StatusView, TilingStatus};
+use crate::render::{self, LastPass, MonitorView, PinView, StatusView, TemplateStatus, TilingStatus};
 use crate::restore::{self, RestoreCtx};
 use crate::rules::{self, ProfileMode, Resolved};
-use crate::state::{self, Class, Persisted, Pin, TilingMemory, Warnings};
+use crate::state::{self, Class, Persisted, Pin, TemplateRecords, TilingMemory, Warnings};
+use crate::template;
 use crate::tiling::{self, Leave, Plan, Rule};
 use crate::world::{self, WinInfo};
 use serde_json::{Value, json};
@@ -65,7 +66,7 @@ const EMPTY_RETRY: [Duration; 5] = [
     Duration::from_secs(8),
     Duration::from_secs(15),
 ];
-pub const INERT_HINT: &str = "exclusive tiling needs an AeroSpace with window-moved/window-closed (restart AeroSpace after installing)";
+pub const INERT_HINT: &str = "window events need an AeroSpace with window-moved/window-closed (restart AeroSpace after installing)";
 
 struct Pending {
     due: Instant,
@@ -118,6 +119,11 @@ pub struct Worker<A: Aero, S: FnMut() -> Vec<Screen>> {
     /// Exclusive tiling's memory as `state.json` had it: observe mode keeps its own changes
     /// in-process and writes this back instead (V15).
     tiling_on_disk: TilingMemory,
+    /// Template records as `state.json` had them: observe mode writes these back (V49).
+    templates_on_disk: TemplateRecords,
+    /// Arrivals (`window-moved`) per workspace since the queue was last drained: a template
+    /// rebuild waits until every queued event is judged (V45, V47).
+    arrivals: std::collections::BTreeMap<String, BTreeSet<u32>>,
 }
 
 fn reply_all(waiters: Vec<Sender<Response>>, r: Response) {
@@ -135,10 +141,16 @@ fn reasons(plans: &[Plan]) -> Vec<(String, String)> {
     plans.iter().map(|p| (p.workspace.clone(), p.describe())).collect()
 }
 
+/// (workspace, why it rebuilds) for the dry-run block.
+fn rebuild_reasons(rebuilds: &[pass::Rebuild]) -> Vec<(String, String)> {
+    rebuilds.iter().map(|b| (b.workspace.clone(), b.why.map_or("forced", |w| w.reason()).to_string())).collect()
+}
+
 impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     pub fn new(aero: A, screens: S, config_path: PathBuf, state_path: PathBuf, aero_up: bool, observe: bool) -> Self {
         let persisted = Persisted::load(&state_path);
         let tiling_on_disk = persisted.exclusive_tiling.clone();
+        let templates_on_disk = persisted.template_records.clone();
         let mut w = Worker {
             aero,
             screens,
@@ -168,6 +180,8 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             last_ds: None,
             known: Default::default(),
             tiling_on_disk,
+            templates_on_disk,
+            arrivals: Default::default(),
         };
         let _ = w.load_config();
         w
@@ -190,6 +204,11 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 // A steady stream of window events must not postpone a due pass or retry.
                 Ok(m) => {
                     self.handle(m);
+                    // V45, V47: judge everything already queued, then rebuild once.
+                    while let Ok(m) = rx.try_recv() {
+                        self.handle(m);
+                    }
+                    self.queue_drained();
                     self.tick(Instant::now());
                 }
                 Err(RecvTimeoutError::Timeout) => self.tick(Instant::now()),
@@ -257,7 +276,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         }
         if self.sub_retry_at.is_some_and(|t| t <= now) {
             self.sub_retry_at = None;
-            if self.sub.is_none() && self.config.has_exclusive_tiling() {
+            if self.sub.is_none() && self.config.wants_window_events() {
                 self.spawn_subscription();
             }
         }
@@ -283,7 +302,15 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     }
 
     fn aero_socket(&mut self, up: bool) {
+        let came_back = up && !self.aero_up;
         self.aero_up = up;
+        // V51: window ids restart with the server, so every record is void. Only on the edge:
+        // the watcher also reports a socket that was already up when the daemon started.
+        if came_back && !self.persisted.template_records.is_empty() {
+            self.persisted.template_records.clear();
+            crate::log!("workspace template: AeroSpace restarted; every record dropped");
+            self.save_state();
+        }
         if up {
             crate::log!("AeroSpace socket present; backstop pass in {}s", BACKSTOP_DELAY.as_secs());
             self.backstop = Some(Instant::now() + BACKSTOP_DELAY);
@@ -337,7 +364,16 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         }
         let before = self.persisted.exclusive_tiling.clone();
         let live = self.sub.is_some(); // inert: only removals converge (C3, V20)
-        let result = pass::run_pass(&mut self.aero, &r, &ds, &pinned, &self.abort, Some(&mut self.persisted.exclusive_tiling), live);
+        // V41 saves template records mid-pass, from a pre-pass copy for the rest; the save below
+        // brings converged tiling memory up to date.
+        let (base, path) = (self.persisted.clone(), self.state_path.clone());
+        let mut save = |recs: &TemplateRecords| {
+            if let Err(e) = (Persisted { template_records: recs.clone(), ..base.clone() }).save(&path) {
+                crate::log!("cannot save state: {e:#}");
+            }
+        };
+        let mem = pass::Memory { tiling: &mut self.persisted.exclusive_tiling, templates: &mut self.persisted.template_records, save: &mut save };
+        let result = pass::run_pass(&mut self.aero, &r, &ds, &pinned, &self.abort, Some(mem), live);
         if self.persisted.exclusive_tiling != before {
             self.save_state(); // also after an error: memory follows each executed command
         }
@@ -390,15 +426,15 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 return;
             }
         };
-        if let Some(prev) = self.persisted.gap_written.clone() {
-            if plan.on_disk.as_ref() != Some(&prev) {
-                let now = plan.on_disk.as_ref().map_or_else(|| "a shape this tool does not write".to_string(), |v| v.to_toml());
-                self.warn(
-                    Class::World,
-                    "gaps-writer",
-                    &format!("outer.top in {} is {now}, not the {prev:?} this tool wrote: another writer owns that line", path.display()),
-                );
-            }
+        if let Some(prev) = self.persisted.gap_written.clone()
+            && plan.on_disk.as_ref() != Some(&prev)
+        {
+            let now = plan.on_disk.as_ref().map_or_else(|| "a shape this tool does not write".to_string(), |v| v.to_toml());
+            self.warn(
+                Class::World,
+                "gaps-writer",
+                &format!("outer.top in {} is {now}, not the {prev:?} this tool wrote: another writer owns that line", path.display()),
+            );
         }
         if self.persisted.gap_written.as_ref() != Some(&want) {
             self.persisted.gap_written = Some(want.clone());
@@ -519,11 +555,10 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     }
 
     fn observe_pass(&mut self, r: &Resolved, ds: &[Display], pinned: &BTreeSet<String>, p: Pending) {
-        // V15: the converge is logged, and taken as done in-process only.
+        // V15, V49: converges and rebuilds are logged, and taken as done in-process only.
         let plans = self.converge_plans(&r.exclusive_tiling);
-        let text = match self.aero.windows() {
-            Ok(s) => {
-                let cmds = pass::dry_run(r, &s, ds, pinned, &plans);
+        let text = match self.predict(r, ds, pinned, &plans) {
+            Ok((cmds, rebuilds)) => {
                 crate::log!("observe: would run {} command(s)", cmds.len());
                 for c in &cmds {
                     crate::log!("  would run: {c}");
@@ -531,7 +566,10 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 for plan in &plans {
                     tiling::commit(&mut self.persisted.exclusive_tiling, plan);
                 }
-                render::dry_run(r, &cmds, &reasons(&plans))
+                for b in &rebuilds {
+                    self.persisted.template_records.insert(b.workspace.clone(), b.record.clone());
+                }
+                render::dry_run(r, &cmds, &reasons(&plans), &rebuild_reasons(&rebuilds))
             }
             Err(e) => format!("observe: {e:#}\n"),
         };
@@ -648,7 +686,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
 
     fn save_state(&mut self) {
         let saved = if self.observe {
-            &Persisted { exclusive_tiling: self.tiling_on_disk.clone(), ..self.persisted.clone() }
+            &Persisted { exclusive_tiling: self.tiling_on_disk.clone(), template_records: self.templates_on_disk.clone(), ..self.persisted.clone() }
         } else {
             &self.persisted
         };
@@ -660,11 +698,12 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     // ---------- exclusive tiling: the subscribe child (V14) ----------
 
     /// On a trigger that may have fixed the connection (Startup, config reload, unlock,
-    /// AeroSpace's socket appearing, explicit reconcile): run the child iff a rule exists.
+    /// AeroSpace's socket appearing, explicit reconcile): run the child iff a rule or a
+    /// workspace template exists (V53).
     fn ensure_subscription(&mut self) {
-        if !self.config.has_exclusive_tiling() {
+        if !self.config.wants_window_events() {
             if self.sub.take().is_some() {
-                crate::log!("exclusive tiling: no rule left; subscribe child stopped");
+                crate::log!("window events: no rule or template left; subscribe child stopped");
             }
             self.sub_retry_at = None;
             self.inert = None;
@@ -710,7 +749,12 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     /// The child is gone (or never started): inert, warn, and retry a bounded number of times.
     fn sub_failed(&mut self, how: String, stderr: String) {
         let detail = if stderr.is_empty() { String::new() } else { format!(" ({stderr})") };
-        self.warn(Class::ExclusiveTiling, "exclusive-tiling", &format!("exclusive tiling is inert: {how}{detail}. Hint: {INERT_HINT}"));
+        let what = match (self.config.has_exclusive_tiling(), self.config.has_workspace_template()) {
+            (true, true) => "exclusive tiling and workspace-template arrivals are",
+            (false, true) => "workspace-template arrivals are",
+            _ => "exclusive tiling is",
+        };
+        self.warn(Class::ExclusiveTiling, "exclusive-tiling", &format!("{what} inert: {how}{detail}. Hint: {INERT_HINT}"));
         self.inert = Some(how);
         if let Some(d) = SUB_RETRY.get(self.sub_retries) {
             self.sub_retry_at = Some(Instant::now() + *d);
@@ -735,6 +779,11 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             self.apply_leave(w, &wins, &rules);
             changed = true;
         }
+        for ws in template::stale_records(&self.persisted.template_records, &wins) {
+            self.persisted.template_records.remove(&ws);
+            crate::log!("workspace template: {ws} record dropped (its windows changed while disconnected)");
+            changed = true;
+        }
         if changed {
             self.save_state();
         }
@@ -750,6 +799,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             Leave::Retile => {
                 if self.exec(&Cmd::Tile { id: w.id }, &format!("left for {}", w.workspace)) {
                     self.persisted.exclusive_tiling.remove(w.id);
+                    self.drop_template_record(&w.workspace);
                 }
             }
             Leave::StayFloated(why) => {
@@ -767,7 +817,8 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let (id, workspace, app) = match ev {
             WindowEvent::WindowClosed { id, app, .. } => {
                 self.known.remove(&id);
-                if self.persisted.exclusive_tiling.floated_on(id, &app).is_some() && self.persisted.exclusive_tiling.remove(id) {
+                let floated = self.persisted.exclusive_tiling.floated_on(id, &app).is_some() && self.persisted.exclusive_tiling.remove(id);
+                if template::forget(&mut self.persisted.template_records, id) | floated {
                     self.save_state();
                 }
                 return;
@@ -776,6 +827,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             WindowEvent::WindowDetected {} => unreachable!("handle routes window-detected to a verify"),
         };
         self.known.insert(id, workspace.clone()); // judged below; later arrivals count it
+        self.arrivals.entry(workspace.clone()).or_default().insert(id);
         let left = self.persisted.exclusive_tiling.floated_on(id, &app).is_some_and(|ws| ws != workspace);
         let rules = self.current_rules();
         let rule = rules.iter().find(|r| r.workspace == workspace).cloned();
@@ -814,6 +866,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             Some(tiling::Arrival::Float(why)) => {
                 if self.exec(&Cmd::Float { id }, &format!("arrived on {workspace}: {why}")) {
                     self.persisted.exclusive_tiling.insert(workspace, id, &w.app);
+                    self.drop_template_record(workspace);
                     changed = true;
                 }
             }
@@ -828,6 +881,93 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         if changed {
             self.save_state();
         }
+    }
+
+    /// V52: a float or tile the daemon sent changed a template workspace's tiled set (an
+    /// arrival verdict, which also catches a late pre-layout answer, or a retile on a leave). Dropping
+    /// its record makes the queue drain or the next pass rebuild. A pinned workspace keeps its
+    /// record (V46). The caller saves.
+    fn drop_template_record(&mut self, ws: &str) {
+        if !self.persisted.pins.iter().any(|p| p.workspace == ws) && self.persisted.template_records.remove(ws).is_some() {
+            crate::log!("workspace template: {ws} record dropped (the daemon changed its tiled windows)");
+        }
+    }
+
+    /// V40 (b), V45, V47: every queued window event is judged; now each workspace an arrival
+    /// landed on rebuilds once, if its template applies and an arrived window is still tiled
+    /// there. One read of the monitors' windows, one of window details. Never debounced.
+    pub fn queue_drained(&mut self) {
+        let arrivals = std::mem::take(&mut self.arrivals);
+        // Before the first gated pass, that pass decides (V40 a).
+        let (false, Some(ds), true) = (arrivals.is_empty(), self.last_ds.clone(), self.aero_up) else { return };
+        let r = rules::resolve(&self.config, &ds, self.persisted.lock.as_deref());
+        if !r.templates.iter().any(|d| arrivals.contains_key(&d.template.workspace)) {
+            return; // no read for a workspace without a template
+        }
+        let (s, details) = match (self.aero.windows(), self.aero.window_details()) {
+            (Ok(s), Ok(d)) => (s, d),
+            (Err(e), _) | (_, Err(e)) => return crate::log!("workspace template: window read failed; the next pass decides: {e:#}"),
+        };
+        let applying = r.applying(&s, &self.persisted.pinned_names());
+        let due = r.templates.iter().map(|d| &d.template).filter(|t| {
+            applying.contains(&t.workspace)
+                && arrivals.get(&t.workspace).is_some_and(|ids| details.iter().any(|w| ids.contains(&w.id) && w.workspace == t.workspace && w.tiled()))
+        });
+        let due: Vec<template::Template> = due.cloned().collect();
+        for t in &due {
+            let _ = self.rebuild(t, &details, "window arrived");
+        }
+    }
+
+    /// One forced rebuild outside a pass (V41: the record only after the last command). A failure
+    /// or abort leaves no record and arms one re-pass (V47 exception, B8): the partial tree must
+    /// not wait for an unrelated trigger. Observe logs, records in-process (V49). Ok = the
+    /// commands that ran (none: no tiled window); Err = why it did not finish.
+    fn rebuild(&mut self, t: &template::Template, details: &[WinInfo], why: &str) -> Result<Vec<Cmd>, String> {
+        let b = pass::Rebuild::of(t, details, &self.persisted.template_records);
+        let cmds = b.cmds.clone();
+        let result = if self.observe {
+            for c in &cmds {
+                crate::log!("workspace template: would run: {c}");
+            }
+            if !cmds.is_empty() {
+                self.persisted.template_records.insert(b.workspace, b.record);
+            }
+            Ok(if cmds.is_empty() { pass::Rebuilt::Nothing } else { pass::Rebuilt::Built })
+        } else {
+            let (base, path) = (self.persisted.clone(), self.state_path.clone());
+            let mut save = |recs: &TemplateRecords| {
+                if let Err(e) = (Persisted { template_records: recs.clone(), ..base.clone() }).save(&path) {
+                    crate::log!("cannot save state: {e:#}");
+                }
+            };
+            let mut executed = vec![];
+            let r = pass::run_rebuild(&mut self.aero, b, &mut self.persisted.template_records, &mut save, &self.abort, &mut executed);
+            for e in &executed {
+                crate::log!("  {}  ({} ms)", e.cmd, e.ms);
+            }
+            r
+        };
+        let what = match result {
+            Ok(pass::Rebuilt::Built) => {
+                crate::log!("workspace template: {} rebuilt ({why})", t.workspace);
+                return Ok(cmds);
+            }
+            Ok(pass::Rebuilt::Nothing) => return Ok(vec![]),
+            Ok(pass::Rebuilt::Aborted) => "aborted".to_string(),
+            Err(e) => format!("failed: {e:#}"),
+        };
+        crate::log!("workspace template: {} rebuild {what}; one re-pass", t.workspace);
+        self.arm(Trigger::Repass, true, None);
+        Err(format!("{} rebuild {what}; a re-pass will finish it", t.workspace))
+    }
+
+    /// `reconcile --dry-run` and observe: the commands a full pass would issue now, and the
+    /// template rebuilds among them.
+    fn predict(&mut self, r: &Resolved, ds: &[Display], pinned: &BTreeSet<String>, plans: &[Plan]) -> anyhow::Result<(Vec<Cmd>, Vec<pass::Rebuild>)> {
+        let s = self.aero.windows()?;
+        let details = if r.templates.is_empty() { vec![] } else { self.aero.window_details()? };
+        Ok(pass::dry_run(r, &s, ds, pinned, plans, &self.persisted.template_records, &details))
     }
 
     /// The converge plans a pass would run now, against a fresh window read: while inert only
@@ -939,6 +1079,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             Request::ProfileLock { name } => self.lock(name),
             Request::ProfileUnlock => Ok(self.unlock()),
             Request::Reload => self.reload(),
+            Request::Arrange { workspace, dry_run } => self.arrange(workspace, dry_run),
             Request::PreLayout { windows, moved } => Ok(self.pre_layout(windows, moved)),
         };
         let _ = reply.send(resp.unwrap_or_else(Response::err));
@@ -977,17 +1118,40 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let r = rules::resolve(&cfg, &ds, self.persisted.lock.as_deref());
         let mut text = render::explain(&r);
         let mut j = json!(r);
-        if !r.exclusive_tiling.is_empty() || !self.persisted.exclusive_tiling.records.is_empty() {
-            let wins = self.aero.window_details().ok(); // one read, answered between passes
+        let ruled = !r.exclusive_tiling.is_empty() || !self.persisted.exclusive_tiling.records.is_empty();
+        if !ruled && r.templates.is_empty() {
+            return Ok(Response::ok(text, j));
+        }
+        let wins = self.aero.window_details().ok(); // one read, answered between passes
+        let state = self.tiling_state();
+        let note = match state {
+            "inert" => Some(format!("inert: {}", self.inert.as_deref().unwrap_or("not subscribed to window events"))),
+            "observe" => Some("observe".to_string()),
+            _ => None,
+        };
+        if ruled {
             let views = tiling::view(&r.exclusive_tiling, &self.persisted.exclusive_tiling, wins.as_deref());
-            let state = self.tiling_state();
-            let note = match state {
-                "inert" => Some(format!("inert: {}", self.inert.as_deref().unwrap_or("not subscribed to window events"))),
-                "observe" => Some("observe".to_string()),
-                _ => None,
-            };
             text.push_str(&render::exclusive_tiling(&views, note.as_deref()));
             j["exclusive_tiling"] = json!({ "state": state, "inert": self.inert, "workspaces": views });
+        }
+        if !r.templates.is_empty() {
+            // V42 judges `when` after placement: a non-empty workspace counts on its target.
+            let s = self.aero.windows().unwrap_or_default();
+            let at = self
+                .aero
+                .workspaces()
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|w| {
+                            let m = r.target_for(&w.workspace).filter(|_| s.is_nonempty(&w.workspace)).unwrap_or(w.monitor);
+                            (w.workspace, m)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let views = template::view(&r.templates, &self.persisted.template_records, &self.persisted.pinned_names(), &at, &ds, wins.as_deref().unwrap_or_default());
+            text.push_str(&render::workspace_template(&views, note.as_deref()));
+            j["workspace_template"] = json!({ "state": state, "inert": self.inert, "workspaces": views });
         }
         Ok(Response::ok(text, j))
     }
@@ -995,14 +1159,15 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     fn dry_run(&mut self, path: Option<PathBuf>) -> Result<Response, String> {
         let cfg = self.candidate(path)?;
         let ds = self.world()?;
-        let s = self.aero.windows().map_err(fmt_err)?;
         let r = rules::resolve(&cfg, &ds, self.persisted.lock.as_deref());
         let plans = self.converge_plans(&r.exclusive_tiling);
-        let cmds = pass::dry_run(&r, &s, &ds, &self.persisted.pinned_names(), &plans);
+        let (cmds, rebuilds) = self.predict(&r, &ds, &self.persisted.pinned_names(), &plans).map_err(fmt_err)?;
         let lines: Vec<String> = cmds.iter().map(|c| c.to_string()).collect();
-        let converge: Vec<Value> = reasons(&plans).into_iter().map(|(ws, why)| json!({ "workspace": ws, "reason": why })).collect();
-        let text = format!("{}{}", render::dry_run(&r, &cmds, &reasons(&plans)), render::gaps(&r));
-        Ok(Response::ok(text, json!({ "placement": r.placement, "converge": converge, "commands": lines, "gaps": r.gaps })))
+        let pairs = |v: Vec<(String, String)>| -> Vec<Value> { v.into_iter().map(|(ws, why)| json!({ "workspace": ws, "reason": why })).collect() };
+        let (converge, rebuild) = (reasons(&plans), rebuild_reasons(&rebuilds));
+        let text = format!("{}{}", render::dry_run(&r, &cmds, &converge, &rebuild), render::gaps(&r));
+        let j = json!({ "placement": r.placement, "converge": pairs(converge), "rebuild": pairs(rebuild), "commands": lines, "gaps": r.gaps });
+        Ok(Response::ok(text, j))
     }
 
     fn monitors(&mut self) -> Result<Response, String> {
@@ -1041,6 +1206,10 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 state: self.tiling_state().into(),
                 inert: self.sub.is_none().then(|| self.inert.clone().unwrap_or_else(|| "not subscribed to window events".into())),
                 rule_floated: self.persisted.exclusive_tiling.counts(),
+            }),
+            workspace_template: self.config.has_workspace_template().then(|| TemplateStatus {
+                state: if self.sub.is_some() { "live" } else { "inert" }.into(),
+                applied: self.persisted.template_records.keys().cloned().collect(),
             }),
         };
         let mut resp = Response::ok(render::status(&view), json!(view));
@@ -1103,9 +1272,55 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         if removed.is_empty() {
             return Err("nothing to unpin".into());
         }
+        for w in &removed {
+            self.persisted.template_records.remove(w); // V46: the armed pass rebuilds it
+        }
         self.save_state();
         self.arm(Trigger::Unpin, true, None); // D17: unpin is a trigger
         Ok(Response::ok(format!("unpinned {}\n", removed.join(" ")), Value::Null))
+    }
+
+    /// I.tpl.cli.arrange: rebuild `ws` now, even when its record is equal (V40 c). Refuses a
+    /// workspace with no template, one whose `when` fails on its monitor, and a pinned one (V46).
+    fn arrange(&mut self, ws: Option<String>, dry_run: bool) -> Result<Response, String> {
+        let ws = match ws {
+            Some(w) => w,
+            None => self.focused_ws()?,
+        };
+        let ds = self.world()?;
+        let r = rules::resolve(&self.config, &ds, self.persisted.lock.as_deref());
+        let d = r.templates.iter().find(|d| d.template.workspace == ws).ok_or_else(|| format!("{ws}: no template"))?;
+        let rows = self.aero.workspaces().map_err(fmt_err)?;
+        let at = rows.iter().find(|row| row.workspace == ws).map(|row| row.monitor);
+        if !at.is_some_and(|m| d.monitors.contains(&m)) {
+            let name = at.map_or("(no monitor)".to_string(), |m| ds.iter().find(|x| x.aero_id == m).map_or(format!("monitor {m}"), |x| x.aero_name.clone()));
+            return Err(format!("{ws}: when does not match {name}"));
+        }
+        if self.persisted.pins.iter().any(|p| p.workspace == ws) {
+            return Err(format!("{ws} is pinned; unpin it first"));
+        }
+        let t = d.template.clone();
+        let details = self.aero.window_details().map_err(fmt_err)?;
+        let planned = pass::Rebuild::of(&t, &details, &self.persisted.template_records).cmds;
+        // No tiled window: nothing to build, and the record stays (V41: an empty workspace keeps it).
+        let cmds = if dry_run || planned.is_empty() || self.observe {
+            if self.observe && !dry_run && !planned.is_empty() {
+                self.rebuild(&t, &details, "arrange")?; // logs, records in-process (V49)
+            }
+            planned
+        } else {
+            let cmds = self.rebuild(&t, &details, "arrange")?;
+            self.arrivals.remove(&ws); // V47: this rebuild already saw them
+            cmds
+        };
+        let lines: Vec<String> = cmds.iter().map(|c| c.to_string()).collect();
+        let text = match (cmds.is_empty(), dry_run) {
+            (true, _) => format!("{ws} has no tiled window: nothing to arrange\n"),
+            (false, true) => format!("commands:\n{}", lines.iter().map(|l| format!("  {l}\n")).collect::<String>()),
+            (false, false) if self.observe => format!("observe: nothing executed\ncommands:\n{}", lines.iter().map(|l| format!("  {l}\n")).collect::<String>()),
+            (false, false) => format!("arranged {ws}: {} command(s)\n", cmds.len()),
+        };
+        Ok(Response::ok(text, json!({ "workspace": ws, "commands": lines })))
     }
 
     fn pins(&mut self) -> Response {
@@ -1157,6 +1372,7 @@ mod tests {
     use super::*;
     use crate::aero::{Aero, Cmd};
     use crate::config::Axis;
+    use crate::template::Tree;
     use crate::testutil::{FakeAero, desk3};
     use std::sync::mpsc;
 
@@ -1233,7 +1449,7 @@ mod tests {
         let text = std::fs::read_to_string(&aero_cfg).unwrap();
         assert!(text.contains("outer.top = [{ monitor.2 = 20 }, 1]"), "{text}");
         assert!(text.contains("inner.horizontal = 8   # tight"), "the rest of the file is untouched: {text}");
-        assert!(w.aero.log.iter().any(|c| *c == Cmd::ReloadConfig), "AeroSpace must be told to reread");
+        assert!(w.aero.log.contains(&Cmd::ReloadConfig), "AeroSpace must be told to reread");
         // Steady state: a second pass writes nothing and never reloads.
         let n = w.aero.log.len();
         w.handle(Msg::Trigger(Trigger::Display));
@@ -1278,7 +1494,7 @@ mod tests {
         w.handle(Msg::Trigger(Trigger::Display));
         w.tick(later());
         assert_eq!(std::fs::read_to_string(&aero_cfg).unwrap(), "[gaps]\nouter.top = 42\n");
-        assert!(!w.aero.log.iter().any(|c| *c == Cmd::ReloadConfig));
+        assert!(!w.aero.log.contains(&Cmd::ReloadConfig));
         assert!(w.persisted.gap_written.is_none());
     }
 
@@ -1980,5 +2196,409 @@ mod tests {
         assert!(r.text.contains("move-workspace-to-monitor --workspace 1"));
         assert_eq!(ask(&mut w, Request::Explain { config: None }).exit, 0);
         assert!(w.aero.log.is_empty());
+    }
+
+    // ---------- workspace template: window events (T37) ----------
+
+    /// `C` on the built-in: `h[line, v[igcl, msgr]]`.
+    const TPL: &str = "\n[[workspace-template]]\nworkspaces = [\"C\"]\nwhen = { builtin = true }\nroot = \"h\"\ntree = [{ app = \"line\" }, [{ app = \"igcl\" }, { app = \"msgr\" }]]\n";
+
+    /// A worker with LINE 44 and IGCL 10 tiled on `C` (built-in), gated against desk3.
+    fn tpl_worker(extra: &str) -> (TestWorker, tempfile::TempDir) {
+        let mut f = docked();
+        f.add_window("C", 44, "line", "LINE", false);
+        f.add_window("C", 10, "igcl", "IGCL", false);
+        let (mut w, d) = live(f, &format!("{TPL}{extra}"));
+        w.last_ds = Some(desk3());
+        (w, d)
+    }
+
+    fn flattens(log: &[Cmd]) -> usize {
+        log.iter().filter(|c| matches!(c, Cmd::Flatten { ws } if ws == "C")).count()
+    }
+
+    #[test]
+    fn a_burst_of_arrivals_rebuilds_once_after_the_queue_is_judged() {
+        let (mut w, d) = tpl_worker("");
+        for id in [49, 50] {
+            w.aero.add_window("C", id, "msgr", "Messenger", false);
+            w.handle(moved(id, "C", None, "msgr"));
+        }
+        assert!(w.aero.log.is_empty(), "no rebuild before the queue is drained: {:?}", w.aero.log);
+        w.queue_drained();
+        assert_eq!(flattens(&w.aero.log), 1, "{:?}", w.aero.log);
+        assert_eq!(
+            w.aero.tree("C"),
+            Tree::Split(Axis::H, vec![Tree::Win(44), Tree::Split(Axis::V, vec![Tree::Win(10), Tree::Win(49), Tree::Win(50)])])
+        );
+        let rec = &Persisted::load(&d.path().join("state.json")).template_records["C"];
+        assert_eq!(rec.slots["2.2"], [49, 50], "record saved after the last command");
+        assert!(w.pending.is_none(), "V47: never arms a pass");
+        w.aero.log.clear();
+        w.queue_drained();
+        assert!(w.aero.log.is_empty(), "nothing queued, nothing rebuilt");
+    }
+
+    #[test]
+    fn arrivals_elsewhere_or_on_a_pinned_template_workspace_send_nothing() {
+        let (mut w, _d) = tpl_worker("");
+        w.aero.add_window("T", 77, KITTY, "", false);
+        w.handle(moved(77, "T", None, KITTY));
+        w.queue_drained();
+        assert!(w.aero.log.is_empty(), "T has no template: {:?}", w.aero.log);
+        w.persisted.pin(Pin { workspace: "C".into(), cg_id: 0, monitor_name: String::new() });
+        w.aero.add_window("C", 49, "msgr", "Messenger", false);
+        w.handle(moved(49, "C", None, "msgr"));
+        w.queue_drained();
+        assert!(w.aero.log.is_empty(), "V46: pinned: {:?}", w.aero.log);
+    }
+
+    #[test]
+    fn an_arrival_the_rule_floats_triggers_no_rebuild_and_drops_the_record() {
+        let rule = "\n[[exclusive-tiling]]\nworkspaces = [\"C\"]\ntiling-allowlist = [{ app = \"line\", max-tiled = 1 }, { app = \"igcl\", max-tiled = 1 }]\n";
+        let (mut w, d) = tpl_worker(rule);
+        w.handle(moved(44, "C", None, "line"));
+        w.queue_drained();
+        assert!(w.persisted.template_records.contains_key("C"), "first rebuild leaves a record");
+        w.aero.log.clear();
+        w.aero.add_window("C", 49, "msgr", "Messenger", false);
+        w.handle(moved(49, "C", None, "msgr"));
+        w.queue_drained();
+        assert_eq!(w.aero.log, [Cmd::Float { id: 49 }], "floated, then not tiled: no rebuild (V40 b)");
+        assert!(!w.persisted.template_records.contains_key("C"), "V52: the daemon's float drops the record");
+        assert!(!Persisted::load(&d.path().join("state.json")).template_records.contains_key("C"), "and saves");
+    }
+
+    #[test]
+    fn a_closed_window_leaves_the_record_without_commands() {
+        let (mut w, d) = tpl_worker("");
+        w.aero.add_window("C", 49, "msgr", "Messenger", false);
+        w.handle(moved(49, "C", None, "msgr"));
+        w.queue_drained();
+        w.aero.log.clear();
+        w.aero.close_window(49);
+        w.handle(Msg::Window(WindowEvent::WindowClosed { id: 49, workspace: "C".into(), app: "msgr".into() }));
+        w.queue_drained();
+        assert!(w.aero.log.is_empty(), "{:?}", w.aero.log);
+        let rec = &Persisted::load(&d.path().join("state.json")).template_records["C"];
+        assert!(rec.slots["2.2"].is_empty() && rec.slots["1"] == [44], "{rec:?}");
+        // The next pass compares equal: the record follows the close (V41).
+        let wins = w.aero.window_details().unwrap();
+        let t = &rules::resolve(&w.config, &desk3(), None).templates[0].template;
+        assert_eq!(template::pending(Some(rec), &template::wanted(t, &wins.into_iter().filter(|x| x.workspace == "C").collect::<Vec<_>>())), None);
+    }
+
+    #[test]
+    fn a_retile_on_leave_drops_the_record_and_the_arrival_rebuilds() {
+        let (mut w, _d) = tpl_worker(RULE);
+        w.handle(moved(44, "C", None, "line"));
+        w.queue_drained();
+        assert!(w.persisted.template_records.contains_key("C"));
+        // Kitty 77 was floated by T's rule; the user moves it to C, where no rule holds it.
+        w.aero.add_window("T", 77, KITTY, "", true);
+        w.persisted.exclusive_tiling.insert("T", 77, KITTY);
+        w.aero.move_window(77, "C");
+        w.aero.log.clear();
+        w.handle(moved(77, "C", Some("T"), KITTY));
+        assert_eq!(w.aero.log, [Cmd::Tile { id: 77 }]);
+        assert!(!w.persisted.template_records.contains_key("C"), "V52: the daemon's tile drops the record");
+        w.queue_drained();
+        assert_eq!(flattens(&w.aero.log), 1, "now tiled on C: the arrival rebuilds");
+        assert_eq!(w.persisted.template_records["C"].rest, [77]);
+    }
+
+    #[test]
+    fn a_drain_rebuild_stopped_halfway_arms_one_repass() {
+        let (mut w, _d) = tpl_worker("");
+        w.aero.add_window("C", 49, "msgr", "Messenger", false);
+        w.handle(moved(49, "C", None, "msgr"));
+        w.abort.store(true, Ordering::SeqCst); // a display change mid-rebuild; a failed command takes the same branch
+        w.queue_drained();
+        assert!(!w.persisted.template_records.contains_key("C"), "no record after a partial rebuild (V41)");
+        let p = w.pending.as_ref().expect("B8: a re-pass is armed");
+        assert!(p.full && p.repass && p.trigger == Trigger::Repass);
+    }
+
+    /// Sends `inject` into the worker's inbox when the first `C` flatten runs: events that
+    /// arrive during a rebuild.
+    struct Inject {
+        f: FakeAero,
+        inject: Option<(Sender<Msg>, Vec<Msg>)>,
+        log: std::sync::Arc<std::sync::Mutex<Vec<Cmd>>>,
+    }
+
+    impl Aero for Inject {
+        fn monitors(&mut self) -> anyhow::Result<Vec<crate::world::AeroMonitor>> {
+            self.f.monitors()
+        }
+        fn windows(&mut self) -> anyhow::Result<crate::world::Snapshot> {
+            self.f.windows()
+        }
+        fn workspaces(&mut self) -> anyhow::Result<Vec<crate::world::WorkspaceRow>> {
+            self.f.workspaces()
+        }
+        fn window_details(&mut self) -> anyhow::Result<Vec<WinInfo>> {
+            self.f.window_details()
+        }
+        fn run(&mut self, cmd: &Cmd) -> Result<(), String> {
+            self.log.lock().unwrap().push(cmd.clone());
+            if matches!(cmd, Cmd::Flatten { ws } if ws == "C")
+                && let Some((tx, msgs)) = self.inject.take()
+            {
+                for id in [50, 51] {
+                    self.f.add_window("C", id, "msgr", "Messenger", false);
+                }
+                for m in msgs {
+                    tx.send(m).unwrap();
+                }
+            }
+            self.f.run(cmd)
+        }
+        fn subscribe(&mut self, sink: crate::aero::Sink) -> anyhow::Result<crate::aero::Subscription> {
+            self.f.subscribe(sink)
+        }
+    }
+
+    #[test]
+    fn events_during_a_rebuild_are_judged_together_and_rebuild_once_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg.toml");
+        std::fs::write(&cfg, format!("{EXAMPLE}{TPL}")).unwrap();
+        let mut f = docked();
+        f.add_window("C", 44, "line", "LINE", false);
+        f.add_window("C", 10, "igcl", "IGCL", false);
+        f.add_window("C", 49, "msgr", "Messenger", false);
+        let (tx, rx) = mpsc::channel();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let inject = Inject { f, inject: Some((tx.clone(), vec![moved(50, "C", None, "msgr"), moved(51, "C", None, "msgr")])), log: log.clone() };
+        let mut w = Worker::new(inject, all_screens(), cfg, dir.path().join("state.json"), true, false);
+        w.last_ds = Some(desk3());
+        tx.send(moved(49, "C", None, "msgr")).unwrap();
+        drop(tx);
+        w.run(rx); // returns once the inbox is drained and every sender is gone
+        assert_eq!(flattens(&log.lock().unwrap()), 2, "one rebuild, then one for both events queued during it: {:?}", log.lock().unwrap());
+        let rec = &Persisted::load(&dir.path().join("state.json")).template_records["C"];
+        assert_eq!(rec.slots["2.2"], [49, 50, 51]);
+    }
+
+    // ---------- workspace template: lifecycle (T38) ----------
+
+    /// `tpl_worker` after one arrival rebuild of `C`: a record for LINE 44, IGCL 10, Messenger 49.
+    fn tpl_built() -> (TestWorker, tempfile::TempDir) {
+        let (mut w, d) = tpl_worker("");
+        w.aero.add_window("C", 49, "msgr", "Messenger", false);
+        w.handle(moved(49, "C", None, "msgr"));
+        w.queue_drained();
+        assert!(w.persisted.template_records.contains_key("C"));
+        w.aero.log.clear();
+        (w, d)
+    }
+
+    fn disk_has_record(d: &tempfile::TempDir, ws: &str) -> bool {
+        Persisted::load(&d.path().join("state.json")).template_records.contains_key(ws)
+    }
+
+    #[test]
+    fn a_template_alone_runs_the_subscribe_child_and_warns_when_inert() {
+        let (mut w, d) = worker_cfg(docked(), TPL, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        assert_eq!(w.aero.live_subs(), 1, "V53: a template without a rule still subscribes");
+        exit(&mut w, 2);
+        let st = ask(&mut w, Request::Status);
+        assert_eq!(st.exit, 4, "inert is a pending warning");
+        assert!(st.text.contains("workspace-template arrivals are inert: aerospace subscribe exited 2"), "{}", st.text);
+        assert!(w.sub_retry_at.is_some(), "the retry is shared");
+        w.tick(later());
+        assert_eq!(w.aero.live_subs(), 1, "and respawns");
+        set_config(&mut w, &d, "");
+        assert_eq!(w.aero.live_subs(), 0, "no rule and no template: the child stops");
+    }
+
+    #[test]
+    fn a_reconnect_resync_drops_a_record_whose_windows_changed() {
+        let (mut w, d) = tpl_built();
+        exit(&mut w, 1);
+        w.tick(later());
+        assert_eq!(w.aero.live_subs(), 1);
+        assert!(disk_has_record(&d, "C"), "nothing missed: the record stays");
+        // Messenger closes while no child listens; C is pinned meanwhile (V53 names no exemption).
+        w.aero.close_window(49);
+        w.persisted.pin(Pin { workspace: "C".into(), cg_id: 0, monitor_name: String::new() });
+        exit(&mut w, 1);
+        w.tick(later());
+        assert!(!w.persisted.template_records.contains_key("C") && !disk_has_record(&d, "C"), "dropped and saved");
+        assert!(w.aero.log.is_empty(), "no commands: {:?}", w.aero.log);
+    }
+
+    #[test]
+    fn records_die_with_the_aerospace_server_not_with_the_daemon() {
+        let (mut w, d) = tpl_built();
+        w.handle(Msg::AeroSocket(true)); // the watcher's first report: the socket was already up
+        assert!(disk_has_record(&d, "C"), "V51: a daemon restart alone keeps records");
+        w.handle(Msg::AeroSocket(false));
+        assert!(disk_has_record(&d, "C"));
+        w.handle(Msg::AeroSocket(true));
+        assert!(w.persisted.template_records.is_empty() && !disk_has_record(&d, "C"), "V51: the server came back");
+        assert!(w.aero.log.is_empty(), "no commands: the next pass rebuilds");
+    }
+
+    #[test]
+    fn unpin_drops_the_record_and_arms_a_pass() {
+        let (mut w, d) = tpl_built();
+        w.persisted.pin(Pin { workspace: "C".into(), cg_id: 0, monitor_name: String::new() });
+        w.drop_template_record("C");
+        assert!(w.persisted.template_records.contains_key("C"), "pinned keeps its record");
+        let r = ask(&mut w, Request::Unpin { workspace: Some("C".into()), all: false });
+        assert_eq!(r.exit, 0, "{}", r.text);
+        assert!(!disk_has_record(&d, "C"), "V46: unpin drops the record");
+        let p = w.pending.as_ref().expect("and arms a pass");
+        assert!(p.full && p.trigger == Trigger::Unpin);
+    }
+
+    #[test]
+    fn a_pre_layout_request_with_a_template_alone_answers_nothing_and_the_arrival_still_rebuilds() {
+        let (mut w, _d) = tpl_worker("");
+        assert_eq!(w.aero.live_subs(), 1, "V53: the child runs, so pre-layout takes the full path");
+        w.aero.add_window("C", 49, "msgr", "Messenger", false);
+        let wins = w.aero.window_details().unwrap();
+        let r = ask(&mut w, Request::PreLayout { windows: wins, moved: vec![49] });
+        assert_eq!(r.json, serde_json::json!([]), "no rule, no answer");
+        w.handle(moved(49, "C", None, "msgr"));
+        w.queue_drained();
+        assert_eq!(flattens(&w.aero.log), 1, "{:?}", w.aero.log);
+    }
+
+    // ---------- workspace template: surfaces (T39) ----------
+
+    fn arrange(w: &mut TestWorker, ws: Option<&str>, dry_run: bool) -> Response {
+        ask(w, Request::Arrange { workspace: ws.map(Into::into), dry_run })
+    }
+
+    #[test]
+    fn arrange_refuses_and_names_why() {
+        let (mut w, _d) = tpl_worker("");
+        let r = arrange(&mut w, None, false);
+        assert_eq!((r.exit, r.text.as_str()), (1, "T: no template"), "default: the focused workspace");
+        w.aero.run(&Cmd::Move { ws: "C".into(), monitor: 3, target: "3".into() }).unwrap();
+        let r = arrange(&mut w, Some("C"), false);
+        assert_eq!((r.exit, r.text.as_str()), (1, "C: when does not match LEN T23i-10 (1)"));
+        w.aero.run(&Cmd::Move { ws: "C".into(), monitor: 2, target: "2".into() }).unwrap();
+        w.aero.log.clear();
+        w.persisted.pin(Pin { workspace: "C".into(), cg_id: 0, monitor_name: String::new() });
+        let r = arrange(&mut w, Some("C"), false);
+        assert_eq!((r.exit, r.text.as_str()), (1, "C is pinned; unpin it first"));
+        assert!(w.aero.log.is_empty(), "{:?}", w.aero.log);
+    }
+
+    #[test]
+    fn arrange_with_no_tiled_window_keeps_the_record() {
+        let (mut w, d) = tpl_built();
+        for id in [44, 10, 49] {
+            w.aero.close_window(id);
+        }
+        let r = arrange(&mut w, Some("C"), false);
+        assert_eq!((r.exit, r.text.as_str()), (0, "C has no tiled window: nothing to arrange\n"));
+        assert!(disk_has_record(&d, "C") && w.persisted.template_records.contains_key("C"), "V41: an empty workspace keeps its record");
+        assert!(w.aero.log.is_empty());
+    }
+
+    #[test]
+    fn arrange_rebuilds_now_even_when_the_record_is_equal() {
+        let (mut w, d) = tpl_built();
+        let dry = arrange(&mut w, Some("C"), true);
+        assert!(dry.text.starts_with("commands:\n  aerospace flatten-workspace-tree --workspace C\n"), "{}", dry.text);
+        assert!(w.aero.log.is_empty(), "--dry-run runs nothing");
+        // An arrival queued before arrange: arrange already saw it, so the drain adds nothing (V47).
+        w.aero.add_window("C", 50, "msgr", "Messenger", false);
+        w.handle(moved(50, "C", None, "msgr"));
+        let r = arrange(&mut w, Some("C"), false);
+        assert_eq!(r.exit, 0, "{}", r.text);
+        assert!(r.text.starts_with("arranged C: "), "{}", r.text);
+        assert_eq!(r.json["commands"].as_array().unwrap().len(), w.aero.log.len());
+        w.queue_drained();
+        assert_eq!(flattens(&w.aero.log), 1, "{:?}", w.aero.log);
+        assert_eq!(Persisted::load(&d.path().join("state.json")).template_records["C"].slots["2.2"], [49, 50]);
+        assert!(w.pending.is_none());
+    }
+
+    #[test]
+    fn an_arrange_stopped_halfway_errors_and_arms_one_repass() {
+        let (mut w, d) = tpl_built();
+        w.abort.store(true, Ordering::SeqCst);
+        let r = arrange(&mut w, Some("C"), false);
+        assert_eq!(r.exit, 1);
+        assert!(r.text.contains("C rebuild aborted; a re-pass will finish it"), "{}", r.text);
+        assert!(!disk_has_record(&d, "C"), "V41: no record after a partial rebuild");
+        assert!(w.pending.as_ref().is_some_and(|p| p.full && p.trigger == Trigger::Repass), "B8");
+    }
+
+    /// `TPL` without `when`, `C` already where the example places it (monitor 3), LINE 44 and
+    /// IGCL 10 tiled there: placement leaves it, so a pass rebuilds it.
+    fn tpl_on_3() -> FakeAero {
+        let mut f = docked();
+        f.add_window("C", 44, "line", "LINE", false);
+        f.add_window("C", 10, "igcl", "IGCL", false);
+        f.run(&Cmd::Move { ws: "C".into(), monitor: 3, target: "3".into() }).unwrap();
+        f.log.clear();
+        f
+    }
+
+    fn tpl_any() -> String {
+        TPL.replace("when = { builtin = true }\n", "")
+    }
+
+    #[test]
+    fn dry_run_explain_and_status_show_the_template() {
+        let (mut w, _d) = live(tpl_on_3(), &tpl_any());
+        let dry = ask(&mut w, Request::Reconcile { dry_run: true, config: None });
+        assert!(dry.text.contains("workspace-template rebuild:\n  C    first run\n"), "{}", dry.text);
+        assert!(dry.text.contains("  aerospace flatten-workspace-tree --workspace C\n"), "{}", dry.text);
+        assert_eq!(dry.json["rebuild"][0]["workspace"], "C");
+        let ex = ask(&mut w, Request::Explain { config: None });
+        assert!(ex.text.contains("workspace-template:\n  C    root h   [top-level #1]   on LEN T23i-10 (1): applies\n"), "{}", ex.text);
+        assert!(ex.text.contains("record: pending: first run"), "{}", ex.text);
+        assert_eq!(ex.json["workspace_template"]["workspaces"][0]["tree"][0]["windows"][0]["id"], 44);
+        assert!(ask(&mut w, Request::Status).text.contains("workspace template: live; none applied\n"));
+        assert!(w.aero.log.is_empty(), "reads only: {:?}", w.aero.log);
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert_eq!(flattens(&w.aero.log), 1, "the pass rebuilt as predicted: {:?}", w.aero.log);
+        assert!(ask(&mut w, Request::Status).text.contains("workspace template: live; C applied\n"));
+        assert!(!ask(&mut w, Request::Reconcile { dry_run: true, config: None }).text.contains("workspace-template rebuild"));
+        assert!(ask(&mut w, Request::Explain { config: None }).text.contains("record: up to date"));
+        exit(&mut w, 2);
+        assert!(ask(&mut w, Request::Status).text.contains("workspace template: inert; C applied\n"));
+        // `C` on the built-in, placed on monitor 3 by the example: explain judges `when` where the
+        // pass will, after placement (V42), and agrees with dry-run.
+        let (mut w, _d) = tpl_worker("");
+        assert!(!ask(&mut w, Request::Reconcile { dry_run: true, config: None }).text.contains("workspace-template rebuild"));
+        let ex = ask(&mut w, Request::Explain { config: None });
+        assert!(ex.text.contains("on LEN T23i-10 (1): not applied\n       record: not applied: when does not match LEN T23i-10 (1)\n"), "{}", ex.text);
+        let (mut w, _d) = worker(docked());
+        assert!(!ask(&mut w, Request::Status).text.contains("workspace template"), "no template, no line");
+        assert!(!ask(&mut w, Request::Explain { config: None }).text.contains("workspace-template"));
+    }
+
+    #[test]
+    fn observe_keeps_the_template_records_on_disk_through_other_saves() {
+        let old = crate::state::TemplateRecord { fingerprint: "old".into(), slots: std::collections::BTreeMap::from([("1".to_string(), vec![44])]), rest: vec![] };
+        let disk = Persisted { template_records: std::collections::BTreeMap::from([("C".to_string(), old.clone())]), ..Default::default() };
+        let (mut w, d) = worker_cfg(tpl_on_3(), &tpl_any(), Some(&disk));
+        w.observe = true;
+        let r = arrange(&mut w, Some("C"), false);
+        assert_eq!(r.exit, 0, "{}", r.text);
+        assert!(r.text.starts_with("observe: nothing executed\ncommands:\n  aerospace flatten-workspace-tree --workspace C\n"), "{}", r.text);
+        assert!(w.aero.log.is_empty(), "observe runs nothing: {:?}", w.aero.log);
+        assert_ne!(w.persisted.template_records["C"], old, "the record moves in-process");
+        assert_eq!(ask(&mut w, Request::Pin { workspace: Some("A".into()) }).exit, 0); // a save
+        assert_eq!(Persisted::load(&d.path().join("state.json")).template_records["C"], old, "V49");
+        // An observe pass rebuilds in-process only too.
+        w.persisted.template_records.clear();
+        w.last_ds = Some(desk3());
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert!(w.aero.log.iter().all(|c| !matches!(c, Cmd::Flatten { .. })), "{:?}", w.aero.log);
+        assert!(w.persisted.template_records.contains_key("C"), "taken as done in-process");
+        assert_eq!(Persisted::load(&d.path().join("state.json")).template_records["C"], old);
     }
 }

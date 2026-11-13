@@ -2,6 +2,7 @@
 
 use crate::display::{Display, Rect, Screen};
 
+#[allow(clippy::too_many_arguments)]
 fn screen(cg_id: u32, name: &str, bounds: Rect, px: (u64, u64), rotation: f64, main: bool, builtin: bool, notch: f64) -> Screen {
     Screen {
         cg_id,
@@ -61,7 +62,8 @@ pub fn desk3() -> Vec<Display> {
     vec![len_portrait(1), builtin(2), len_landscape(3)]
 }
 
-use crate::aero::{Aero, Cmd, Sink, Subscription};
+use crate::aero::{Aero, Cmd, Dir, Sink, Subscription};
+use crate::template::Tree;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::config::Axis;
@@ -85,6 +87,260 @@ pub struct FakeWs {
     pub root: Axis,
     /// `v_accordion` / `h_accordion` instead of tiles. `layout --root ... tiles|accordion` sets it.
     pub accordion: bool,
+    /// The tiling tree once a test or a `move` / `join-with` needs one. `None` = the tiled
+    /// windows sit flat under the root in `windows` order. Its root axis follows `root`.
+    pub tree: Option<FakeSplit>,
+}
+
+/// A child in a container's most-recent list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Win(u32),
+    Split(u32),
+}
+
+#[derive(Debug, Clone)]
+pub enum FakeNode {
+    Win(u32),
+    Split(FakeSplit),
+}
+
+impl FakeNode {
+    fn key(&self) -> Key {
+        match self {
+            FakeNode::Win(id) => Key::Win(*id),
+            FakeNode::Split(s) => Key::Split(s.id),
+        }
+    }
+
+    fn to_tree(&self) -> Tree {
+        match self {
+            FakeNode::Win(id) => Tree::Win(*id),
+            FakeNode::Split(s) => s.to_tree(),
+        }
+    }
+}
+
+/// A tiles container with the fork's semantics for what a rebuild sends (TreeNode.swift,
+/// MoveCommand.swift, JoinWithCommand.swift): `bind` raises the child and every ancestor to most
+/// recent. Paths a rebuild never takes are errors, so a plan that strays onto them fails.
+#[derive(Debug, Clone)]
+pub struct FakeSplit {
+    pub id: u32,
+    pub axis: Axis,
+    pub kids: Vec<FakeNode>,
+    /// Most recent last.
+    pub mru: Vec<Key>,
+}
+
+impl FakeSplit {
+    /// Ids count up from `next`; the most-recent order is child order.
+    fn from_tree(t: &Tree, next: &mut u32) -> FakeSplit {
+        let Tree::Split(axis, kids) = t else { panic!("a container is a Split") };
+        *next += 1;
+        let id = *next;
+        let kids: Vec<FakeNode> = kids
+            .iter()
+            .map(|k| match k {
+                Tree::Win(w) => FakeNode::Win(*w),
+                s => FakeNode::Split(FakeSplit::from_tree(s, next)),
+            })
+            .collect();
+        FakeSplit { id, axis: *axis, mru: kids.iter().map(FakeNode::key).collect(), kids }
+    }
+
+    fn to_tree(&self) -> Tree {
+        Tree::Split(self.axis, self.kids.iter().map(FakeNode::to_tree).collect())
+    }
+
+    fn find(&self, key: Key) -> Option<Vec<usize>> {
+        if key == Key::Split(self.id) {
+            return Some(vec![]);
+        }
+        self.kids.iter().enumerate().find_map(|(i, k)| match k {
+            _ if k.key() == key => Some(vec![i]),
+            FakeNode::Split(s) => s.find(key).map(|p| [vec![i], p].concat()),
+            FakeNode::Win(_) => None,
+        })
+    }
+
+    fn split(&self, path: &[usize]) -> &FakeSplit {
+        path.iter().fold(self, |s, &i| match &s.kids[i] {
+            FakeNode::Split(x) => x,
+            FakeNode::Win(_) => panic!("path ends at a window"),
+        })
+    }
+
+    fn split_mut(&mut self, path: &[usize]) -> &mut FakeSplit {
+        let mut s = self;
+        for &i in path {
+            s = match &mut s.kids[i] {
+                FakeNode::Split(x) => x,
+                FakeNode::Win(_) => panic!("path ends at a window"),
+            };
+        }
+        s
+    }
+
+    fn max_id(&self) -> u32 {
+        self.kids.iter().filter_map(|k| if let FakeNode::Split(s) = k { Some(s.max_id()) } else { None }).fold(self.id, u32::max)
+    }
+
+    fn unbind(&mut self, key: Key) -> FakeNode {
+        let path = self.find(key).expect("unbind: not bound");
+        let (&i, parent) = path.split_last().expect("unbind: the root");
+        let p = self.split_mut(parent);
+        p.mru.retain(|k| *k != key);
+        p.kids.remove(i)
+    }
+
+    /// `bind`: insert into container `parent` at `index` (`None` = last), then mark most recent.
+    fn bind(&mut self, parent: Key, node: FakeNode, index: Option<usize>) {
+        let mut path = self.find(parent).expect("bind: no such container");
+        let p = self.split_mut(&path);
+        let index = index.unwrap_or(p.kids.len());
+        p.kids.insert(index, node);
+        path.push(index);
+        self.raise(&path);
+    }
+
+    /// `markAsMostRecentChild`: the node at `path` and every ancestor.
+    fn raise(&mut self, path: &[usize]) {
+        for d in (0..path.len()).rev() {
+            let p = self.split_mut(&path[..d]);
+            let k = p.kids[path[d]].key();
+            p.mru.retain(|x| *x != k);
+            p.mru.push(k);
+        }
+    }
+
+    fn most_recent(&self) -> Key {
+        self.mru.last().copied().unwrap_or_else(|| self.kids.last().expect("inhabited").key())
+    }
+
+    /// The sibling of child `i` toward `dir`, if this container runs along `dir`.
+    fn neighbour(&self, i: usize, dir: Dir) -> Option<usize> {
+        if self.axis != dir.axis() {
+            return None;
+        }
+        if dir.is_pos() { (i + 1 < self.kids.len()).then_some(i + 1) } else { i.checked_sub(1) }
+    }
+
+    /// `move --window-id id --boundaries workspace --boundaries-action stop dir`.
+    fn move_window(&mut self, id: u32, dir: Dir) -> Result<(), String> {
+        let me = Key::Win(id);
+        let path = self.find(me).ok_or(format!("no window {id} in the tree"))?;
+        let (&i, pp) = path.split_last().expect("a window is not the root");
+        let parent = self.split(pp);
+        let Some(j) = parent.neighbour(i, dir) else {
+            // moveOut: from the root it reaches the workspace boundary, and `stop` succeeds.
+            return if pp.is_empty() { Ok(()) } else { Err(format!("fake: move-out of a container is not modeled ({id} {})", dir.as_str())) };
+        };
+        let (into, at) = match &parent.kids[j] {
+            FakeNode::Win(_) => (Key::Split(parent.id), Some(j)), // swap
+            FakeNode::Split(s) => {
+                // deepMoveIn: a container along the move takes the window first; otherwise
+                // follow most-recent children down to a window and land right after it.
+                let mut s = s;
+                loop {
+                    if s.axis == dir.axis() {
+                        break (Key::Split(s.id), Some(0));
+                    }
+                    let k = s.most_recent();
+                    let at = s.kids.iter().position(|c| c.key() == k).expect("most recent is a child");
+                    match &s.kids[at] {
+                        FakeNode::Split(c) => s = c,
+                        FakeNode::Win(_) => break (Key::Split(s.id), Some(at + 1)),
+                    }
+                }
+            }
+        };
+        let w = self.unbind(me);
+        self.bind(into, w, at);
+        Ok(())
+    }
+
+    /// `join-with --window-id id dir`: the closest ancestor along `dir` with a neighbour there;
+    /// the neighbour and the window go into a new container of the opposite axis at the
+    /// neighbour's place, the neighbour first, the window first for a positive `dir`, else last.
+    fn join_with(&mut self, id: u32, dir: Dir) -> Result<(), String> {
+        let me = Key::Win(id);
+        let mut path = self.find(me).ok_or(format!("no window {id} in the tree"))?;
+        let (parent, nb) = loop {
+            let Some((&i, pp)) = path.split_last() else { return Err("No windows in the specified direction".into()) };
+            let p = self.split(pp);
+            if let Some(nb) = p.neighbour(i, dir) {
+                break (p, nb);
+            }
+            path.pop();
+        };
+        let (pkey, axis, target) = (Key::Split(parent.id), parent.axis.opposite(), parent.kids[nb].key());
+        let target = self.unbind(target);
+        let k = self.max_id() + 1;
+        self.bind(pkey, FakeNode::Split(FakeSplit { id: k, axis, kids: vec![], mru: vec![] }), Some(nb));
+        let w = self.unbind(me);
+        self.bind(Key::Split(k), target, Some(0));
+        self.bind(Key::Split(k), w, if dir.is_pos() { Some(0) } else { None });
+        Ok(())
+    }
+
+    /// `flatten-workspace-tree`: every leaf, depth-first, bound last to the root.
+    fn flatten(&mut self) {
+        let leaves = self.to_tree().leaves();
+        self.kids.clear();
+        self.mru.clear();
+        for id in leaves {
+            self.bind(Key::Split(self.id), FakeNode::Win(id), None);
+        }
+    }
+
+    /// V43: neither normalization setting may find anything to change between commands: no
+    /// container with fewer than two children, none of its parent's axis, and no root whose only
+    /// child is a container.
+    fn check_normal(&self) -> Result<(), String> {
+        fn below(s: &FakeSplit) -> Result<(), String> {
+            for k in &s.kids {
+                if let FakeNode::Split(c) = k {
+                    if c.kids.len() < 2 || c.axis == s.axis {
+                        return Err(format!("fake: normalization would change {:?}", c.to_tree()));
+                    }
+                    below(c)?;
+                }
+            }
+            Ok(())
+        }
+        if let [FakeNode::Split(_)] = self.kids.as_slice() {
+            return Err(format!("fake: normalization would change root {:?}", self.to_tree()));
+        }
+        below(self)
+    }
+
+    /// Follow the workspace: root axis, windows that left or stopped tiling, new tiled windows.
+    fn sync(&mut self, axis: Axis, tiled: &[u32]) {
+        fn prune(s: &mut FakeSplit) {
+            s.kids.retain_mut(|k| match k {
+                FakeNode::Split(c) => {
+                    prune(c);
+                    !c.kids.is_empty()
+                }
+                FakeNode::Win(_) => true,
+            });
+            let keys: Vec<Key> = s.kids.iter().map(FakeNode::key).collect();
+            s.mru.retain(|k| keys.contains(k));
+        }
+        self.axis = axis;
+        for id in self.to_tree().leaves() {
+            if !tiled.contains(&id) {
+                self.unbind(Key::Win(id));
+            }
+        }
+        prune(self);
+        for &id in tiled {
+            if self.find(Key::Win(id)).is_none() {
+                self.bind(Key::Split(self.id), FakeNode::Win(id), None);
+            }
+        }
+    }
 }
 
 /// In-memory AeroSpace with the move semantics of MoveWorkspaceToMonitorCommand.swift:15-21
@@ -134,6 +390,7 @@ impl FakeAero {
                         .collect(),
                     root: *root,
                     accordion: false,
+                    tree: None,
                 })
                 .collect(),
             focused: focused.into(),
@@ -195,6 +452,48 @@ impl FakeAero {
             .iter()
             .map(|w| WorkspaceRow { workspace: w.name.clone(), monitor: w.monitor, visible: w.visible, focused: w.name == self.focused })
             .collect()
+    }
+
+    fn tiled_ids(&self, i: usize) -> Vec<u32> {
+        self.ws[i].windows.iter().filter(|w| !w.floating).map(|w| w.id).collect()
+    }
+
+    /// Workspace `ws` gets this tiling tree (and its root axis), with `most_recent` raised the
+    /// way AeroSpace raises the window it last bound or focused.
+    pub fn set_tree(&mut self, ws: &str, tree: &Tree, most_recent: u32) {
+        let i = self.idx(ws).expect("no such fake workspace");
+        let tiled = self.tiled_ids(i);
+        assert!(tree.leaves().iter().all(|id| tiled.contains(id)), "every leaf must be a tiled window on {ws}");
+        let mut t = FakeSplit::from_tree(tree, &mut 0);
+        let path = t.find(Key::Win(most_recent)).expect("most_recent must be a leaf");
+        t.raise(&path);
+        self.ws[i].root = t.axis;
+        self.ws[i].tree = Some(t);
+    }
+
+    /// The tiling tree of `ws` as the daemon would want to see it (it never can, C20).
+    pub fn tree(&self, ws: &str) -> Tree {
+        let i = self.idx(ws).expect("no such fake workspace");
+        let tiled = self.tiled_ids(i);
+        let mut t = self.ws[i].tree.clone().unwrap_or(FakeSplit { id: 0, axis: self.ws[i].root, kids: vec![], mru: vec![] });
+        t.sync(self.ws[i].root, &tiled);
+        t.to_tree()
+    }
+
+    fn tree_mut(&mut self, i: usize) -> &mut FakeSplit {
+        let (tiled, axis) = (self.tiled_ids(i), self.ws[i].root);
+        let t = self.ws[i].tree.get_or_insert_with(|| FakeSplit { id: 0, axis, kids: vec![], mru: vec![] });
+        t.sync(axis, &tiled);
+        t
+    }
+
+    /// The workspace holding tiled window `id`; a rebuild never moves a floating one (C23).
+    fn tiled_ws(&self, id: u32) -> Result<usize, String> {
+        let i = self.ws.iter().position(|w| w.windows.iter().any(|x| x.id == id)).ok_or(format!("no window {id}"))?;
+        if self.win(id).is_some_and(|w| w.floating) {
+            return Err("moving floating windows isn't yet supported".into());
+        }
+        Ok(i)
     }
 
     fn idx(&self, name: &str) -> Result<usize, String> {
@@ -280,7 +579,25 @@ impl Aero for FakeAero {
                 }
                 Ok(())
             }
-            Cmd::Flatten { ws } => self.idx(ws).map(|_| ()),
+            Cmd::Flatten { ws } => {
+                let i = self.idx(ws)?;
+                if self.ws[i].tree.is_some() {
+                    self.tree_mut(i).flatten();
+                }
+                Ok(())
+            }
+            Cmd::MoveWindow { id, dir } => {
+                let i = self.tiled_ws(*id)?;
+                let t = self.tree_mut(i);
+                t.move_window(*id, *dir)?;
+                t.check_normal()
+            }
+            Cmd::JoinWith { id, dir } => {
+                let i = self.tiled_ws(*id)?;
+                let t = self.tree_mut(i);
+                t.join_with(*id, *dir)?;
+                t.check_normal()
+            }
             Cmd::LayoutKind { ws, layout } => {
                 let i = self.idx(ws)?;
                 if !self.ignore_layout {

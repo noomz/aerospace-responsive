@@ -56,6 +56,15 @@ enum Verb {
         #[arg(long, conflicts_with = "workspace")]
         all: bool,
     },
+    /// Rebuild a workspace's template now (default: the focused workspace)
+    Arrange {
+        workspace: Option<String>,
+        /// Print the commands; run nothing
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// List pins
     Pins {
         #[arg(long)]
@@ -93,6 +102,7 @@ fn main() -> ExitCode {
         Verb::Status { json } => (Request::Status, json),
         Verb::Pin { workspace } => (Request::Pin { workspace }, false),
         Verb::Unpin { workspace, all } => (Request::Unpin { workspace, all }, false),
+        Verb::Arrange { workspace, dry_run, json } => (Request::Arrange { workspace, dry_run }, json),
         Verb::Pins { json } => (Request::Pins, json),
         Verb::Profile { action: None, json } => (Request::Profile, json),
         Verb::Profile { action: Some(ProfileAction::Lock { name }), .. } => (Request::ProfileLock { name }, false),

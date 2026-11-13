@@ -256,3 +256,194 @@ id|date|cause|fix
 B4|2026-10-30|toml_edit hangs comment lines on the key decor; replacing `outer.top` dropped `#outer.top = [{ monitor.main = 50 }, 10]` from the live config|V32
 B5|2026-10-30|`gap_written` is saved before a successful write, and observe's `save_state` persists it (only exclusive-tiling memory is substituted back). A later live pass then warns `gaps-writer` even though this tool never wrote the file, or the write failed|open
 B6|2026-11-03|AeroSpace restart: resync's `list-windows --all` reached the dying server and was never answered; `Command::output` had no deadline, so the worker blocked and `reconcile` / `status` hung behind it until `launchctl bootout` (issue #1)|V36
+
+# SPEC: workspace template
+
+Drafted 2026-11-12. Not built. Ids continue the specs above (last used C18, V37, T30, B7).
+Terms (add to `CONTEXT.md`, T40): **Workspace template** = a per-workspace rule that names the tiling tree to
+build. **Slot** = one leaf of that tree; it names an app, optionally narrowed by title. **Rest windows** = tiled
+windows on the workspace that no slot matches. **Rebuild** = flatten the workspace, then build the tree again.
+
+## §G goal
+
+A workspace template rebuilds a nested tiling tree from config, so a hand-made layout comes back by itself.
+Motivating case: `C` on the built-in display = `h[ LINE, v[ IGCL, Messenger ] ]`. Today a `[[layout]]` rule sets
+the root only, and a pin only protects what was arranged by hand.
+
+## §C constraints
+
+- C19 Stock commands only: `flatten-workspace-tree --workspace`, `move --window-id`, `join-with --window-id`,
+  `layout --root --workspace`. No new fork delta: T31 passed, so C19 holds. Read from fork source 2026-11-12,
+  confirmed live by T31 the same day: `join-with` wraps the window and its neighbour in a new tiles container of the
+  opposite orientation; `move` toward a window sibling swaps; `move` toward a container sibling enters it next
+  to that container's most recent child; every command resolves `--window-id` / `--workspace` without focus.
+- C20 The daemon cannot read a tree. `list-windows` gives each window's parent layout only and sorts by app
+  name, then title; flatten keeps depth-first order, but nothing reports it. So a template never
+  compares the live tree with the wanted one. It rebuilds on triggers (V40) and trusts its record (V41).
+- C21 Never fights the user (C5 again). Between triggers a hand-made change stays. A trigger rebuilds the whole
+  workspace and overwrites it. Pin is the opt-out (V46).
+- C22 Nesting alternates. A nested container always has the orientation opposite to its parent, because
+  `join-with` builds nothing else. Config cannot ask for `h` inside `h`.
+- C23 Tiled windows only. A floating window is never moved, tiled or counted. Exclusive tiling decides float
+  state first (V45).
+- C24 Never poll (C2). Arrival triggers need the fork's `window-moved` (I.fork.events). Without events, arrival
+  triggers are inert and `status` warns; pass triggers and `arrange` still work. The subscribe child runs for
+  a template alone (V53).
+- C25 Out of scope v1: container sizes and weights (a rebuild resets them); accordion inside the tree; a slot
+  that places rest windows; capturing a live tree into config (C20); a per-slot window limit; matching by
+  anything but app + title.
+
+## §I interfaces
+
+- I.tpl.cfg — tool TOML:
+  ```toml
+  [[workspace-template]]
+  workspaces = ["C"]
+  when = { builtin = true }       # optional monitor Pred; absent = every monitor; `nth` is a load error
+  root = "h"                      # required: "h" | "v"
+  tree = [                        # required; item = slot table, or array = container (opposite orientation)
+    { app = "jp.naver.line.mac" },
+    [ { app = "com.igcl.app" },
+      { app = "com.google.Chrome.app.bbdeiblfgdokhlblpgeaokenkfknecgl" } ],
+  ]
+  ```
+  Also `[[profile.workspace-template]]`. kebab-case, `deny_unknown_fields`. Slot = `app` (exact bundle id,
+  required), `title?` (regex, case-insensitive, unanchored: same as a `tiling-allowlist` entry, no `max-tiled`).
+- I.tpl.aero — new daemon commands: `move --window-id N --boundaries workspace --boundaries-action stop <dir>`,
+  `join-with --window-id N <dir>`. Reused: `Cmd::Flatten`, `Cmd::Layout`, `Cmd::LayoutKind` (root → tiles).
+  Read: one `list-windows --workspace W --format` with id, bundle id, title, `%{window-layout}`.
+- I.tpl.state — `state.json` gains per-workspace template record: fingerprint of the effective template + one
+  window-id list per slot path (empty slots kept) + the rest list (V41). `serde` default.
+- I.tpl.cli.arrange — `aerospace-responsive arrange [ws]` (default: focused workspace). Rebuilds now, even when
+  the record is equal. No template for `ws` on its monitor → error, exit non-zero, names why (`no template` |
+  `when does not match <monitor>`). Pinned → error `C is pinned; unpin it first`. `--dry-run` prints commands.
+- I.tpl.cli.explain — new `workspace-template:` section (human + `--json`):
+  ```
+  workspace-template:
+    C   root h   when builtin        [top-level #1]   on Built-in Retina Display: applies
+        record: up to date
+        tree:
+          1 jp.naver.line.mac                 44 LINE
+          2 v
+            2.1 com.igcl.app                  10 IGCL
+            2.2 com.google.Chrome.app.bbde…   49 Messenger
+        rest: none
+  ```
+  `record:` ∈ `up to date` | `pending: first run` | `pending: template changed` | `pending: windows changed` |
+  `not applied: when does not match <monitor>` | `not applied: pinned`. Empty slot prints `(no window)`.
+- I.tpl.cli.dryrun — `reconcile --dry-run` adds a `workspace-template rebuild:` block (workspace + reason) after
+  the exclusive-tiling block; its commands sit where layout commands sit.
+- I.tpl.cli.status — one line, omitted when no template: `workspace template: live|inert; C applied`.
+- I.tpl.docs — README config reference + example block (commented, parses when uncommented, V35 style).
+
+## §V invariants
+
+Reviewed by codex 2026-11-12 (R1–R10 below name its findings). V51–V54 and the R-marked text came from it.
+
+- V38 Assignment. Input = the workspace's tiled windows, one read. Each window goes to the first slot (depth-first
+  tree order) whose `app` equals its bundle id and whose `title`, if set, matches now. A slot holds every window
+  it matches, lowest window id first, side by side in the slot's container. No match → rest window. Rest windows
+  go to the end of the root, lowest id first.
+- V39 Canonical shape (R1). After assignment, repeat until nothing changes: (1) drop a container with no window;
+  (2) replace a one-child container by its child; (3) when a container's child is a container of the same axis,
+  merge the child's children into it in place; (4) when the root's only child is a container, the root takes
+  that container's axis and children. So the built tree has no one-child container and no same-axis nesting, and
+  both AeroSpace normalization settings leave it alone. Root kind = tiles. Root axis = `root`, except after (4).
+  A root with one window is valid.
+- V40 Triggers (closed set): (a) a pass where there is no record, or the record differs from the wanted record
+  (V41); (b) `window-moved` whose `workspace` has an applying template and whose window is tiled once every
+  queued window event is judged (V45); (c) `arrange`. Not immediate triggers: `window-closed`, a title change, a
+  daemon restart, a hand-made move, float or tile. A hand-made float or tile, or a title change that moves a
+  window to another slot, changes the wanted record, so the next pass rebuilds (R8).
+- V41 Record (R2, R5). Wanted record = template fingerprint + one window-id list per slot path (empty slots
+  included) + the rest list. Before the first command of a rebuild the workspace's record is removed and
+  `state.json` saved; the new record is saved only after the last command succeeds. So a rebuild that fails or is
+  aborted halfway leaves no record, the partial tree stays, and the next pass rebuilds. Pass: no record →
+  rebuild; equal → nothing; differs → rebuild. `window-closed` removes the id from the record, no commands; the
+  tree may then hold a one-child container until the next rebuild (same picture, sizes may differ: accepted).
+  Stale record: a full pass removes a workspace's record (save, no commands, V50) when no effective template
+  exists for it, or when it is non-empty, not pinned, and `when` fails on its monitor after placement. Else the
+  `[[layout]]` rule flattens it there and the old record still compares equal on return (dock → undock → dock).
+  Pinned keeps its record (V46: `unpin` removes it). Empty workspace keeps its record.
+- V42 Applies = effective template exists for the workspace AND (`when` absent OR `when` matches the monitor the
+  workspace is on after placement) AND not pinned. While it applies, `plan_layout` and the layout checks in
+  `diff` skip that workspace, in a verify-only pass too (R4): `orientation`, `flatten` and `kind` of the matching
+  `[[layout]]` rule do nothing there. Placement checks in `diff` stay.
+- V43 Rebuild = one command list from a pure fn `(template, tiled windows) -> Vec<Cmd>`: flatten, root kind
+  tiles, root axis, order the root, then join and move windows into containers, outermost first. The plan must
+  not depend on the order windows have after flatten (the daemon cannot read it, C20) or on which window is
+  most recent. Empty workspace → no commands, no record. Running it twice gives the same tree. Recipe (fixed by
+  T31; leaves L1..Ln depth-first; pos = right|down, neg = left|up of an axis):
+  (1) `flatten-workspace-tree`, `layout --root` tiles, `layout --root` root axis.
+  (2) Order: for each of L2..Ln in order, `move --window-id Li --boundaries workspace --boundaries-action stop
+  pos(root)` n-1 times. A flat root has only window siblings, so a move swaps; at the edge it is a no-op success.
+  L1 ends first.
+  (3) Nest top-down: per container K (parent axis p) whose leaves are contiguous flat siblings,
+  `join-with --window-id <K's 2nd leaf> neg(p)`. The joiner is bound last, so it is K's most-recent child.
+  Then each further leaf: `move --window-id <leaf> neg(p)`. It enters K after its most-recent child, which is
+  the previous leaf (`bind` marks most-recent). Recurse into K's sub-containers.
+  Join direction matters (from source): joining toward pos leaves the first leaf most-recent, so the next move
+  lands in the wrong slot. Not isolated live: the negative control reversed joins and moves together.
+  No intermediate step has a one-child container or same-axis nesting, so neither normalization setting changes
+  anything between commands. Commands = 3 + (n-1)² + Σ containers (leaves − 1); 6 windows = 33.
+  Evidence: 96/96 live builds. mac_jr: all four normalization settings, workspace focused and hidden. Desk
+  (off/off): 12 focused + 12 hidden (a first desk hidden batch ran visible by mistake; rerun). Focus same before
+  and after every build. Desk: ~36 ms/cmd, 0.26 s (3 windows) to 1.2 s (6 windows). A focused workspace redraws
+  once per command; flicker not yet judged by eye (T41). Record `.scratch/workspace-template/RESULT.md`, script
+  `scripts/spike-workspace-template.py`.
+- V44 Pass order in `run_pass`: placement → converge (V10) → template rebuild → flatten + layout (non-template
+  workspaces) → diff. Abort flag checked before each rebuild command. A failed command = pass error (existing
+  one-repass budget); V41 makes the repass rebuild.
+- V45 Exclusive tiling first (R3). Converge in a pass runs before the rebuild. On window events the worker first
+  judges every queued `Msg::Window` (V12), then reads the workspace once and rebuilds. A rule-floated arrival
+  triggers nothing by itself.
+- V46 Pin ⟂ template: pin skips the rebuild like it skips layout (V11). `unpin` removes that workspace's record
+  and arms a pass, so the template rebuilds (R7).
+- V47 One rebuild per workspace per drained queue: window events that arrive during a rebuild wait, are judged
+  together, and cause at most one more rebuild. Window events never debounced, never arm `Pending`. Exception
+  (B8, amended 2026-11-13): a drain rebuild that fails or is aborted halfway arms one `Repass` (full pass, the
+  existing one-repass budget), so the partial tree does not wait for an unrelated trigger.
+- V48 Config: rule identity = workspace name. Per workspace the last block wins whole (top-level file order, then
+  active profile); no per-field merge. Load errors: empty `workspaces`; missing or bad `root`; missing or empty
+  `tree`; empty nested array; slot w/o `app`; invalid `title` regex; `nth` in `when`; unknown key in a block or a
+  slot. A nested array with one item is valid (V39 collapses it). `tree` item parses as untagged
+  `Slot | Vec<Node>`.
+- V49 `--observe`: logs the would-be commands; records kept in-process only. `save_state` in observe puts the
+  on-disk template records back, like exclusive-tiling memory (V34), also when a pin or gap save runs (R10).
+- V50 Uninstall and template removal send no template commands. After removal the `[[layout]]` rule owns the
+  workspace again and may flatten it on the next pass (R8).
+- V51 Server lifetime (R6). Fork window ids are a counter that restarts with AeroSpace, so a record is valid for
+  one AeroSpace server run only. When the daemon sees the server come back (`AeroSocket(true)`, V14) it removes
+  every template record; the next pass rebuilds. A daemon restart alone keeps records.
+- V52 A float or tile the daemon itself sends for a window on an applying-template workspace (arrival verdict,
+  late pre-layout answer, converge) removes that workspace's record, so the queue drain or the next pass
+  rebuilds (R3).
+- V53 Subscription (R9, amends V14 for this feature). The subscribe child runs while ≥ 1 exclusive-tiling rule
+  OR ≥ 1 workspace template is configured. Retry, respawn and inert warning are shared. Each (re)connect resync
+  also compares template records with the windows listed, and removes a record that differs.
+- V54 Rebuild targets work by id: every command carries `--window-id` or `--workspace`, so a workspace that is
+  not focused or not visible is rebuilt the same way, and focus does not move.
+
+## §T tasks
+
+T31 gates T34. T33 needs nothing live and may run beside T31.
+
+id|status|task|cites
+-|-|-|-
+T31|x|spike, live, scratch ws `X` (TextEdit windows, style T15): prove a recipe builds `h[A, v[B, C]]`, `v[A, h[B, C, D]]`, a 3-level tree and a 6-window tree, from any start order and any most-recent window, with `X` focused and with `X` hidden, under both normalization settings; ordering by push-to-edge moves (`--boundaries-action stop`); focus unchanged; count commands, wall time, visible flicker; record in `.scratch/workspace-template/`. Fails → amend C19 (fork command)|C19,C20,V43,V54
+T32|x|config: `[[workspace-template]]` + profile variant, untagged `tree` parse, last-block-wins resolve w/ source, load errors incl. unknown key in slot|V48,I.tpl.cfg
+T33|x|core: pure assignment + canonical shape fns + tests (first slot wins, title, many windows in a slot, rest, empty container, one-child collapse, same-axis merge, root promotion, single window)|V38,V39
+T34|x|core: pure rebuild plan `-> Vec<Cmd>` per T31 recipe; `Cmd::MoveWindow`, `Cmd::JoinWith`; `FakeAero` gains a tree model that applies them with fork semantics (swap, enter container at most-recent child, join = opposite axis) + tests: canonical tree reached from every start order and most-recent choice, twice = same|V43,V54,I.tpl.aero
+T35|x|state: per-slot-path record in `state.json`, serde default; wanted-record compare; remove-before-rebuild, save-after-success|V41,I.tpl.state
+T36|x|pass: rebuild step, `plan_layout` + `diff` skip, verify-only skip, `when` vs landed monitor, pin skip, abort, tests (first run, template edit, dock → undock → dock for `C`, daemon restart = no commands, pinned, command fails halfway → repass rebuilds, no mismatch warning for an applied template)|V40,V41,V42,V44
+T37|x|worker: judge all queued window events then rebuild once; close prunes record; daemon float/tile drops record; worker tests (burst of arrivals, arrival then rule-float, event during rebuild)|V40,V45,V47,V52
+T38|x|worker lifecycle: subscribe child gated on rule OR template; template-only config test; resync record check; `AeroSocket(true)` drops records; `unpin` drops record + arms pass; inert warning|V46,V51,V53,C24
+T39|x|surfaces: `arrange` command + ipc, explain section, dry-run block, status line, `--json`; observe keeps disk records through pin / gap saves; render tests|I.tpl.cli.arrange,I.tpl.cli.explain,I.tpl.cli.dryrun,I.tpl.cli.status,V49
+T40|x|docs: README section + commented example block guarded by parse test; `CONTEXT.md` terms|I.tpl.docs,V50
+T41|x|acceptance at the desk: `C` template on built-in; LINE / IGCL / Messenger quit + reopen; dock to DELL (flatten rule wins) and back; AeroSpace restart rebuilds; pin keeps a hand-made tree, unpin rebuilds; `cargo test` + clippy green; then live deploy|T31-T40
+
+## §B bugs
+
+id|date|cause|fix
+-|-|-|-
+B8|2026-11-13|drain rebuild (window arrival) that failed or aborted halfway was only logged; record gone, but no pass armed, so the half-built tree stayed until an unrelated trigger|V47
