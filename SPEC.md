@@ -400,7 +400,9 @@ Reviewed by codex 2026-11-12 (R1–R10 below name its findings). V51–V54 and t
 - V46 Pin ⟂ template: pin skips the rebuild like it skips layout (V11). `unpin` removes that workspace's record
   and arms a pass, so the template rebuilds (R7).
 - V47 One rebuild per workspace per drained queue: window events that arrive during a rebuild wait, are judged
-  together, and cause at most one more rebuild. Never debounced, never arm `Pending`.
+  together, and cause at most one more rebuild. Window events never debounced, never arm `Pending`. Exception
+  (B8, amended 2026-11-13): a drain rebuild that fails or is aborted halfway arms one `Repass` (full pass, the
+  existing one-repass budget), so the partial tree does not wait for an unrelated trigger.
 - V48 Config: rule identity = workspace name. Per workspace the last block wins whole (top-level file order, then
   active profile); no per-field merge. Load errors: empty `workspaces`; missing or bad `root`; missing or empty
   `tree`; empty nested array; slot w/o `app`; invalid `title` regex; `nth` in `when`; unknown key in a block or a
@@ -444,3 +446,4 @@ T41|.|acceptance at the desk: `C` template on built-in; LINE / IGCL / Messenger 
 
 id|date|cause|fix
 -|-|-|-
+B8|2026-11-13|drain rebuild (window arrival) that failed or aborted halfway was only logged; record gone, but no pass armed, so the half-built tree stayed until an unrelated trigger|V47

@@ -915,12 +915,15 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         for e in &executed {
             crate::log!("  {}  ({} ms)", e.cmd, e.ms);
         }
-        match result {
-            Ok(pass::Rebuilt::Built) => crate::log!("workspace template: {} rebuilt (window arrived)", t.workspace),
-            Ok(pass::Rebuilt::Aborted) => crate::log!("workspace template: {} rebuild aborted; the next pass rebuilds", t.workspace),
-            Ok(pass::Rebuilt::Nothing) => {}
-            Err(e) => crate::log!("workspace template: {} rebuild failed; the next pass rebuilds: {e:#}", t.workspace),
-        }
+        let why = match result {
+            Ok(pass::Rebuilt::Built) => return crate::log!("workspace template: {} rebuilt (window arrived)", t.workspace),
+            Ok(pass::Rebuilt::Nothing) => return,
+            Ok(pass::Rebuilt::Aborted) => "aborted".to_string(),
+            Err(e) => format!("failed: {e:#}"),
+        };
+        // V47 exception (B8): the partial tree must not wait for an unrelated trigger.
+        crate::log!("workspace template: {} rebuild {why}; one re-pass", t.workspace);
+        self.arm(Trigger::Repass, true, None);
     }
 
     /// The converge plans a pass would run now, against a fresh window read: while inert only
@@ -2183,6 +2186,18 @@ mod tests {
         w.queue_drained();
         assert_eq!(flattens(&w.aero.log), 1, "now tiled on C: the arrival rebuilds");
         assert_eq!(w.persisted.template_records["C"].rest, [77]);
+    }
+
+    #[test]
+    fn a_drain_rebuild_stopped_halfway_arms_one_repass() {
+        let (mut w, _d) = tpl_worker("");
+        w.aero.add_window("C", 49, "msgr", "Messenger", false);
+        w.handle(moved(49, "C", None, "msgr"));
+        w.abort.store(true, Ordering::SeqCst); // a display change mid-rebuild; a failed command takes the same branch
+        w.queue_drained();
+        assert!(!w.persisted.template_records.contains_key("C"), "no record after a partial rebuild (V41)");
+        let p = w.pending.as_ref().expect("B8: a re-pass is armed");
+        assert!(p.full && p.repass && p.trigger == Trigger::Repass);
     }
 
     /// Sends `inject` into the worker's inbox when the first `C` flatten runs: events that
