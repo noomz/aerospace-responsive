@@ -1,7 +1,8 @@
 //! Workspace templates (SPEC "workspace template" §G): a per-workspace rule naming the tiling
 //! tree to rebuild. This module resolves which template applies to which workspace.
 
-use crate::config::{Axis, Config, Node, Pred, Profile, TemplateBlock};
+use crate::aero::{Cmd, Dir};
+use crate::config::{Axis, Config, Kind, Node, Pred, Profile, TemplateBlock};
 use crate::world::WinInfo;
 use std::collections::BTreeMap;
 
@@ -133,6 +134,54 @@ fn normalize_kids(axis: Axis, kids: Vec<Tree>) -> Vec<Tree> {
         }
     }
     out
+}
+
+/// V43: the commands that rebuild `t` from the workspace's windows. Empty workspace → none.
+pub fn rebuild(t: &Template, windows: &[WinInfo]) -> Vec<Cmd> {
+    plan(&t.workspace, &canonical(t.root, &t.tree, &assign(&t.tree, windows)))
+}
+
+/// V43 recipe (T31) for a canonical tree. It reads neither the order windows have after flatten
+/// nor any most-recent child it did not set itself, and every command targets an id or `ws` (V54).
+/// The axis comes from the tree, not the template: V39 step (4) may have promoted the root.
+pub fn plan(ws: &str, tree: &Tree) -> Vec<Cmd> {
+    let leaves = tree.leaves();
+    let (Tree::Split(axis, kids), [_, rest @ ..]) = (tree, leaves.as_slice()) else { return vec![] };
+    let mut cmds = vec![
+        Cmd::Flatten { ws: ws.into() },
+        Cmd::LayoutKind { ws: ws.into(), layout: Kind::Tiles },
+        Cmd::Layout { ws: ws.into(), axis: *axis },
+    ];
+    // Push L2..Ln to the end in turn: on a flat root each move swaps, and at the edge it stops.
+    for &id in rest {
+        cmds.extend(std::iter::repeat_n(Cmd::MoveWindow { id, dir: Dir::pos(*axis) }, rest.len()));
+    }
+    nest(*axis, kids, &mut cmds);
+    cmds
+}
+
+/// Builds each container of `kids` from its flat, contiguous leaves, then recurses into it. A
+/// container takes all its leaves before any sub-container exists: a move enters a container
+/// after its most-recent child, and a sub-container there (the move's own axis) would swallow it.
+fn nest(parent: Axis, kids: &[Tree], cmds: &mut Vec<Cmd>) {
+    for k in kids {
+        let Tree::Split(axis, sub) = k else { continue };
+        let leaves = k.leaves();
+        // The joiner is bound last, so it is the most-recent child the next move lands after.
+        cmds.push(Cmd::JoinWith { id: leaves[1], dir: Dir::neg(parent) });
+        cmds.extend(leaves[2..].iter().map(|&id| Cmd::MoveWindow { id, dir: Dir::neg(parent) }));
+        nest(*axis, sub, cmds);
+    }
+}
+
+impl Tree {
+    /// Window ids, depth-first.
+    pub fn leaves(&self) -> Vec<u32> {
+        match self {
+            Tree::Win(id) => vec![*id],
+            Tree::Split(_, kids) => kids.iter().flat_map(Tree::leaves).collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +338,214 @@ tree = [{ app = "p" }]
         assert_eq!(tree, Split(Axis::H, vec![Win(44), Split(Axis::V, vec![Win(10), Win(49)])]));
         let Split(axis, kids) = tree.clone() else { unreachable!() };
         assert_eq!(normalize_root(axis, kids), tree);
+    }
+
+    // --- V43 rebuild plan, against the FakeAero tree model (T34) ---
+
+    use crate::aero::Aero;
+    use crate::testutil::{FakeAero, desk3};
+
+    fn h(kids: Vec<Tree>) -> Tree {
+        Split(Axis::H, kids)
+    }
+
+    fn v(kids: Vec<Tree>) -> Tree {
+        Split(Axis::V, kids)
+    }
+
+    /// Hidden `X` (V54: not focused, not visible) holding a tiled window per leaf.
+    fn fake_with(leaves: &[u32]) -> FakeAero {
+        let mut f = FakeAero::new(&desk3(), &[("X", 2, false, 0, Axis::H), ("T", 2, true, 0, Axis::H)], "T");
+        for &id in leaves {
+            f.add_window("X", id, "com.example.app", "", false);
+        }
+        f.add_window("X", 999, "com.example.app", "floating", true);
+        f
+    }
+
+    fn run(f: &mut FakeAero, cmds: &[Cmd]) -> Result<(), String> {
+        cmds.iter().try_for_each(|c| f.run(c).map_err(|e| format!("{c}: {e}")))
+    }
+
+    fn perms(xs: &[u32]) -> Vec<Vec<u32>> {
+        if xs.len() <= 1 {
+            return vec![xs.to_vec()];
+        }
+        (0..xs.len())
+            .flat_map(|i| {
+                let mut rest = xs.to_vec();
+                let x = rest.remove(i);
+                perms(&rest).into_iter().map(move |mut p| {
+                    p.insert(0, x);
+                    p
+                })
+            })
+            .collect()
+    }
+
+    /// Start trees for one start order: flat, and nested two deep, both on the other root axis.
+    fn starts(order: &[u32], want: Axis) -> Vec<Tree> {
+        let w = |ids: &[u32]| ids.iter().map(|&i| Win(i)).collect::<Vec<_>>();
+        let mut out = vec![Split(want.opposite(), w(order))];
+        if order.len() >= 3 {
+            let mut kids = vec![Split(want, w(&order[..2]))];
+            kids.extend(w(&order[2..]));
+            out.push(Split(want.opposite(), kids));
+        }
+        out
+    }
+
+    /// The trees T31 proved live, the motivating case, and sub-containers placed first and in
+    /// the middle of their parent (T31 only had them last).
+    fn targets() -> Vec<(Tree, usize)> {
+        vec![
+            (h(vec![Win(44), v(vec![Win(10), Win(49)])]), 8),
+            (v(vec![Win(5), h(vec![Win(3), Win(8), Win(1)])]), 14),
+            (h(vec![Win(1), v(vec![Win(2), h(vec![Win(3), Win(4)])]), Win(5)]), 22),
+            (v(vec![h(vec![Win(6), Win(5), Win(4)]), h(vec![Win(3), v(vec![Win(2), Win(1)])])]), 33),
+            (h(vec![v(vec![h(vec![Win(1), Win(2)]), Win(3)]), Win(4)]), 3 + 9 + 2 + 1),
+            (h(vec![Win(1), v(vec![Win(2), h(vec![Win(3), Win(4)]), Win(5)])]), 3 + 16 + 3 + 1),
+        ]
+    }
+
+    /// V54: every command names a window id or the workspace, so focus is never needed.
+    fn targets_by_id(cmds: &[Cmd]) -> bool {
+        cmds.iter().all(|c| match c {
+            Cmd::MoveWindow { .. } | Cmd::JoinWith { .. } => true,
+            Cmd::Flatten { ws } | Cmd::LayoutKind { ws, .. } | Cmd::Layout { ws, .. } => ws == "X",
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn plan_count_matches_the_t31_formula() {
+        for (tree, n) in targets() {
+            let cmds = plan("X", &tree);
+            assert_eq!(cmds.len(), n, "{tree:?}");
+            assert!(targets_by_id(&cmds));
+            assert_eq!(cmds[..3], [Cmd::Flatten { ws: "X".into() }, Cmd::LayoutKind { ws: "X".into(), layout: Kind::Tiles }, Cmd::Layout {
+                ws: "X".into(),
+                axis: match &tree {
+                    Split(a, _) => *a,
+                    Win(_) => unreachable!(),
+                }
+            }]);
+        }
+    }
+
+    #[test]
+    fn empty_workspace_sends_nothing_and_one_window_only_sets_the_root() {
+        assert!(plan("X", &h(vec![])).is_empty());
+        let t = tpl("h", r#"[{ app = "a" }]"#);
+        assert!(rebuild(&t, &[]).is_empty());
+        assert!(rebuild(&t, &[win(3, "a", "", "floating")]).is_empty(), "floating is not counted");
+        assert_eq!(plan("X", &v(vec![Win(7)])), [
+            Cmd::Flatten { ws: "X".into() },
+            Cmd::LayoutKind { ws: "X".into(), layout: Kind::Tiles },
+            Cmd::Layout { ws: "X".into(), axis: Axis::V }
+        ]);
+    }
+
+    #[test]
+    fn every_start_order_and_most_recent_window_builds_the_canonical_tree_and_twice_is_the_same() {
+        for (want, _) in targets() {
+            let Split(axis, _) = want else { unreachable!() };
+            let leaves = want.leaves();
+            let cmds = plan("X", &want);
+            for order in perms(&leaves) {
+                for start in starts(&order, axis) {
+                    for &recent in &leaves {
+                        let mut f = fake_with(&leaves);
+                        f.set_tree("X", &start, recent);
+                        run(&mut f, &cmds).unwrap_or_else(|e| panic!("{want:?} from {start:?}: {e}"));
+                        assert_eq!(f.tree("X"), want, "from {start:?}, most recent {recent}");
+                        run(&mut f, &cmds).unwrap();
+                        assert_eq!(f.tree("X"), want, "twice, from {start:?}");
+                        assert_eq!(f.focused, "T", "focus does not move");
+                        assert!(f.win(999).is_some_and(|w| w.floating), "a floating window is left alone");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rebuild_uses_the_promoted_root_axis() {
+        let t = tpl("h", r#"[{ app = "a" }, [{ app = "b" }, [{ app = "c" }, { app = "d" }]]]"#);
+        let ws = [tiled(2, "b"), tiled(3, "c"), tiled(4, "d")];
+        let cmds = rebuild(&t, &ws);
+        assert_eq!(cmds[2], Cmd::Layout { ws: "X".into(), axis: Axis::V });
+        let mut f = fake_with(&[2, 3, 4]);
+        run(&mut f, &cmds).unwrap();
+        assert_eq!(f.tree("X"), v(vec![Win(2), h(vec![Win(3), Win(4)])]));
+    }
+
+    #[test]
+    fn motivating_case_from_its_template() {
+        let t = tpl("h", r#"[{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]"#);
+        let ws = [tiled(49, "msgr"), tiled(10, "igcl"), tiled(44, "line")];
+        let mut f = fake_with(&[49, 10, 44]);
+        run(&mut f, &rebuild(&t, &ws)).unwrap();
+        assert_eq!(f.tree("X"), h(vec![Win(44), v(vec![Win(10), Win(49)])]));
+    }
+
+    /// Negative control 1 (from source, T31): join from the first leaf toward pos also wraps
+    /// both leaves, but leaves the first one most recent, so the next move lands in the wrong slot.
+    #[test]
+    fn joining_toward_pos_puts_the_next_leaf_in_the_wrong_slot() {
+        let want = h(vec![Win(1), v(vec![Win(2), Win(3), Win(4)])]);
+        let cmds: Vec<Cmd> = plan("X", &want)
+            .into_iter()
+            .map(|c| match c {
+                Cmd::JoinWith { id: 3, dir: Dir::Left } => Cmd::JoinWith { id: 2, dir: Dir::Right },
+                c => c,
+            })
+            .collect();
+        let mut f = fake_with(&[1, 2, 3, 4]);
+        run(&mut f, &cmds).unwrap();
+        assert_eq!(f.tree("X"), h(vec![Win(1), v(vec![Win(2), Win(4), Win(3)])]));
+    }
+
+    /// Negative control 2: building a sub-container before its parent has all its leaves makes
+    /// the sub-container the parent's most recent child, and its axis is the move's axis, so
+    /// deep move-in drops the next leaf at its index 0.
+    #[test]
+    fn building_a_sub_container_early_swallows_the_next_leaf() {
+        let want = h(vec![Win(1), v(vec![Win(2), h(vec![Win(3), Win(4)]), Win(5)])]);
+        let good = plan("X", &want);
+        let ordered = 3 + 16;
+        let mut early = good[..ordered].to_vec();
+        early.extend([
+            Cmd::JoinWith { id: 3, dir: Dir::Left },
+            Cmd::MoveWindow { id: 4, dir: Dir::Left },
+            Cmd::JoinWith { id: 4, dir: Dir::Up },
+            Cmd::MoveWindow { id: 5, dir: Dir::Left },
+        ]);
+        let mut f = fake_with(&[1, 2, 3, 4, 5]);
+        run(&mut f, &early).unwrap();
+        assert_eq!(f.tree("X"), h(vec![Win(1), v(vec![Win(2), h(vec![Win(5), Win(3), Win(4)])])]));
+        assert_eq!(good[ordered..], [
+            Cmd::JoinWith { id: 3, dir: Dir::Left },
+            Cmd::MoveWindow { id: 4, dir: Dir::Left },
+            Cmd::MoveWindow { id: 5, dir: Dir::Left },
+            Cmd::JoinWith { id: 4, dir: Dir::Up },
+        ]);
+    }
+
+    #[test]
+    fn fake_refuses_what_a_rebuild_never_sends() {
+        let mut f = fake_with(&[1, 2, 3]);
+        f.set_tree("X", &h(vec![Win(1), v(vec![Win(2), Win(3)])]), 3);
+        // Move-out of a container (at its edge, or across its axis) and a floating window.
+        assert!(f.run(&Cmd::MoveWindow { id: 3, dir: Dir::Down }).is_err());
+        assert!(f.run(&Cmd::MoveWindow { id: 2, dir: Dir::Left }).is_err());
+        assert!(f.run(&Cmd::MoveWindow { id: 999, dir: Dir::Left }).is_err());
+        // At the root's edge `stop` is a no-op success.
+        let mut f = fake_with(&[1, 2]);
+        f.run(&Cmd::MoveWindow { id: 2, dir: Dir::Right }).unwrap();
+        assert_eq!(f.tree("X"), h(vec![Win(1), Win(2)]));
+        // A root whose only child is a container: normalization would change it.
+        assert!(f.run(&Cmd::JoinWith { id: 2, dir: Dir::Left }).is_err());
     }
 
     #[test]
