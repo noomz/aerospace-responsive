@@ -66,7 +66,7 @@ const EMPTY_RETRY: [Duration; 5] = [
     Duration::from_secs(8),
     Duration::from_secs(15),
 ];
-pub const INERT_HINT: &str = "exclusive tiling needs an AeroSpace with window-moved/window-closed (restart AeroSpace after installing)";
+pub const INERT_HINT: &str = "window events need an AeroSpace with window-moved/window-closed (restart AeroSpace after installing)";
 
 struct Pending {
     due: Instant,
@@ -267,7 +267,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         }
         if self.sub_retry_at.is_some_and(|t| t <= now) {
             self.sub_retry_at = None;
-            if self.sub.is_none() && self.config.has_exclusive_tiling() {
+            if self.sub.is_none() && self.config.wants_window_events() {
                 self.spawn_subscription();
             }
         }
@@ -293,7 +293,15 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     }
 
     fn aero_socket(&mut self, up: bool) {
+        let came_back = up && !self.aero_up;
         self.aero_up = up;
+        // V51: window ids restart with the server, so every record is void. Only on the edge:
+        // the watcher also reports a socket that was already up when the daemon started.
+        if came_back && !self.persisted.template_records.is_empty() {
+            self.persisted.template_records.clear();
+            crate::log!("workspace template: AeroSpace restarted; every record dropped");
+            self.save_state();
+        }
         if up {
             crate::log!("AeroSpace socket present; backstop pass in {}s", BACKSTOP_DELAY.as_secs());
             self.backstop = Some(Instant::now() + BACKSTOP_DELAY);
@@ -679,11 +687,12 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     // ---------- exclusive tiling: the subscribe child (V14) ----------
 
     /// On a trigger that may have fixed the connection (Startup, config reload, unlock,
-    /// AeroSpace's socket appearing, explicit reconcile): run the child iff a rule exists.
+    /// AeroSpace's socket appearing, explicit reconcile): run the child iff a rule or a
+    /// workspace template exists (V53).
     fn ensure_subscription(&mut self) {
-        if !self.config.has_exclusive_tiling() {
+        if !self.config.wants_window_events() {
             if self.sub.take().is_some() {
-                crate::log!("exclusive tiling: no rule left; subscribe child stopped");
+                crate::log!("window events: no rule or template left; subscribe child stopped");
             }
             self.sub_retry_at = None;
             self.inert = None;
@@ -729,7 +738,12 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     /// The child is gone (or never started): inert, warn, and retry a bounded number of times.
     fn sub_failed(&mut self, how: String, stderr: String) {
         let detail = if stderr.is_empty() { String::new() } else { format!(" ({stderr})") };
-        self.warn(Class::ExclusiveTiling, "exclusive-tiling", &format!("exclusive tiling is inert: {how}{detail}. Hint: {INERT_HINT}"));
+        let what = match (self.config.has_exclusive_tiling(), self.config.has_workspace_template()) {
+            (true, true) => "exclusive tiling and workspace-template arrivals are",
+            (false, true) => "workspace-template arrivals are",
+            _ => "exclusive tiling is",
+        };
+        self.warn(Class::ExclusiveTiling, "exclusive-tiling", &format!("{what} inert: {how}{detail}. Hint: {INERT_HINT}"));
         self.inert = Some(how);
         if let Some(d) = SUB_RETRY.get(self.sub_retries) {
             self.sub_retry_at = Some(Instant::now() + *d);
@@ -752,6 +766,11 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let left: Vec<&WinInfo> = wins.iter().filter(|w| mem.floated_on(w.id, &w.app).is_some_and(|ws| ws != w.workspace)).collect();
         for w in left {
             self.apply_leave(w, &wins, &rules);
+            changed = true;
+        }
+        for ws in template::stale_records(&self.persisted.template_records, &wins) {
+            self.persisted.template_records.remove(&ws);
+            crate::log!("workspace template: {ws} record dropped (its windows changed while disconnected)");
             changed = true;
         }
         if changed {
@@ -1198,6 +1217,9 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         let removed: Vec<String> = names.into_iter().filter(|w| self.persisted.unpin(w)).collect();
         if removed.is_empty() {
             return Err("nothing to unpin".into());
+        }
+        for w in &removed {
+            self.persisted.template_records.remove(w); // V46: the armed pass rebuilds it
         }
         self.save_state();
         self.arm(Trigger::Unpin, true, None); // D17: unpin is a trigger
@@ -2260,5 +2282,79 @@ mod tests {
         assert_eq!(flattens(&log.lock().unwrap()), 2, "one rebuild, then one for both events queued during it: {:?}", log.lock().unwrap());
         let rec = &Persisted::load(&dir.path().join("state.json")).template_records["C"];
         assert_eq!(rec.slots["2.2"], [49, 50, 51]);
+    }
+
+    // ---------- workspace template: lifecycle (T38) ----------
+
+    /// `tpl_worker` after one arrival rebuild of `C`: a record for LINE 44, IGCL 10, Messenger 49.
+    fn tpl_built() -> (TestWorker, tempfile::TempDir) {
+        let (mut w, d) = tpl_worker("");
+        w.aero.add_window("C", 49, "msgr", "Messenger", false);
+        w.handle(moved(49, "C", None, "msgr"));
+        w.queue_drained();
+        assert!(w.persisted.template_records.contains_key("C"));
+        w.aero.log.clear();
+        (w, d)
+    }
+
+    fn disk_has_record(d: &tempfile::TempDir, ws: &str) -> bool {
+        Persisted::load(&d.path().join("state.json")).template_records.contains_key(ws)
+    }
+
+    #[test]
+    fn a_template_alone_runs_the_subscribe_child_and_warns_when_inert() {
+        let (mut w, d) = worker_cfg(docked(), TPL, None);
+        w.handle(Msg::Trigger(Trigger::Startup));
+        assert_eq!(w.aero.live_subs(), 1, "V53: a template without a rule still subscribes");
+        exit(&mut w, 2);
+        let st = ask(&mut w, Request::Status);
+        assert_eq!(st.exit, 4, "inert is a pending warning");
+        assert!(st.text.contains("workspace-template arrivals are inert: aerospace subscribe exited 2"), "{}", st.text);
+        assert!(w.sub_retry_at.is_some(), "the retry is shared");
+        w.tick(later());
+        assert_eq!(w.aero.live_subs(), 1, "and respawns");
+        set_config(&mut w, &d, "");
+        assert_eq!(w.aero.live_subs(), 0, "no rule and no template: the child stops");
+    }
+
+    #[test]
+    fn a_reconnect_resync_drops_a_record_whose_windows_changed() {
+        let (mut w, d) = tpl_built();
+        exit(&mut w, 1);
+        w.tick(later());
+        assert_eq!(w.aero.live_subs(), 1);
+        assert!(disk_has_record(&d, "C"), "nothing missed: the record stays");
+        // Messenger closes while no child listens; C is pinned meanwhile (V53 names no exemption).
+        w.aero.close_window(49);
+        w.persisted.pin(Pin { workspace: "C".into(), cg_id: 0, monitor_name: String::new() });
+        exit(&mut w, 1);
+        w.tick(later());
+        assert!(!w.persisted.template_records.contains_key("C") && !disk_has_record(&d, "C"), "dropped and saved");
+        assert!(w.aero.log.is_empty(), "no commands: {:?}", w.aero.log);
+    }
+
+    #[test]
+    fn records_die_with_the_aerospace_server_not_with_the_daemon() {
+        let (mut w, d) = tpl_built();
+        w.handle(Msg::AeroSocket(true)); // the watcher's first report: the socket was already up
+        assert!(disk_has_record(&d, "C"), "V51: a daemon restart alone keeps records");
+        w.handle(Msg::AeroSocket(false));
+        assert!(disk_has_record(&d, "C"));
+        w.handle(Msg::AeroSocket(true));
+        assert!(w.persisted.template_records.is_empty() && !disk_has_record(&d, "C"), "V51: the server came back");
+        assert!(w.aero.log.is_empty(), "no commands: the next pass rebuilds");
+    }
+
+    #[test]
+    fn unpin_drops_the_record_and_arms_a_pass() {
+        let (mut w, d) = tpl_built();
+        w.persisted.pin(Pin { workspace: "C".into(), cg_id: 0, monitor_name: String::new() });
+        w.drop_template_record("C");
+        assert!(w.persisted.template_records.contains_key("C"), "pinned keeps its record");
+        let r = ask(&mut w, Request::Unpin { workspace: Some("C".into()), all: false });
+        assert_eq!(r.exit, 0, "{}", r.text);
+        assert!(!disk_has_record(&d, "C"), "V46: unpin drops the record");
+        let p = w.pending.as_ref().expect("and arms a pass");
+        assert!(p.full && p.trigger == Trigger::Unpin);
     }
 }

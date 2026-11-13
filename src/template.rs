@@ -285,6 +285,22 @@ pub fn execute(
     Ok(true)
 }
 
+/// V53: on a (re)connect, the workspaces whose record holds other window ids than the tiled
+/// windows listed there (events missed while disconnected). A set compare, no config: an empty
+/// workspace with an all-empty record is equal (V41).
+pub fn stale_records(records: &TemplateRecords, windows: &[WinInfo]) -> Vec<String> {
+    use std::collections::BTreeSet;
+    records
+        .iter()
+        .filter(|(ws, rec)| {
+            let held: BTreeSet<u32> = rec.slots.values().chain([&rec.rest]).flatten().copied().collect();
+            let live: BTreeSet<u32> = windows.iter().filter(|w| &w.workspace == *ws && w.tiled()).map(|w| w.id).collect();
+            held != live
+        })
+        .map(|(ws, _)| ws.clone())
+        .collect()
+}
+
 /// V41: a closed window leaves every record it is in; no commands. True when one changed.
 pub fn forget(records: &mut TemplateRecords, id: u32) -> bool {
     let mut changed = false;
@@ -775,5 +791,28 @@ tree = [{ app = "p" }]
         assert!(execute(&mut records, "X", wanted(&t, &[]), &[], &mut |_| saves += 1, |_| unreachable!()).unwrap());
         assert!(records.is_empty());
         assert_eq!(saves, 1);
+    }
+
+    #[test]
+    fn stale_records_compare_id_sets_and_ignore_config() {
+        let t = tpl("h", r#"[{ app = "a" }, { app = "b" }]"#);
+        let ws = [tiled(1, "a"), tiled(2, "b"), tiled(3, "z")];
+        let mut records = TemplateRecords::new();
+        records.insert("X".into(), wanted(&t, &ws));
+        records.insert("E".into(), wanted(&t, &[]));
+        let mut other = tiled(9, "a");
+        other.workspace = "Y".into();
+        let mut floating = win(8, "b", "", "floating");
+        floating.workspace = "X".into();
+        // Same ids (daemon restart; dock -> undock -> dock flattened them), in any order, plus a
+        // floating window and a window elsewhere: equal. An empty workspace with an all-empty record: equal.
+        let same = [ws[2].clone(), ws[0].clone(), ws[1].clone(), other.clone(), floating];
+        assert!(stale_records(&records, &same).is_empty());
+        // A window closed while disconnected, or a new one arrived: differs.
+        assert_eq!(stale_records(&records, &ws[..2]), ["X"]);
+        assert_eq!(stale_records(&records, &[ws[0].clone(), ws[1].clone(), ws[2].clone(), tiled(4, "a")]), ["X"]);
+        let mut e = tiled(5, "a");
+        e.workspace = "E".into();
+        assert_eq!(stale_records(&records, &[ws[0].clone(), ws[1].clone(), ws[2].clone(), e]), ["E"]);
     }
 }

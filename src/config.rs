@@ -522,6 +522,15 @@ impl Config {
         !self.exclusive_tiling.is_empty() || self.profile.iter().any(|p| !p.exclusive_tiling.is_empty())
     }
 
+    pub fn has_workspace_template(&self) -> bool {
+        !self.workspace_template.is_empty() || self.profile.iter().any(|p| !p.workspace_template.is_empty())
+    }
+
+    /// V53: the subscribe child runs for an exclusive-tiling rule or a workspace template.
+    pub fn wants_window_events(&self) -> bool {
+        self.has_exclusive_tiling() || self.has_workspace_template()
+    }
+
     /// Whether `outer.top` is this tool's to write (a `[gaps]` block exists).
     pub fn owns_gaps(&self) -> bool {
         self.gaps.is_some()
