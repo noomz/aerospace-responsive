@@ -414,7 +414,8 @@ Reviewed by codex 2026-11-12 (R1–R10 below name its findings). V51–V54 and t
   workspace again and may flatten it on the next pass (R8).
 - V51 Server lifetime (R6). Fork window ids are a counter that restarts with AeroSpace, so a record is valid for
   one AeroSpace server run only. When the daemon sees the server come back (`AeroSocket(true)`, V14) it removes
-  every template record; the next pass rebuilds. A daemon restart alone keeps records.
+  every template record; the next pass rebuilds. A daemon restart alone keeps records. "Come back" includes a
+  replaced socket (V55).
 - V52 A float or tile the daemon itself sends for a window on an applying-template workspace (arrival verdict,
   late pre-layout answer, converge) removes that workspace's record, so the queue drain or the next pass
   rebuilds (R3).
@@ -423,6 +424,10 @@ Reviewed by codex 2026-11-12 (R1–R10 below name its findings). V51–V54 and t
   also compares template records with the windows listed, and removes a record that differs.
 - V54 Rebuild targets work by id: every command carries `--window-id` or `--workspace`, so a workspace that is
   not focused or not visible is rebuilt the same way, and focus does not move.
+- V55 Restart detection (amends D24 P5). The watcher tracks the AeroSpace socket's identity (dev, inode), not
+  only its existence. A socket replaced between two kqueue wakeups (unlink + bind coalesced, so it exists at
+  both reads) sends `AeroSocket(false)` then `AeroSocket(true)`, so V51 fires. An id set compare cannot catch it
+  (V53): the new server hands the same apps the same ids. See B9.
 
 ## §T tasks
 
@@ -447,3 +452,4 @@ T41|x|acceptance at the desk: `C` template on built-in; LINE / IGCL / Messenger 
 id|date|cause|fix
 -|-|-|-
 B8|2026-11-13|drain rebuild (window arrival) that failed or aborted halfway was only logged; record gone, but no pass armed, so the half-built tree stayed until an unrelated trigger|V47
+B9|2026-11-14|AeroSpace restart: old socket unlinked and new one bound inside one kqueue wakeup; watcher compared existence only (true → true), sent no edge, V51 never dropped records; new server reused ids 3/5/20, so `C` showed `up to date` while flat|V55
