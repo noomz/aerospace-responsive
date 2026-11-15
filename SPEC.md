@@ -445,9 +445,10 @@ Reviewed by codex 2026-11-12 (R1–R10 below name its findings). V51–V54 and t
   swap between two containers of the same layout, is not seen. No loop: when the read after a drift rebuild
   still drifts, the pass warns (`template C: tree still differs after rebuild`) and marks the record, and drift
   then triggers nothing until the record changes (new window set, template edit, `arrange`, V51 drop).
-- V57 Lone window (B11, amends V56). A tiled window that is the only one in its innermost template container
+- V57 Lone window (B11, amends V56). A tiled window that is the only one in a template container below the root
   (V39 collapses that container) passes the drift check under its V56 parent layout OR that container's own
-  `<axis>_tiles` from the template, before collapse. So the one-child container a `window-closed` leaves with
+  `<axis>_tiles` from the template, before collapse; every such container on its path counts (one that collapsed
+  at build time can be the one a later close leaves). So the one-child container a `window-closed` leaves with
   normalization off (V41) is not drift, and a close sends no commands (V40). Limit, by design: a lone window
   wrapped by hand in a one-child container of that axis is not seen.
 
