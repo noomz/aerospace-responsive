@@ -524,6 +524,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             self.warn(Class::Pass, "mismatch", &msg);
             "mismatch after re-pass".to_string()
         };
+        self.warn_stuck();
         self.restore_visibility();
         self.record(p.trigger, result.clone());
         reply_all(p.waiters, Response::ok(format!("pass {result}\n"), json!(rep)));
@@ -536,7 +537,16 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
                 self.arm(Trigger::Repass, false, None);
             }
             Ok(s) => {
-                let m = pass::diff(r, &s, pinned, &BTreeSet::new());
+                let mut m = pass::diff(r, &s, pinned, &BTreeSet::new());
+                // V42, V56: drift is a mismatch here. Only an applying template with a record can
+                // drift, so other verifies (one per new window) make no extra read.
+                let records = &self.persisted.template_records;
+                if r.applying(&s, pinned).iter().any(|ws| records.contains_key(ws)) {
+                    match self.aero.window_details() {
+                        Ok(d) => m.extend(pass::drift_mismatches(r, &s, pinned, &self.persisted.template_records, &d)),
+                        Err(e) => crate::log!("verify: window read failed: {e:#}"),
+                    }
+                }
                 if m.is_empty() {
                     if p.trigger != Trigger::WindowDetected {
                         crate::log!("verify: model matches"); // every new window would log it
@@ -670,6 +680,15 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     fn set_config_warnings(&mut self, fresh: Vec<(String, String)>) {
         for m in self.warnings.replace(Class::Config, fresh) {
             crate::log!("warning: {m}");
+        }
+    }
+
+    /// V56: one warning per record marked stuck, raised after a pass clears its class, so it
+    /// lasts as long as the mark.
+    fn warn_stuck(&mut self) {
+        let stuck: Vec<String> = self.persisted.template_records.iter().filter(|(_, r)| r.stuck).map(|(ws, _)| ws.clone()).collect();
+        for ws in stuck {
+            self.warn(Class::Pass, &format!("stuck:{ws}"), &format!("template {ws}: tree still differs after rebuild"));
         }
     }
 
@@ -2289,6 +2308,40 @@ mod tests {
     }
 
     #[test]
+    fn v56_unlock_verify_reports_drift_and_the_repass_rebuilds() {
+        // `C` where placement leaves it (monitor 3), template without `when`.
+        let mut f = tpl_on_3();
+        f.add_window("C", 49, "msgr", "Messenger", false);
+        let (mut w, _d) = live(f, &tpl_any());
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        let canonical = w.aero.tree("C");
+        assert_eq!(canonical, Tree::Split(Axis::H, vec![Tree::Win(44), Tree::Split(Axis::V, vec![Tree::Win(10), Tree::Win(49)])]));
+        w.aero.set_tree("C", &Tree::Split(Axis::H, vec![Tree::Win(44), Tree::Win(10), Tree::Win(49)]), 10); // regrouped by hand
+        w.aero.log.clear();
+        w.handle(Msg::Trigger(Trigger::Unlock));
+        w.tick(later());
+        assert!(w.aero.log.is_empty(), "verify sends nothing: {:?}", w.aero.log);
+        let p = w.pending.as_ref().expect("V42: drift is a mismatch, one re-pass");
+        assert!(p.full && p.repass);
+        w.tick(later());
+        assert_eq!(flattens(&w.aero.log), 1, "the re-pass rebuilds: {:?}", w.aero.log);
+        assert_eq!(w.aero.tree("C"), canonical);
+        assert!(w.pending.is_none());
+    }
+
+    #[test]
+    fn v56_a_stuck_record_warns_while_marked() {
+        let (mut w, _d) = live(tpl_on_3(), &tpl_any());
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        w.persisted.template_records.get_mut("C").unwrap().stuck = true;
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert!(w.warnings.list().iter().any(|x| x.message == "template C: tree still differs after rebuild"), "{:?}", w.warnings.list());
+    }
+
+    #[test]
     fn a_retile_on_leave_drops_the_record_and_the_arrival_rebuilds() {
         let (mut w, _d) = tpl_worker(RULE);
         w.handle(moved(44, "C", None, "line"));
@@ -2581,7 +2634,7 @@ mod tests {
 
     #[test]
     fn observe_keeps_the_template_records_on_disk_through_other_saves() {
-        let old = crate::state::TemplateRecord { fingerprint: "old".into(), slots: std::collections::BTreeMap::from([("1".to_string(), vec![44])]), rest: vec![] };
+        let old = crate::state::TemplateRecord { fingerprint: "old".into(), slots: std::collections::BTreeMap::from([("1".to_string(), vec![44])]), rest: vec![], stuck: false };
         let disk = Persisted { template_records: std::collections::BTreeMap::from([("C".to_string(), old.clone())]), ..Default::default() };
         let (mut w, d) = worker_cfg(tpl_on_3(), &tpl_any(), Some(&disk));
         w.observe = true;

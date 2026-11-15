@@ -226,24 +226,27 @@ pub fn wanted(t: &Template, windows: &[WinInfo]) -> TemplateRecord {
     let mut keys = Vec::new();
     paths(&t.tree, "", &mut keys);
     let a = assign(&t.tree, windows);
-    TemplateRecord { fingerprint: fingerprint(t), slots: keys.into_iter().zip(a.slots).collect(), rest: a.rest }
+    TemplateRecord { fingerprint: fingerprint(t), slots: keys.into_iter().zip(a.slots).collect(), rest: a.rest, stuck: false }
 }
 
-/// Why a pass would rebuild (V40 (a)); the text is explain's `record:` value.
+/// Why a pass would rebuild (V40 (a), (d)); the text is explain's `record:` value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pending {
     FirstRun,
     TemplateChanged,
     WindowsChanged,
+    /// V56: the record is equal but the live tree is not the canonical one.
+    TreeDrifted,
 }
 
 impl Pending {
-    /// The dry-run block's reason: `first run`, `template changed`, `windows changed`.
+    /// The dry-run block's reason: `first run`, `template changed`, `windows changed`, `tree drifted`.
     pub fn reason(self) -> &'static str {
         match self {
             Pending::FirstRun => "first run",
             Pending::TemplateChanged => "template changed",
             Pending::WindowsChanged => "windows changed",
+            Pending::TreeDrifted => "tree drifted",
         }
     }
 }
@@ -254,12 +257,13 @@ impl fmt::Display for Pending {
     }
 }
 
-/// V41 pass rule: no record → rebuild; equal → nothing; differs → rebuild.
+/// V41 pass rule: no record → rebuild; equal → nothing; differs → rebuild. The V56 `stuck`
+/// mark is not compared.
 pub fn pending(have: Option<&TemplateRecord>, want: &TemplateRecord) -> Option<Pending> {
     match have {
         None => Some(Pending::FirstRun),
         Some(h) if h.fingerprint != want.fingerprint => Some(Pending::TemplateChanged),
-        Some(h) if h != want => Some(Pending::WindowsChanged),
+        Some(h) if h.slots != want.slots || h.rest != want.rest => Some(Pending::WindowsChanged),
         Some(_) => None,
     }
 }
@@ -351,11 +355,14 @@ pub fn stale_records(records: &TemplateRecords, windows: &[WinInfo]) -> Vec<Stri
 pub fn forget(records: &mut TemplateRecords, id: u32) -> bool {
     let mut changed = false;
     for rec in records.values_mut() {
+        let mut here = false;
         for list in rec.slots.values_mut().chain([&mut rec.rest]) {
             let before = list.len();
             list.retain(|x| *x != id);
-            changed |= list.len() != before;
+            here |= list.len() != before;
         }
+        rec.stuck &= !here; // V56: a new window set ends the stuck mark
+        changed |= here;
     }
     changed
 }
@@ -986,7 +993,7 @@ tree = [{ app = "p" }]
     }
 
     fn rec(fp: &str) -> TemplateRecord {
-        TemplateRecord { fingerprint: fp.into(), slots: BTreeMap::new(), rest: vec![] }
+        TemplateRecord { fingerprint: fp.into(), slots: BTreeMap::new(), rest: vec![], stuck: false }
     }
 
     /// Runs `execute` for `X` over three commands; `stop_at` = (index, fails?) aborts or fails there.
