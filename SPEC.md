@@ -334,10 +334,19 @@ the root only, and a pin only protects what was arranged by hand.
         rest: none
   ```
   `record:` ∈ `up to date` | `pending: first run` | `pending: template changed` | `pending: windows changed` |
-  `not applied: when does not match <monitor>` | `not applied: pinned`. Empty slot prints `(no window)`.
+  `pending: tree drifted (<app>: <want> wanted, <have> live)` | `not applied: when does not match <monitor>` |
+  `not applied: pinned`. Empty slot prints `(no window)`. Amended 2026-11-15 (V56, T44): `record:` is what a pass
+  would do, one owner (`template::judge`) for pass and explain, so a stuck record (V56 no loop) reads `up to date`;
+  the stuck warning is its signal. Drift names the first drifted window, depth-first (`IGCL: v_tiles wanted,
+  h_tiles live`; id when the app name is empty). `--json` view gains `drift` (`{id, app, want, have}` | null).
 - I.tpl.cli.dryrun — `reconcile --dry-run` adds a `workspace-template rebuild:` block (workspace + reason) after
-  the exclusive-tiling block; its commands sit where layout commands sit.
-- I.tpl.cli.status — one line, omitted when no template: `workspace template: live|inert; C applied`.
+  the exclusive-tiling block; its commands sit where layout commands sit. Reason text = explain's after `pending: `
+  (`tree drifted (IGCL: v_tiles wanted, h_tiles live)`), same in `--json` `rebuild[].reason`.
+- I.tpl.cli.status — one line, omitted when no template: `workspace template: live|inert; C applied`, then
+  `; C pending: tree drifted (IGCL: v_tiles wanted, h_tiles live)` per applying template whose tree drifted (V56);
+  `--json` gains `drifted` (workspace → reason). Not from memory, unlike I.cli.status: one window read, only
+  while some template holds a record; a failed read drops the clause, status still answers. Other pending
+  reasons are not shown here (explain).
 - I.tpl.docs — README config reference + example block (commented, parses when uncommented, V35 style).
 
 ## §V invariants
