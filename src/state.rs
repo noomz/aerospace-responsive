@@ -193,6 +193,8 @@ pub enum Class {
     World,
     Pass,
     ExclusiveTiling,
+    /// V56: one per template record marked stuck; follows the marks, not the pass.
+    Template,
 }
 
 #[derive(Debug, Clone, Serialize)]

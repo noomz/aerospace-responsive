@@ -683,12 +683,11 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
         }
     }
 
-    /// V56: one warning per record marked stuck, raised after a pass clears its class, so it
-    /// lasts as long as the mark.
+    /// V56: one warning per record marked stuck, kept (with its `since`) exactly as long as the mark.
     fn warn_stuck(&mut self) {
-        let stuck: Vec<String> = self.persisted.template_records.iter().filter(|(_, r)| r.stuck).map(|(ws, _)| ws.clone()).collect();
-        for ws in stuck {
-            self.warn(Class::Pass, &format!("stuck:{ws}"), &format!("template {ws}: tree still differs after rebuild"));
+        let fresh = self.persisted.template_records.iter().filter(|(_, r)| r.stuck).map(|(ws, _)| (format!("stuck:{ws}"), format!("template {ws}: tree still differs after rebuild"))).collect();
+        for m in self.warnings.replace(Class::Template, fresh) {
+            crate::log!("warning: {m}");
         }
     }
 
@@ -2338,7 +2337,16 @@ mod tests {
         w.persisted.template_records.get_mut("C").unwrap().stuck = true;
         w.handle(Msg::Trigger(Trigger::Display));
         w.tick(later());
-        assert!(w.warnings.list().iter().any(|x| x.message == "template C: tree still differs after rebuild"), "{:?}", w.warnings.list());
+        let stuck = |w: &TestWorker| w.warnings.list().into_iter().find(|x| x.message == "template C: tree still differs after rebuild");
+        let first = stuck(&w).expect("warned").since;
+        std::thread::sleep(std::time::Duration::from_millis(1100)); // `since` has second resolution
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert_eq!(stuck(&w).expect("still marked, still warned").since, first, "a clean pass keeps it, not re-raised");
+        w.persisted.template_records.get_mut("C").unwrap().stuck = false;
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        assert!(stuck(&w).is_none(), "the mark gone, the warning gone");
     }
 
     #[test]
