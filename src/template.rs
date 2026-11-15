@@ -264,6 +264,44 @@ pub fn pending(have: Option<&TemplateRecord>, want: &TemplateRecord) -> Option<P
     }
 }
 
+/// V56: a tiled window whose live parent layout is not the one the canonical tree gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drift {
+    pub id: u32,
+    pub want: String,
+    pub have: String,
+}
+
+/// V56: the tiled windows of `t`'s workspace (`windows`, as `wanted` takes them) whose parent
+/// layout differs from the canonical tree's, depth-first. Finds regrouping, not reordering:
+/// a reorder inside one container or a swap between same-layout containers is not seen.
+pub fn drift(t: &Template, windows: &[WinInfo]) -> Vec<Drift> {
+    layout_drift(&canonical(t.root, &t.tree, &assign(&t.tree, windows)), windows)
+}
+
+fn layout_drift(want: &Tree, windows: &[WinInfo]) -> Vec<Drift> {
+    fn walk(t: &Tree, out: &mut Vec<(u32, Axis)>) {
+        if let Tree::Split(axis, kids) = t {
+            for k in kids {
+                match k {
+                    Tree::Win(id) => out.push((*id, *axis)),
+                    split => walk(split, out),
+                }
+            }
+        }
+    }
+    let mut parents = Vec::new();
+    walk(want, &mut parents);
+    parents
+        .into_iter()
+        .filter_map(|(id, axis)| {
+            let w = windows.iter().find(|w| w.id == id && w.tiled())?;
+            let want = format!("{}_tiles", axis_word(axis));
+            (w.layout != want).then(|| Drift { id, want, have: w.layout.clone() })
+        })
+        .collect()
+}
+
 /// V41: runs a rebuild of `ws` so that only a completed one leaves a record. The old record is
 /// removed and saved before the first command; `want` is stored and saved after the last
 /// command succeeds. `run` executes one command and returns `Ok(false)` when it stopped before
@@ -755,6 +793,90 @@ tree = [{ app = "p" }]
         let mut f = fake_with(&[49, 10, 44]);
         run(&mut f, &rebuild(&t, &ws)).unwrap();
         assert_eq!(f.tree("X"), h(vec![Win(44), v(vec![Win(10), Win(49)])]));
+    }
+
+    // --- V56 drift (T42) ---
+
+    /// The live read of `tree`: each window with its parent's layout, the way AeroSpace reports
+    /// `%{window-layout}`. Written apart from `layout_drift`'s walk on purpose.
+    fn live(tree: &Tree, kind: &str) -> Vec<WinInfo> {
+        fn go(t: &Tree, kind: &str, out: &mut Vec<WinInfo>) {
+            let Split(a, kids) = t else { return };
+            let l = format!("{}_{kind}", if *a == Axis::H { "h" } else { "v" });
+            for k in kids {
+                match k {
+                    Win(id) => out.push(win(*id, "app", "", &l)),
+                    s => go(s, "tiles", out),
+                }
+            }
+        }
+        let mut out = Vec::new();
+        go(tree, kind, &mut out);
+        out
+    }
+
+    fn drifted(want: &Tree, ws: &[WinInfo]) -> Vec<(u32, String, String)> {
+        layout_drift(want, ws).into_iter().map(|d| (d.id, d.want, d.have)).collect()
+    }
+
+    #[test]
+    fn v56_b10_tree_drifts_on_the_window_that_left_its_stack() {
+        let t = tpl("h", r#"[{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]"#);
+        // B10 live read: IGCL out of the v-stack, Messenger alone in it.
+        let ws = [win(3, "line", "", "h_tiles"), win(5, "igcl", "", "h_tiles"), win(20, "msgr", "", "v_tiles")];
+        assert_eq!(drift(&t, &ws), [Drift { id: 5, want: "v_tiles".into(), have: "h_tiles".into() }]);
+        let ok = [win(3, "line", "", "h_tiles"), win(5, "igcl", "", "v_tiles"), win(20, "msgr", "", "v_tiles")];
+        assert!(drift(&t, &ok).is_empty());
+    }
+
+    #[test]
+    fn v56_canonical_tree_built_from_every_start_does_not_drift() {
+        for (want, _) in targets() {
+            let Split(axis, _) = want else { unreachable!() };
+            let leaves = want.leaves();
+            let cmds = plan("X", &want);
+            for order in perms(&leaves) {
+                for start in starts(&order, axis) {
+                    let mut f = fake_with(&leaves);
+                    f.set_tree("X", &start, leaves[0]);
+                    run(&mut f, &cmds).unwrap();
+                    assert_eq!(drifted(&want, &live(&f.tree("X"), "tiles")), [], "built from {start:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v56_rest_windows_want_the_root_and_a_promoted_root_its_axis() {
+        let t = tpl("h", r#"[{ app = "a" }, [{ app = "b" }, { app = "c" }]]"#);
+        let ws = [tiled(1, "a"), win(2, "b", "", "v_tiles"), win(3, "c", "", "v_tiles"), win(9, "z", "", "v_tiles")];
+        assert_eq!(drift(&t, &ws), [Drift { id: 9, want: "h_tiles".into(), have: "v_tiles".into() }]);
+        // Root promoted to v (V39 (4)): its direct children want v_tiles.
+        let t = tpl("h", r#"[{ app = "a" }, [{ app = "b" }, [{ app = "c" }, { app = "d" }]]]"#);
+        let ws = [win(2, "b", "", "v_tiles"), win(3, "c", "", "h_tiles"), win(4, "d", "", "h_tiles")];
+        assert!(drift(&t, &ws).is_empty());
+    }
+
+    #[test]
+    fn v56_floating_is_not_compared() {
+        let t = tpl("h", r#"[{ app = "a" }, [{ app = "b" }, { app = "c" }]]"#);
+        let ws = [tiled(1, "a"), win(2, "b", "", "v_tiles"), win(3, "c", "", "v_tiles"), win(4, "b", "", "floating")];
+        assert!(drift(&t, &ws).is_empty());
+    }
+
+    #[test]
+    fn v56_accordion_root_drifts() {
+        let want = h(vec![Win(3), v(vec![Win(5), Win(20)])]);
+        assert_eq!(drifted(&want, &live(&want, "accordion")), [(3, "h_tiles".into(), "h_accordion".into())]);
+    }
+
+    /// Documented limit (V56): order is not read (C20), so these pass as up to date.
+    #[test]
+    fn v56_reorder_and_same_layout_swap_are_not_seen() {
+        let want = h(vec![Win(3), v(vec![Win(5), Win(20)])]);
+        assert!(drifted(&want, &live(&h(vec![v(vec![Win(20), Win(5)]), Win(3)]), "tiles")).is_empty());
+        let want = h(vec![v(vec![Win(1), Win(2)]), v(vec![Win(3), Win(4)])]);
+        assert!(drifted(&want, &live(&h(vec![v(vec![Win(1), Win(3)]), v(vec![Win(2), Win(4)])]), "tiles")).is_empty());
     }
 
     /// Negative control 1 (from source, T31): join from the first leaf toward pos also wraps
