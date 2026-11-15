@@ -237,6 +237,8 @@ pub enum Rebuilt {
 pub struct Rebuild {
     pub workspace: String,
     pub why: Option<template::Pending>,
+    /// V56: the first drifted window when `why` is `TreeDrifted`.
+    pub drift: Option<template::Drift>,
     pub cmds: Vec<Cmd>,
     pub record: TemplateRecord,
 }
@@ -246,10 +248,8 @@ impl Rebuild {
     pub fn of(t: &template::Template, details: &[WinInfo], records: &TemplateRecords) -> Self {
         let wins = on(&t.workspace, details);
         let record = template::wanted(t, &wins);
-        let have = records.get(&t.workspace);
-        let drifted = || !have.is_some_and(|h| h.stuck) && !template::drift(t, &wins).is_empty();
-        let why = template::pending(have, &record).or_else(|| drifted().then_some(template::Pending::TreeDrifted));
-        Rebuild { workspace: t.workspace.clone(), why, cmds: template::rebuild(t, &wins), record }
+        let (why, drift) = template::judge(t, &wins, records.get(&t.workspace), &record);
+        Rebuild { workspace: t.workspace.clone(), why, drift, cmds: template::rebuild(t, &wins), record }
     }
 }
 

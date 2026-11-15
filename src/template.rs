@@ -269,11 +269,47 @@ pub fn pending(have: Option<&TemplateRecord>, want: &TemplateRecord) -> Option<P
 }
 
 /// V56: a tiled window whose live parent layout is not the one the canonical tree gives it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `app` = its app name, as explain lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Drift {
     pub id: u32,
+    pub app: String,
     pub want: String,
     pub have: String,
+}
+
+impl fmt::Display for Drift {
+    /// `IGCL: v_tiles wanted, h_tiles live` (the id when the app name is empty).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let who = if self.app.is_empty() { self.id.to_string() } else { self.app.clone() };
+        write!(f, "{who}: {} wanted, {} live", self.want, self.have)
+    }
+}
+
+/// The one text every surface shows for why a template rebuilds: `tree drifted (IGCL: v_tiles
+/// wanted, h_tiles live)` names the first drifted window (V56); other reasons as `reason`.
+pub fn reason(why: Pending, first: Option<&Drift>) -> String {
+    match first {
+        Some(d) => format!("{} ({d})", why.reason()),
+        None => why.reason().into(),
+    }
+}
+
+/// The single owner of "would a pass rebuild `t` now" (V40 a, d): the record compare (V41),
+/// else drift (V56) unless the record is marked stuck. `wins` = `t`'s workspace windows,
+/// `want` = `wanted(t, wins)`. Returns the reason and, for drift, the first drifted window in
+/// `drift`'s depth-first order.
+pub fn judge(t: &Template, wins: &[WinInfo], have: Option<&TemplateRecord>, want: &TemplateRecord) -> (Option<Pending>, Option<Drift>) {
+    if let Some(p) = pending(have, want) {
+        return (Some(p), None);
+    }
+    if have.is_some_and(|h| h.stuck) {
+        return (None, None);
+    }
+    match drift(t, wins).into_iter().next() {
+        Some(d) => (Some(Pending::TreeDrifted), Some(d)),
+        None => (None, None),
+    }
 }
 
 /// V56: the tiled windows of `t`'s workspace (`windows`, as `wanted` takes them) whose parent
@@ -328,7 +364,7 @@ fn layout_drift(want: &Tree, windows: &[WinInfo]) -> Vec<Drift> {
         .filter_map(|(id, axis)| {
             let w = windows.iter().find(|w| w.id == id && w.tiled())?;
             let want = format!("{}_tiles", axis_word(axis));
-            (w.layout != want).then(|| Drift { id, want, have: w.layout.clone() })
+            (w.layout != want).then(|| Drift { id, app: w.app_name.clone(), want, have: w.layout.clone() })
         })
         .collect()
 }
@@ -407,8 +443,10 @@ pub struct View {
     pub monitor: Option<String>,
     pub applies: bool,
     /// `up to date` | `pending: <reason>` | `not applied: when does not match <monitor>` |
-    /// `not applied: pinned`.
+    /// `not applied: pinned`. Drift reads `pending: tree drifted (IGCL: v_tiles wanted, h_tiles live)`.
     pub record: String,
+    /// V56: the first drifted window while `record` is `pending: tree drifted`.
+    pub drift: Option<Drift>,
     pub tree: Vec<Row>,
     pub rest: Vec<Win>,
 }
@@ -468,12 +506,13 @@ pub fn view(
             let at = monitor_of.get(&t.workspace).copied();
             let name = at.map(|m| displays.iter().find(|x| x.aero_id == m).map_or(format!("monitor {m}"), |x| x.aero_name.clone()));
             let when_ok = at.is_some_and(|m| d.monitors.contains(&m));
-            let record = if !when_ok {
-                format!("not applied: when does not match {}", name.as_deref().unwrap_or("(no monitor)"))
+            let (record, drift) = if !when_ok {
+                (format!("not applied: when does not match {}", name.as_deref().unwrap_or("(no monitor)")), None)
             } else if pinned.contains(&t.workspace) {
-                "not applied: pinned".into()
+                ("not applied: pinned".into(), None)
             } else {
-                pending(records.get(&t.workspace), &want).map_or("up to date".into(), |p| p.to_string())
+                let (why, first) = judge(t, &wins, records.get(&t.workspace), &want);
+                (why.map_or("up to date".into(), |p| format!("pending: {}", reason(p, first.as_ref()))), first)
             };
             let mut tree = vec![];
             let a = assign(&t.tree, &wins); // depth-first, unlike the record's path-keyed map
@@ -486,6 +525,7 @@ pub fn view(
                 monitor: name,
                 applies: when_ok && !pinned.contains(&t.workspace),
                 record,
+                drift,
                 tree,
                 rest: a.rest.iter().map(|&id| win(id)).collect(),
             }
@@ -858,7 +898,7 @@ tree = [{ app = "p" }]
         let t = tpl("h", r#"[{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]"#);
         // B10 live read: IGCL out of the v-stack, Messenger alone in it.
         let ws = [win(3, "line", "", "h_tiles"), win(5, "igcl", "", "h_tiles"), win(20, "msgr", "", "v_tiles")];
-        assert_eq!(drift(&t, &ws), [Drift { id: 5, want: "v_tiles".into(), have: "h_tiles".into() }]);
+        assert_eq!(drift(&t, &ws), [Drift { id: 5, app: "igcl".into(), want: "v_tiles".into(), have: "h_tiles".into() }]);
         let ok = [win(3, "line", "", "h_tiles"), win(5, "igcl", "", "v_tiles"), win(20, "msgr", "", "v_tiles")];
         assert!(drift(&t, &ok).is_empty());
     }
@@ -884,7 +924,7 @@ tree = [{ app = "p" }]
     fn v56_rest_windows_want_the_root_and_a_promoted_root_its_axis() {
         let t = tpl("h", r#"[{ app = "a" }, [{ app = "b" }, { app = "c" }]]"#);
         let ws = [tiled(1, "a"), win(2, "b", "", "v_tiles"), win(3, "c", "", "v_tiles"), win(9, "z", "", "v_tiles")];
-        assert_eq!(drift(&t, &ws), [Drift { id: 9, want: "h_tiles".into(), have: "v_tiles".into() }]);
+        assert_eq!(drift(&t, &ws), [Drift { id: 9, app: "z".into(), want: "h_tiles".into(), have: "v_tiles".into() }]);
         // Root promoted to v (V39 (4)): its direct children want v_tiles.
         let t = tpl("h", r#"[{ app = "a" }, [{ app = "b" }, [{ app = "c" }, { app = "d" }]]]"#);
         let ws = [win(2, "b", "", "v_tiles"), win(3, "c", "", "h_tiles"), win(4, "d", "", "h_tiles")];
@@ -920,7 +960,7 @@ tree = [{ app = "p" }]
         }
         // b and c share h, so b is not lone there; c is lone in its inner v.
         let ws = [win(1, "a", "", "v_tiles"), win(2, "b", "", "v_tiles"), win(3, "c", "", "v_tiles")];
-        assert_eq!(drift(&t, &ws), [Drift { id: 2, want: "h_tiles".into(), have: "v_tiles".into() }]);
+        assert_eq!(drift(&t, &ws), [Drift { id: 2, app: "b".into(), want: "h_tiles".into(), have: "v_tiles".into() }]);
         // A container holding two windows is not lone: regrouped out of it, both drift.
         let t = tpl("v", r#"[{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]"#);
         let ws = [win(44, "line", "", "v_tiles"), win(10, "igcl", "", "v_tiles"), win(49, "msgr", "", "v_tiles")];

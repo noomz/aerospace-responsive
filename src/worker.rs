@@ -16,7 +16,7 @@ use crate::template;
 use crate::tiling::{self, Leave, Plan, Rule};
 use crate::world::{self, WinInfo};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -143,7 +143,7 @@ fn reasons(plans: &[Plan]) -> Vec<(String, String)> {
 
 /// (workspace, why it rebuilds) for the dry-run block.
 fn rebuild_reasons(rebuilds: &[pass::Rebuild]) -> Vec<(String, String)> {
-    rebuilds.iter().map(|b| (b.workspace.clone(), b.why.map_or("forced", |w| w.reason()).to_string())).collect()
+    rebuilds.iter().map(|b| (b.workspace.clone(), b.why.map_or("forced".into(), |w| template::reason(w, b.drift.as_ref())))).collect()
 }
 
 impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
@@ -1204,12 +1204,13 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
     }
 
     fn status(&mut self) -> Result<Response, String> {
-        let (profile, profile_mode) = match self.world() {
+        let (profile, profile_mode, drifted) = match self.world() {
             Ok(ds) => {
                 let r = rules::resolve(&self.config, &ds, self.persisted.lock.as_deref());
-                (r.profile, r.profile_mode)
+                let drifted = self.drifted(&r);
+                (r.profile, r.profile_mode, drifted)
             }
-            Err(_) => (None, ProfileMode::None),
+            Err(_) => (None, ProfileMode::None, BTreeMap::new()),
         };
         let view = StatusView {
             profile,
@@ -1228,6 +1229,7 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             workspace_template: self.config.has_workspace_template().then(|| TemplateStatus {
                 state: if self.sub.is_some() { "live" } else { "inert" }.into(),
                 applied: self.persisted.template_records.keys().cloned().collect(),
+                drifted,
             }),
         };
         let mut resp = Response::ok(render::status(&view), json!(view));
@@ -1235,6 +1237,22 @@ impl<A: Aero, S: FnMut() -> Vec<Screen>> Worker<A, S> {
             resp.exit = 4; // D25 V7
         }
         Ok(resp)
+    }
+
+    /// Status's V56 clause: each applied template whose live tree drifted, with the reason the
+    /// next pass gives. One window read, only while some template holds a record; a failed read
+    /// leaves it empty, so status still answers.
+    fn drifted(&mut self, r: &Resolved) -> BTreeMap<String, String> {
+        if self.persisted.template_records.is_empty() {
+            return BTreeMap::new();
+        }
+        let (Ok(s), Ok(details)) = (self.aero.windows(), self.aero.window_details()) else {
+            return BTreeMap::new();
+        };
+        pass::plan_rebuilds(r, &s, &self.persisted.pinned_names(), &self.persisted.template_records, &details)
+            .into_iter()
+            .filter_map(|b| (b.why == Some(template::Pending::TreeDrifted)).then(|| (b.workspace, template::reason(template::Pending::TreeDrifted, b.drift.as_ref()))))
+            .collect()
     }
 
     fn pin_views(&mut self) -> Vec<PinView> {
@@ -2327,6 +2345,44 @@ mod tests {
         assert_eq!(flattens(&w.aero.log), 1, "the re-pass rebuilds: {:?}", w.aero.log);
         assert_eq!(w.aero.tree("C"), canonical);
         assert!(w.pending.is_none());
+    }
+
+    #[test]
+    fn v56_dry_run_explain_and_status_name_the_first_drifted_window() {
+        let mut f = tpl_on_3();
+        f.add_window("C", 49, "msgr", "Messenger", false);
+        let (mut w, _d) = live(f, &tpl_any());
+        w.handle(Msg::Trigger(Trigger::Display));
+        w.tick(later());
+        w.aero.set_tree("C", &Tree::Split(Axis::H, vec![Tree::Win(44), Tree::Win(10), Tree::Win(49)]), 10); // regrouped by hand
+        w.aero.log.clear();
+        let why = "tree drifted (igcl: v_tiles wanted, h_tiles live)";
+        let dry = ask(&mut w, Request::Reconcile { dry_run: true, config: None });
+        assert!(dry.text.contains(&format!("workspace-template rebuild:\n  C    {why}\n")), "{}", dry.text);
+        assert_eq!(dry.json["rebuild"][0]["reason"], why);
+        let ex = ask(&mut w, Request::Explain { config: None });
+        assert!(ex.text.contains(&format!("record: pending: {why}\n")), "{}", ex.text);
+        let drift = &ex.json["workspace_template"]["workspaces"][0]["drift"];
+        assert_eq!((drift["id"].as_u64(), drift["want"].as_str(), drift["have"].as_str()), (Some(10), Some("v_tiles"), Some("h_tiles")));
+        let st = ask(&mut w, Request::Status);
+        assert!(st.text.contains(&format!("workspace template: live; C applied; C pending: {why}\n")), "{}", st.text);
+        assert_eq!(st.json["workspace_template"]["drifted"]["C"], why);
+        assert!(w.aero.log.is_empty(), "reads only: {:?}", w.aero.log);
+        // A failed read drops the clause; status still answers.
+        w.aero.fail_windows = true;
+        assert!(ask(&mut w, Request::Status).text.contains("workspace template: live; C applied\n"));
+        w.aero.fail_windows = false;
+        // Stuck: the pass would not rebuild, so no surface says pending (one owner, `judge`).
+        w.persisted.template_records.get_mut("C").unwrap().stuck = true;
+        assert!(ask(&mut w, Request::Status).text.contains("workspace template: live; C applied\n"));
+        assert!(ask(&mut w, Request::Explain { config: None }).text.contains("record: up to date\n"));
+        assert!(!ask(&mut w, Request::Reconcile { dry_run: true, config: None }).text.contains("workspace-template rebuild"));
+        w.persisted.template_records.get_mut("C").unwrap().stuck = false;
+        assert!(ask(&mut w, Request::Status).text.contains("; C pending: tree drifted"));
+        // Pinned: the hand tree stays, so no surface says pending (V46).
+        assert_eq!(ask(&mut w, Request::Pin { workspace: Some("C".into()) }).exit, 0);
+        assert!(!ask(&mut w, Request::Status).text.contains("pending"));
+        assert!(ask(&mut w, Request::Explain { config: None }).text.contains("record: not applied: pinned\n"));
     }
 
     #[test]
