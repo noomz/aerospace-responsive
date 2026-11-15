@@ -228,10 +228,10 @@ window id, so focus does not move and a hidden workspace is rebuilt the same way
   what was last built (a tiled window opened, floated, tiled, or retitled into another slot).
   A closed window only leaves a gap in the record; it rebuilds nothing, even when it leaves a
   container holding one window.
-- On a pass or a verify (unlock, wake), when the tree was regrouped: a window sits in a container
+- On a pass or the verify after unlock, when the tree was regrouped: a window sits in a container
   of the wrong layout, say IGCL moved out of its `v` stack. A rebuild that leaves the tree still
   regrouped warns (`template C: tree still differs after rebuild`) and is not retried until the
-  windows or the template change, or you run `arrange`.
+  windows or the template change, AeroSpace restarts, or you run `arrange`.
 - When a tiled window arrives on the workspace (needs the fork events, see Requirements). A burst of
   arrivals causes one rebuild.
 - On `aerospace-responsive arrange [ws]`, always (default: the focused workspace).
