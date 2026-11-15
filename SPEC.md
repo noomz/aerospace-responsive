@@ -472,7 +472,7 @@ T42|x|core: pure `drift(template, tiled windows)` in `template.rs` + tests named
 T43|x|pass + verify: `Pending::TreeDrifted` when record equal and drift non-empty; verify-only reports drift as a mismatch → one re-pass rebuilds; post-rebuild re-read still drifting → warn + mark record, no further drift rebuild until record changes; pinned and `when`-fails skip; tests (drift → rebuild, verify → repass → rebuild, stuck drift rebuilds once, pin keeps hand tree)|V56,V40,V42,V46
 T44|.|surfaces + docs: explain `record:` / status / dry-run reason `tree drifted` with first window; `--json`; README template section: a regrouping hand change is undone at the next pass, pin to keep it; render tests|V56,I.tpl.cli.explain,I.tpl.cli.status,I.tpl.cli.dryrun,I.tpl.docs
 T45|.|acceptance at the desk: close Messenger on C → next pass sends nothing (V57); break C by hand (move IGCL out of the v-stack), poke → rebuilt; unlock (verify) → rebuilt; pin keeps the hand tree; dock to herdr T6 / DELL and back; check live daemon + other agents' sessions before install; `cargo test` + clippy green; then live deploy|T42-T44,T46
-T46|.|core + pass, before T45: `drift` accepts a lone window under its template container's own layout (V57) + tests: close Messenger on built C → next pass sends no template command; lone window under the collapsed parent still passes; a regrouped two-window container still drifts; B10 tree still drifts|V57,V56,V41,V40
+T46|x|core + pass, before T45: `drift` accepts a lone window under its template container's own layout (V57) + tests: close Messenger on built C → next pass sends no template command; lone window under the collapsed parent still passes; a regrouped two-window container still drifts; B10 tree still drifts|V57,V56,V41,V40
 
 ## §B bugs
 

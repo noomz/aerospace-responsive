@@ -1087,6 +1087,19 @@ tree = [{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]
     }
 
     #[test]
+    fn v57_a_close_then_a_pass_sends_no_template_command() {
+        let mut f = tpl_fake(2);
+        let mut disk = Disk::default();
+        ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        f.close_window(49);
+        template::forget(&mut disk.records, 49);
+        assert_eq!(f.tree("C"), Tree::Split(Axis::V, vec![Tree::Win(44), Tree::Split(Axis::H, vec![Tree::Win(10)])]), "normalization off");
+        f.log.clear();
+        let rep = ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        assert!(f.log.is_empty() && rep.rebuilt.is_empty(), "V40, V57: {:?}", f.log);
+    }
+
+    #[test]
     fn v56_a_pin_keeps_the_hand_made_tree() {
         let mut f = tpl_fake(2);
         let mut disk = Disk::default();

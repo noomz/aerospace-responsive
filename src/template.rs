@@ -280,7 +280,34 @@ pub struct Drift {
 /// layout differs from the canonical tree's, depth-first. Finds regrouping, not reordering:
 /// a reorder inside one container or a swap between same-layout containers is not seen.
 pub fn drift(t: &Template, windows: &[WinInfo]) -> Vec<Drift> {
-    layout_drift(&canonical(t.root, &t.tree, &assign(&t.tree, windows)), windows)
+    let a = assign(&t.tree, windows);
+    let lone = lone_layouts(t.root, &t.tree, &a);
+    layout_drift(&canonical(t.root, &t.tree, &a), windows).into_iter().filter(|d| !lone.contains(&(d.id, d.have.clone()))).collect()
+}
+
+/// V57: the layouts a lone window may show besides its canonical parent's: the `<axis>_tiles` of
+/// each template container below the root that holds it and no other tiled window. V39
+/// collapses such a container, but a close with normalization off leaves it (V41).
+fn lone_layouts(root: Axis, tree: &[Node], a: &Assignment) -> Vec<(u32, String)> {
+    fn go(axis: Axis, nodes: &[Node], a: &Assignment, next: &mut usize, nested: bool, out: &mut Vec<(u32, String)>) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for n in nodes {
+            match n {
+                Node::Slot(_) => {
+                    ids.extend(&a.slots[*next]);
+                    *next += 1;
+                }
+                Node::Container(c) => ids.extend(go(axis.opposite(), c, a, next, true, out)),
+            }
+        }
+        if let ([id], true) = (ids.as_slice(), nested) {
+            out.push((*id, format!("{}_tiles", axis_word(axis))));
+        }
+        ids
+    }
+    let mut out = Vec::new();
+    go(root, tree, a, &mut 0, false, &mut out);
+    out
 }
 
 fn layout_drift(want: &Tree, windows: &[WinInfo]) -> Vec<Drift> {
@@ -875,6 +902,29 @@ tree = [{ app = "p" }]
     fn v56_accordion_root_drifts() {
         let want = h(vec![Win(3), v(vec![Win(5), Win(20)])]);
         assert_eq!(drifted(&want, &live(&want, "accordion")), [(3, "h_tiles".into(), "h_accordion".into())]);
+    }
+
+    #[test]
+    fn v57_a_close_leaves_a_lone_window_in_its_container_and_that_is_not_drift() {
+        let t = tpl("v", r#"[{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]"#);
+        // Messenger closed: IGCL alone in h[IGCL] (normalization off), or under the root (on).
+        for have in ["h_tiles", "v_tiles"] {
+            assert!(drift(&t, &[win(44, "line", "", "v_tiles"), win(10, "igcl", "", have)]).is_empty(), "{have}");
+        }
+        assert_eq!(drift(&t, &[win(44, "line", "", "v_tiles"), win(10, "igcl", "", "h_accordion")]).len(), 1, "any other layout is drift");
+        // Built with IGCL alone (its container collapsed), then LINE's sibling closed: any lone
+        // template container's axis passes. v[a, h[b, v[c]]] with b gone: c may show h or v.
+        let t = tpl("v", r#"[{ app = "a" }, [{ app = "b" }, [{ app = "c" }]]]"#);
+        for have in ["h_tiles", "v_tiles"] {
+            assert!(drift(&t, &[win(1, "a", "", "v_tiles"), win(3, "c", "", have)]).is_empty(), "{have}");
+        }
+        // b and c share h, so b is not lone there; c is lone in its inner v.
+        let ws = [win(1, "a", "", "v_tiles"), win(2, "b", "", "v_tiles"), win(3, "c", "", "v_tiles")];
+        assert_eq!(drift(&t, &ws), [Drift { id: 2, want: "h_tiles".into(), have: "v_tiles".into() }]);
+        // A container holding two windows is not lone: regrouped out of it, both drift.
+        let t = tpl("v", r#"[{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]"#);
+        let ws = [win(44, "line", "", "v_tiles"), win(10, "igcl", "", "v_tiles"), win(49, "msgr", "", "v_tiles")];
+        assert_eq!(drift(&t, &ws).len(), 2);
     }
 
     /// Documented limit (V56): order is not read (C20), so these pass as up to date.
