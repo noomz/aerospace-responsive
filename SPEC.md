@@ -445,6 +445,11 @@ Reviewed by codex 2026-11-12 (R1–R10 below name its findings). V51–V54 and t
   swap between two containers of the same layout, is not seen. No loop: when the read after a drift rebuild
   still drifts, the pass warns (`template C: tree still differs after rebuild`) and marks the record, and drift
   then triggers nothing until the record changes (new window set, template edit, `arrange`, V51 drop).
+- V57 Lone window (B11, amends V56). A tiled window that is the only one in its innermost template container
+  (V39 collapses that container) passes the drift check under its V56 parent layout OR that container's own
+  `<axis>_tiles` from the template, before collapse. So the one-child container a `window-closed` leaves with
+  normalization off (V41) is not drift, and a close sends no commands (V40). Limit, by design: a lone window
+  wrapped by hand in a one-child container of that axis is not seen.
 
 ## §T tasks
 
@@ -466,7 +471,8 @@ T41|x|acceptance at the desk: `C` template on built-in; LINE / IGCL / Messenger 
 T42|x|core: pure `drift(template, tiled windows)` in `template.rs` + tests named for V56: motivating B10 tree (IGCL `h_tiles`, want `v_tiles`) drifts; canonical tree from every T34 start does not; rest windows at root; floating ignored; accordion root drifts; reorder in one container does not (documented limit)|V56,V39
 T43|x|pass + verify: `Pending::TreeDrifted` when record equal and drift non-empty; verify-only reports drift as a mismatch → one re-pass rebuilds; post-rebuild re-read still drifting → warn + mark record, no further drift rebuild until record changes; pinned and `when`-fails skip; tests (drift → rebuild, verify → repass → rebuild, stuck drift rebuilds once, pin keeps hand tree)|V56,V40,V42,V46
 T44|.|surfaces + docs: explain `record:` / status / dry-run reason `tree drifted` with first window; `--json`; README template section: a regrouping hand change is undone at the next pass, pin to keep it; render tests|V56,I.tpl.cli.explain,I.tpl.cli.status,I.tpl.cli.dryrun,I.tpl.docs
-T45|.|acceptance at the desk: break C by hand (move IGCL out of the v-stack), poke → rebuilt; unlock (verify) → rebuilt; pin keeps the hand tree; dock to herdr T6 / DELL and back; check live daemon + other agents' sessions before install; `cargo test` + clippy green; then live deploy|T42-T44
+T45|.|acceptance at the desk: close Messenger on C → next pass sends nothing (V57); break C by hand (move IGCL out of the v-stack), poke → rebuilt; unlock (verify) → rebuilt; pin keeps the hand tree; dock to herdr T6 / DELL and back; check live daemon + other agents' sessions before install; `cargo test` + clippy green; then live deploy|T42-T44,T46
+T46|.|core + pass, before T45: `drift` accepts a lone window under its template container's own layout (V57) + tests: close Messenger on built C → next pass sends no template command; lone window under the collapsed parent still passes; a regrouped two-window container still drifts; B10 tree still drifts|V57,V56,V41,V40
 
 ## §B bugs
 
@@ -475,3 +481,4 @@ id|date|cause|fix
 B8|2026-11-13|drain rebuild (window arrival) that failed or aborted halfway was only logged; record gone, but no pass armed, so the half-built tree stayed until an unrelated trigger|V47
 B9|2026-11-14|AeroSpace restart: old socket unlinked and new one bound inside one kqueue wakeup; watcher compared existence only (true → true), sent no edge, V51 never dropped records; new server reused ids 3/5/20, so `C` showed `up to date` while flat|V55
 B10|2026-11-15|`C` showed `up to date` while live tree was h[IGCL, LINE, v[Messenger]] (IGCL out of its v-stack): the pass compares record vs wanted record only (V41) and never the live tree, though each window's parent layout is in the read. What regrouped it is unknown: after the last rebuild (2026-11-14T16:36Z) came a move of `C` herdr T6 → Built-in (16:37) or a hand move; `reload-config` ruled out by a live probe. User decision: drift is rebuilt, pin is the opt-out|V56
+B11|2026-11-15|normalization off (desk config): `window-closed` leaves a one-child container (C = v[LINE, h[IGCL]] after Messenger closes), accepted by V41; V56 compared against the collapsed canonical tree (V39), so IGCL read `h_tiles` vs wanted `v_tiles` and the next pass rebuilt C (flatten, sizes reset) though a close is not a trigger (V40). Found by a probe test in T43, before deploy. User decision: tolerate the lone window|V57
