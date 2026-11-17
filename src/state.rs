@@ -46,6 +46,10 @@ pub struct TemplateRecord {
     /// Window ids per slot path (`1`, `2.1`), empty slots included.
     pub slots: BTreeMap<String, Vec<u32>>,
     pub rest: Vec<u32>,
+    /// V56: a drift rebuild left the tree still drifting, so drift triggers nothing until the
+    /// record changes. Not part of the wanted-record compare.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stuck: bool,
 }
 
 /// Exclusive tiling's memory (I.state): the windows the rule floated, and per workspace the
@@ -189,6 +193,8 @@ pub enum Class {
     World,
     Pass,
     ExclusiveTiling,
+    /// V56: one per template record marked stuck; follows the marks, not the pass.
+    Template,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -275,7 +281,7 @@ mod tests {
         let mut p = Persisted { pins: vec![pin("1")], lock: Some("desk".into()), ..Persisted::default() };
         p.exclusive_tiling.insert("T", 4380, "net.kovidgoyal.kitty");
         let slots = BTreeMap::from([("1".to_string(), vec![44]), ("2.1".to_string(), vec![]), ("2.2".to_string(), vec![10, 49])]);
-        p.template_records.insert("C".into(), TemplateRecord { fingerprint: "h[a, v[b, c]]".into(), slots, rest: vec![7] });
+        p.template_records.insert("C".into(), TemplateRecord { fingerprint: "h[a, v[b, c]]".into(), slots, rest: vec![7], stuck: true });
         p.save(&path).unwrap();
         assert_eq!(Persisted::load(&path), p);
         std::fs::write(&path, "{not json").unwrap();

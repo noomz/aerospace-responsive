@@ -226,14 +226,20 @@ window id, so focus does not move and a hidden workspace is rebuilt the same way
 
 - On a pass, the first time, and whenever the template or the workspace's tiled windows differ from
   what was last built (a tiled window opened, floated, tiled, or retitled into another slot).
-  A closed window only leaves a gap in the record; it rebuilds nothing.
+  A closed window only leaves a gap in the record; it rebuilds nothing, even when it leaves a
+  container holding one window.
+- On a pass or the verify after unlock, when the tree was regrouped: a window sits in a container
+  of the wrong layout, say IGCL moved out of its `v` stack. A rebuild that leaves the tree still
+  regrouped warns (`template C: tree still differs after rebuild`) and is not retried until the
+  windows or the template change, AeroSpace restarts, or you run `arrange`.
 - When a tiled window arrives on the workspace (needs the fork events, see Requirements). A burst of
   arrivals causes one rebuild.
 - On `aerospace-responsive arrange [ws]`, always (default: the focused workspace).
 - After AeroSpace restarts (its window ids restart). A daemon restart alone rebuilds nothing.
 
-Between triggers your hand-made changes stay; a trigger overwrites them. `pin` the workspace to keep a
-hand-made tree; `unpin` rebuilds it.
+Between triggers your hand-made changes stay; a trigger overwrites them. A hand change that regroups
+windows is undone at the next pass; reordering windows inside one container is not seen and stays.
+`pin` the workspace to keep a hand-made tree; `unpin` rebuilds it.
 While a template applies, the matching `[[layout]]` rule's `orientation`, `flatten` and `kind` do
 nothing on that workspace; placement still applies. When `when` does not match — say `C` docked to an
 external monitor — the `[[layout]]` rule owns the workspace there, and docking back rebuilds the tree.
@@ -247,7 +253,8 @@ active profile's `[[profile.workspace-template]]`. Load errors: empty `workspace
 Each command takes about 36 ms: a 3-window tree builds in ~0.3 s, a 6-window tree in ~1.2 s. A
 focused workspace redraws once per command.
 
-`status` gets one line (`workspace template: live; C applied`, or `inert`). `explain` shows each
+`status` gets one line (`workspace template: live; C applied`, or `inert`), which ends with
+`; C pending: tree drifted (IGCL: v_tiles wanted, h_tiles live)` while a built tree is regrouped. `explain` shows each
 template, whether it applies on the monitor its workspace is on, and the window in every slot:
 
 ```
@@ -263,8 +270,9 @@ workspace-template:
 ```
 
 `record:` says what the next pass would do: `up to date`, `pending: first run | template changed |
-windows changed`, or `not applied: pinned | when does not match <monitor>`. `reconcile --dry-run`
-lists pending rebuilds and their commands; `arrange --dry-run` prints one workspace's commands; and
+windows changed`, `pending: tree drifted (IGCL: v_tiles wanted, h_tiles live)` naming the first
+regrouped window, or `not applied: pinned | when does not match <monitor>`. `reconcile --dry-run`
+lists pending rebuilds with the same reasons, and their commands; `arrange --dry-run` prints one workspace's commands; and
 `daemon --observe` logs them without running them.
 
 ## Rollback

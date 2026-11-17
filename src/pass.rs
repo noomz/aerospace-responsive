@@ -203,6 +203,9 @@ pub struct PassReport {
     pub converged: Vec<String>,
     /// Workspaces whose template rebuild completed this pass.
     pub rebuilt: Vec<String>,
+    /// Workspaces whose drift rebuild left the tree still drifting; their records are now
+    /// marked stuck (V56).
+    pub stuck: Vec<String>,
     pub nonempty: BTreeSet<String>,
     /// What this pass left visible per monitor. Ticket 13 S3.3: a monitor is restored only
     /// while it still shows what the pass put there — anything else means the user acted.
@@ -228,11 +231,14 @@ pub enum Rebuilt {
 }
 
 /// One template rebuild (V43) and the record it leaves (V41). `why` is `None` when the record
-/// already equals `record`: only a forced rebuild (an arrival, V40 b, or `arrange`) runs it then.
+/// already equals `record` and the tree has not drifted (V56), or drifted with the record marked
+/// stuck: only a forced rebuild (an arrival, V40 b, or `arrange`) runs it then.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rebuild {
     pub workspace: String,
     pub why: Option<template::Pending>,
+    /// V56: the first drifted window when `why` is `TreeDrifted`.
+    pub drift: Option<template::Drift>,
     pub cmds: Vec<Cmd>,
     pub record: TemplateRecord,
 }
@@ -240,10 +246,40 @@ pub struct Rebuild {
 impl Rebuild {
     /// `t` over its tiled windows in `details` (one read of every window).
     pub fn of(t: &template::Template, details: &[WinInfo], records: &TemplateRecords) -> Self {
-        let wins: Vec<WinInfo> = details.iter().filter(|w| w.workspace == t.workspace).cloned().collect();
+        let wins = on(&t.workspace, details);
         let record = template::wanted(t, &wins);
-        Rebuild { workspace: t.workspace.clone(), why: template::pending(records.get(&t.workspace), &record), cmds: template::rebuild(t, &wins), record }
+        let (why, drift) = template::judge(t, &wins, records.get(&t.workspace), &record);
+        Rebuild { workspace: t.workspace.clone(), why, drift, cmds: template::rebuild(t, &wins), record }
     }
+}
+
+/// The windows of `ws` in `details`.
+fn on(ws: &str, details: &[WinInfo]) -> Vec<WinInfo> {
+    details.iter().filter(|w| w.workspace == ws).cloned().collect()
+}
+
+/// V56 no loop: of the workspaces a drift rebuild just built, those whose fresh read still
+/// drifts get their record marked stuck, so drift triggers nothing there until it changes.
+fn mark_stuck(r: &Resolved, rebuilt: &[String], details: &[WinInfo], records: &mut TemplateRecords) -> Vec<String> {
+    r.templates
+        .iter()
+        .map(|d| &d.template)
+        .filter(|t| rebuilt.contains(&t.workspace) && !template::drift(t, &on(&t.workspace, details)).is_empty())
+        .filter_map(|t| {
+            records.get_mut(&t.workspace)?.stuck = true;
+            Some(t.workspace.clone())
+        })
+        .collect()
+}
+
+/// V42, V56: in a verify-only pass a drifted tree is a mismatch, so the one re-pass rebuilds it.
+/// Only drift: a record that differs is a full pass's business.
+pub fn drift_mismatches(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, records: &TemplateRecords, details: &[WinInfo]) -> Vec<String> {
+    plan_rebuilds(r, s, pinned, records, details)
+        .into_iter()
+        .filter(|b| b.why == Some(template::Pending::TreeDrifted))
+        .map(|b| format!("workspace {} tree drifted", b.workspace))
+        .collect()
 }
 
 /// Step 3c's record upkeep before any rebuild: V52 (a converge float or tile on an unpinned
@@ -254,8 +290,8 @@ pub fn settle_records(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, con
     drop_stale(r, s, pinned, &r.applying(s, pinned), records) | dropped
 }
 
-/// Step 3c's decision (V40 a, V42): every applying template whose record differs from what a
-/// rebuild would leave, in template order. Records must be settled first.
+/// Step 3c's decision (V40 a, d, V42): every applying template whose record differs from what a
+/// rebuild would leave, or whose tree drifted (V56), in template order. Records must be settled first.
 pub fn plan_rebuilds(r: &Resolved, s: &Snapshot, pinned: &BTreeSet<String>, records: &TemplateRecords, details: &[WinInfo]) -> Vec<Rebuild> {
     let applying = r.applying(s, pinned);
     r.templates
@@ -363,22 +399,33 @@ pub fn run_pass(
     // from what converge left, not from before it.
     let s_layout = if rep.converged.is_empty() { s1.clone() } else { aero.windows()? };
 
-    // 3c. TEMPLATE REBUILD (V40 a, V41, V42): after converge, so the tiled set is final.
+    // 3c. TEMPLATE REBUILD (V40 a, d, V41, V42): after converge, so the tiled set is final.
     if let Some(m) = mem.as_mut() {
         if settle_records(r, &s_layout, pinned, &changed_tiling, m.templates) {
             (m.save)(m.templates);
         }
         if !r.applying(&s_layout, pinned).is_empty() {
             let details = aero.window_details()?;
+            let mut redrift = vec![]; // V56: built for drift, so read again
             for b in plan_rebuilds(r, &s_layout, pinned, m.templates, &details) {
-                let ws = b.workspace.clone();
+                let (ws, drift) = (b.workspace.clone(), b.why == Some(template::Pending::TreeDrifted));
                 match run_rebuild(aero, b, m.templates, m.save, abort, &mut rep.executed)? {
                     Rebuilt::Aborted => {
                         rep.aborted = true;
                         return Ok(rep);
                     }
+                    Rebuilt::Built if drift => {
+                        redrift.push(ws.clone());
+                        rep.rebuilt.push(ws);
+                    }
                     Rebuilt::Built => rep.rebuilt.push(ws),
                     Rebuilt::Nothing => {}
+                }
+            }
+            if !redrift.is_empty() {
+                rep.stuck = mark_stuck(r, &redrift, &aero.window_details()?, m.templates);
+                if !rep.stuck.is_empty() {
+                    (m.save)(m.templates);
                 }
             }
         }
@@ -986,9 +1033,105 @@ tree = [{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]
         assert!(disk.records.is_empty());
     }
 
+    // ---------- drift (T43, V56) ----------
+
+    /// `C` built, then regrouped by hand: IGCL and Messenger out of their h-stack into the v root.
+    fn drifted_by_hand(f: &mut FakeAero, disk: &mut Disk) {
+        ok_pass(f, &tpl_cfg(""), disk, &[]);
+        f.set_tree("C", &Tree::Split(Axis::V, vec![Tree::Win(44), Tree::Win(10), Tree::Win(49)]), 10);
+        f.log.clear();
+    }
+
+    #[test]
+    fn v56_a_drifted_tree_with_an_equal_record_rebuilds() {
+        let mut f = tpl_fake(2);
+        let mut disk = Disk::default();
+        drifted_by_hand(&mut f, &mut disk);
+        let rep = ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        assert_eq!(rep.rebuilt, ["C"], "V40 (d): {:?}", f.log);
+        assert_eq!(f.tree("C"), built());
+        assert!(rep.stuck.is_empty() && !disk.records["C"].stuck);
+        f.log.clear();
+        ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        assert_eq!(template_cmds(&f.log), 0, "rebuilt tree does not drift: {:?}", f.log);
+    }
+
+    #[test]
+    fn v56_drift_a_rebuild_cannot_fix_rebuilds_once_then_waits_for_the_record_to_change() {
+        let mut f = Trip { f: tpl_fake(2), on: |c| matches!(c, Cmd::JoinWith { .. }), trap: Trap::Swallow, abort: None };
+        let mut disk = Disk::default();
+        drifted_by_hand(&mut f.f, &mut disk);
+        let rep = tpass(&mut f, &tpl_cfg(""), &mut disk, &[], &AtomicBool::new(false)).unwrap();
+        assert_eq!(rep.rebuilt, ["C"]);
+        assert_eq!(rep.stuck, ["C"], "the re-read still drifts");
+        assert!(disk.records["C"].stuck && disk.saves.last().unwrap()["C"].stuck, "marked and saved");
+        f.f.log.clear();
+        let rep = tpass(&mut f, &tpl_cfg(""), &mut disk, &[], &AtomicBool::new(false)).unwrap();
+        assert_eq!(template_cmds(&f.f.log), 0, "no loop: {:?}", f.f.log);
+        assert!(rep.rebuilt.is_empty() && rep.stuck.is_empty());
+        // A new window changes the record: that rebuild leaves an unmarked one.
+        f.f.add_window("C", 50, "zed", "Zed", false);
+        let rep = tpass(&mut f, &tpl_cfg(""), &mut disk, &[], &AtomicBool::new(false)).unwrap();
+        assert_eq!(rep.rebuilt, ["C"]);
+        assert!(!disk.records["C"].stuck && rep.stuck.is_empty(), "a windows-changed rebuild is not judged for stuck");
+    }
+
+    #[test]
+    fn v56_a_closed_window_ends_the_stuck_mark() {
+        let mut recs = TemplateRecords::from([(
+            "C".to_string(),
+            TemplateRecord { fingerprint: "f".into(), slots: BTreeMap::from([("1".to_string(), vec![44, 10])]), rest: vec![], stuck: true },
+        )]);
+        assert!(!template::forget(&mut recs, 99) && recs["C"].stuck, "not held: unchanged");
+        assert!(template::forget(&mut recs, 10) && !recs["C"].stuck);
+    }
+
+    #[test]
+    fn v57_a_close_then_a_pass_sends_no_template_command() {
+        let mut f = tpl_fake(2);
+        let mut disk = Disk::default();
+        ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        f.close_window(49);
+        template::forget(&mut disk.records, 49);
+        assert_eq!(f.tree("C"), Tree::Split(Axis::V, vec![Tree::Win(44), Tree::Split(Axis::H, vec![Tree::Win(10)])]), "normalization off");
+        f.log.clear();
+        let rep = ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        assert!(f.log.is_empty() && rep.rebuilt.is_empty(), "V40, V57: {:?}", f.log);
+    }
+
+    #[test]
+    fn v56_a_pin_keeps_the_hand_made_tree() {
+        let mut f = tpl_fake(2);
+        let mut disk = Disk::default();
+        drifted_by_hand(&mut f, &mut disk);
+        let hand = f.tree("C");
+        let rep = ok_pass(&mut f, &tpl_cfg(""), &mut disk, &["C"]);
+        assert!(f.log.is_empty() && rep.rebuilt.is_empty(), "V46: {:?}", f.log);
+        assert_eq!(f.tree("C"), hand);
+        let r = resolve(&tpl_cfg(""), &desk3(), None);
+        let pinned = BTreeSet::from(["C".to_string()]);
+        let (s, d) = (f.windows().unwrap(), f.window_details().unwrap());
+        assert!(drift_mismatches(&r, &s, &pinned, &disk.records, &d).is_empty(), "nor a verify mismatch");
+        assert_eq!(drift_mismatches(&r, &s, &BTreeSet::new(), &disk.records, &d), ["workspace C tree drifted"]);
+    }
+
+    #[test]
+    fn v56_drift_is_not_judged_where_when_fails() {
+        // Docked to the portrait: the template does not apply, the `[[layout]]` rule flattens.
+        let mut f = tpl_fake(2);
+        let mut disk = Disk::default();
+        drifted_by_hand(&mut f, &mut disk);
+        let i = f.ws.iter().position(|w| w.name == "C").unwrap();
+        f.ws[i].monitor = 1;
+        let rep = ok_pass(&mut f, &tpl_cfg(""), &mut disk, &[]);
+        assert!(rep.rebuilt.is_empty() && template_cmds(&f.log) == 0, "{:?}", f.log);
+    }
+
     enum Trap {
         Fail,
         Abort,
+        /// Answers ok without running it: AeroSpace takes the command and leaves the tree as is.
+        Swallow,
     }
 
     /// FakeAero that fails, or raises the abort flag, on the commands `on` picks.
@@ -1016,6 +1159,7 @@ tree = [{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]
                 match self.trap {
                     Trap::Fail => return Err("Invalid window-id".into()),
                     Trap::Abort => self.abort.unwrap().store(true, Ordering::SeqCst),
+                    Trap::Swallow => return Ok(()),
                 }
             }
             self.f.run(cmd)

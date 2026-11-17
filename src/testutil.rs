@@ -480,6 +480,24 @@ impl FakeAero {
         t.to_tree()
     }
 
+    /// Each tiled window of workspace `i` with its parent's layout, as `%{window-layout}` reports
+    /// it: the root's kind for the root's children, tiles for nested containers.
+    fn parent_layouts(&self, i: usize) -> Vec<(u32, String)> {
+        fn go(t: &Tree, kind: &str, out: &mut Vec<(u32, String)>) {
+            let Tree::Split(axis, kids) = t else { return };
+            let l = format!("{}_{kind}", if *axis == Axis::H { "h" } else { "v" });
+            for k in kids {
+                match k {
+                    Tree::Win(id) => out.push((*id, l.clone())),
+                    s => go(s, "tiles", out),
+                }
+            }
+        }
+        let mut out = vec![];
+        go(&self.tree(&self.ws[i].name), if self.ws[i].accordion { "accordion" } else { "tiles" }, &mut out);
+        out
+    }
+
     fn tree_mut(&mut self, i: usize) -> &mut FakeSplit {
         let (tiled, axis) = (self.tiled_ids(i), self.ws[i].root);
         let t = self.ws[i].tree.get_or_insert_with(|| FakeSplit { id: 0, axis, kids: vec![], mru: vec![] });
@@ -546,10 +564,10 @@ impl Aero for FakeAero {
             anyhow::bail!("list-windows: connection refused");
         }
         let mut out = vec![];
-        for w in &self.ws {
-            let tiled = if w.root == Axis::H { "h_tiles" } else { "v_tiles" };
+        for (i, w) in self.ws.iter().enumerate() {
+            let parents = self.parent_layouts(i);
             for x in &w.windows {
-                let layout = if x.floating { "floating" } else { tiled };
+                let layout = if x.floating { "floating" } else { parents.iter().find(|(id, _)| *id == x.id).map_or("", |(_, l)| l.as_str()) };
                 let app_name = x.app.rsplit('.').next().unwrap_or_default().to_string();
                 out.push(WinInfo { id: x.id, workspace: w.name.clone(), app: x.app.clone(), app_name, title: x.title.clone(), layout: layout.into() });
             }

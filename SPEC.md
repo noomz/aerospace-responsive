@@ -279,9 +279,13 @@ the root only, and a pin only protects what was arranged by hand.
   to that container's most recent child; every command resolves `--window-id` / `--workspace` without focus.
 - C20 The daemon cannot read a tree. `list-windows` gives each window's parent layout only and sorts by app
   name, then title; flatten keeps depth-first order, but nothing reports it. So a template never
-  compares the live tree with the wanted one. It rebuilds on triggers (V40) and trusts its record (V41).
-- C21 Never fights the user (C5 again). Between triggers a hand-made change stays. A trigger rebuilds the whole
-  workspace and overwrites it. Pin is the opt-out (V46).
+  reads the live order. It rebuilds on triggers (V40) and trusts its record (V41) for order. Amended
+  2026-11-15 (B10): the parent layout per window (`%{window-layout}`, already in `DETAIL_FORMAT`) is readable,
+  so a pass compares it with the wanted tree (V56). That check finds regrouping, not reordering.
+- C21 Template owns the tree (amended 2026-11-15, B10; was "never fights the user"). A hand-made change stays
+  until the next pass or verify. A change that regroups windows (V56 drift) is then rebuilt. A pure reorder
+  within the same groups is not seen and stays. A trigger rebuilds the whole workspace and overwrites it.
+  Pin is the opt-out (V46).
 - C22 Nesting alternates. A nested container always has the orientation opposite to its parent, because
   `join-with` builds nothing else. Config cannot ask for `h` inside `h`.
 - C23 Tiled windows only. A floating window is never moved, tiled or counted. Exclusive tiling decides float
@@ -330,10 +334,19 @@ the root only, and a pin only protects what was arranged by hand.
         rest: none
   ```
   `record:` ∈ `up to date` | `pending: first run` | `pending: template changed` | `pending: windows changed` |
-  `not applied: when does not match <monitor>` | `not applied: pinned`. Empty slot prints `(no window)`.
+  `pending: tree drifted (<app>: <want> wanted, <have> live)` | `not applied: when does not match <monitor>` |
+  `not applied: pinned`. Empty slot prints `(no window)`. Amended 2026-11-15 (V56, T44): `record:` is what a pass
+  would do, one owner (`template::judge`) for pass and explain, so a stuck record (V56 no loop) reads `up to date`;
+  the stuck warning is its signal. Drift names the first drifted window, depth-first (`IGCL: v_tiles wanted,
+  h_tiles live`; id when the app name is empty). `--json` view gains `drift` (`{id, app, want, have}` | null).
 - I.tpl.cli.dryrun — `reconcile --dry-run` adds a `workspace-template rebuild:` block (workspace + reason) after
-  the exclusive-tiling block; its commands sit where layout commands sit.
-- I.tpl.cli.status — one line, omitted when no template: `workspace template: live|inert; C applied`.
+  the exclusive-tiling block; its commands sit where layout commands sit. Reason text = explain's after `pending: `
+  (`tree drifted (IGCL: v_tiles wanted, h_tiles live)`), same in `--json` `rebuild[].reason`.
+- I.tpl.cli.status — one line, omitted when no template: `workspace template: live|inert; C applied`, then
+  `; C pending: tree drifted (IGCL: v_tiles wanted, h_tiles live)` per applying template whose tree drifted (V56);
+  `--json` gains `drifted` (workspace → reason). Not from memory, unlike I.cli.status: one window read, only
+  while some template holds a record; a failed read drops the clause, status still answers. Other pending
+  reasons are not shown here (explain).
 - I.tpl.docs — README config reference + example block (commented, parses when uncommented, V35 style).
 
 ## §V invariants
@@ -352,8 +365,9 @@ Reviewed by codex 2026-11-12 (R1–R10 below name its findings). V51–V54 and t
   A root with one window is valid.
 - V40 Triggers (closed set): (a) a pass where there is no record, or the record differs from the wanted record
   (V41); (b) `window-moved` whose `workspace` has an applying template and whose window is tiled once every
-  queued window event is judged (V45); (c) `arrange`. Not immediate triggers: `window-closed`, a title change, a
-  daemon restart, a hand-made move, float or tile. A hand-made float or tile, or a title change that moves a
+  queued window event is judged (V45); (c) `arrange`; (d) a pass or verify where the record is equal but the live
+  tree has drifted (V56, B10). Not immediate triggers: `window-closed`, a title change, a
+  daemon restart, a hand-made move, float or tile (a regrouping move is caught by (d) at the next pass). A hand-made float or tile, or a title change that moves a
   window to another slot, changes the wanted record, so the next pass rebuilds (R8).
 - V41 Record (R2, R5). Wanted record = template fingerprint + one window-id list per slot path (empty slots
   included) + the rest list. Before the first command of a rebuild the workspace's record is removed and
@@ -368,7 +382,9 @@ Reviewed by codex 2026-11-12 (R1–R10 below name its findings). V51–V54 and t
 - V42 Applies = effective template exists for the workspace AND (`when` absent OR `when` matches the monitor the
   workspace is on after placement) AND not pinned. While it applies, `plan_layout` and the layout checks in
   `diff` skip that workspace, in a verify-only pass too (R4): `orientation`, `flatten` and `kind` of the matching
-  `[[layout]]` rule do nothing there. Placement checks in `diff` stay.
+  `[[layout]]` rule do nothing there. Placement checks in `diff` stay. The V56 drift check replaces the layout
+  check there: in a verify-only pass, drift is a mismatch (one re-pass, existing budget), and the re-pass
+  rebuilds.
 - V43 Rebuild = one command list from a pure fn `(template, tiled windows) -> Vec<Cmd>`: flatten, root kind
   tiles, root axis, order the root, then join and move windows into containers, outermost first. The plan must
   not depend on the order windows have after flatten (the daemon cannot read it, C20) or on which window is
@@ -428,6 +444,22 @@ Reviewed by codex 2026-11-12 (R1–R10 below name its findings). V51–V54 and t
   only its existence. A socket replaced between two kqueue wakeups (unlink + bind coalesced, so it exists at
   both reads) sends `AeroSocket(false)` then `AeroSocket(true)`, so V51 fires. An id set compare cannot catch it
   (V53): the new server hands the same apps the same ids. See B9.
+- V56 Drift (B10, amends C20/C21). For an applying template whose record equals the wanted record (V41), each
+  tiled window on the workspace has a wanted parent layout: the `<axis>_tiles` of its container in the canonical
+  tree (V39), with rest windows under the root. Pure fn `drift(template, tiled windows) -> Vec<(id, want, have)>`
+  over the read the pass already makes; no new AeroSpace command. Non-empty → `Pending::TreeDrifted`, so the pass
+  rebuilds (V40 (d)), and explain / status / dry-run show `pending: tree drifted` naming the first window
+  (`IGCL: v_tiles wanted, h_tiles live`). Floating windows are not compared (C23). An accordion root under a
+  template counts as drift (template roots are tiles). Limits, by design: a reorder inside one container, or a
+  swap between two containers of the same layout, is not seen. No loop: when the read after a drift rebuild
+  still drifts, the pass warns (`template C: tree still differs after rebuild`) and marks the record, and drift
+  then triggers nothing until the record changes (new window set, template edit, `arrange`, V51 drop).
+- V57 Lone window (B11, amends V56). A tiled window that is the only one in a template container below the root
+  (V39 collapses that container) passes the drift check under its V56 parent layout OR that container's own
+  `<axis>_tiles` from the template, before collapse; every such container on its path counts (one that collapsed
+  at build time can be the one a later close leaves). So the one-child container a `window-closed` leaves with
+  normalization off (V41) is not drift, and a close sends no commands (V40). Limit, by design: a lone window
+  wrapped by hand in a one-child container of that axis is not seen.
 
 ## §T tasks
 
@@ -446,6 +478,11 @@ T38|x|worker lifecycle: subscribe child gated on rule OR template; template-only
 T39|x|surfaces: `arrange` command + ipc, explain section, dry-run block, status line, `--json`; observe keeps disk records through pin / gap saves; render tests|I.tpl.cli.arrange,I.tpl.cli.explain,I.tpl.cli.dryrun,I.tpl.cli.status,V49
 T40|x|docs: README section + commented example block guarded by parse test; `CONTEXT.md` terms|I.tpl.docs,V50
 T41|x|acceptance at the desk: `C` template on built-in; LINE / IGCL / Messenger quit + reopen; dock to DELL (flatten rule wins) and back; AeroSpace restart rebuilds; pin keeps a hand-made tree, unpin rebuilds; `cargo test` + clippy green; then live deploy|T31-T40
+T42|x|core: pure `drift(template, tiled windows)` in `template.rs` + tests named for V56: motivating B10 tree (IGCL `h_tiles`, want `v_tiles`) drifts; canonical tree from every T34 start does not; rest windows at root; floating ignored; accordion root drifts; reorder in one container does not (documented limit)|V56,V39
+T43|x|pass + verify: `Pending::TreeDrifted` when record equal and drift non-empty; verify-only reports drift as a mismatch → one re-pass rebuilds; post-rebuild re-read still drifting → warn + mark record, no further drift rebuild until record changes; pinned and `when`-fails skip; tests (drift → rebuild, verify → repass → rebuild, stuck drift rebuilds once, pin keeps hand tree)|V56,V40,V42,V46
+T44|x|surfaces + docs: explain `record:` / status / dry-run reason `tree drifted` with first window; `--json`; README template section: a regrouping hand change is undone at the next pass, pin to keep it; render tests|V56,I.tpl.cli.explain,I.tpl.cli.status,I.tpl.cli.dryrun,I.tpl.docs
+T45|x|acceptance at the desk: close Messenger on C → next pass sends nothing (V57); break C by hand (move IGCL out of the v-stack), poke → rebuilt; unlock (verify) → rebuilt; pin keeps the hand tree; dock to herdr T6 / DELL and back; check live daemon + other agents' sessions before install; `cargo test` + clippy green; then live deploy|T42-T44,T46
+T46|x|core + pass, before T45: `drift` accepts a lone window under its template container's own layout (V57) + tests: close Messenger on built C → next pass sends no template command; lone window under the collapsed parent still passes; a regrouped two-window container still drifts; B10 tree still drifts|V57,V56,V41,V40
 
 ## §B bugs
 
@@ -453,3 +490,5 @@ id|date|cause|fix
 -|-|-|-
 B8|2026-11-13|drain rebuild (window arrival) that failed or aborted halfway was only logged; record gone, but no pass armed, so the half-built tree stayed until an unrelated trigger|V47
 B9|2026-11-14|AeroSpace restart: old socket unlinked and new one bound inside one kqueue wakeup; watcher compared existence only (true → true), sent no edge, V51 never dropped records; new server reused ids 3/5/20, so `C` showed `up to date` while flat|V55
+B10|2026-11-15|`C` showed `up to date` while live tree was h[IGCL, LINE, v[Messenger]] (IGCL out of its v-stack): the pass compares record vs wanted record only (V41) and never the live tree, though each window's parent layout is in the read. What regrouped it is unknown: after the last rebuild (2026-11-14T16:36Z) came a move of `C` herdr T6 → Built-in (16:37) or a hand move; `reload-config` ruled out by a live probe. User decision: drift is rebuilt, pin is the opt-out|V56
+B11|2026-11-15|normalization off (desk config): `window-closed` leaves a one-child container (C = v[LINE, h[IGCL]] after Messenger closes), accepted by V41; V56 compared against the collapsed canonical tree (V39), so IGCL read `h_tiles` vs wanted `v_tiles` and the next pass rebuilt C (flatten, sizes reset) though a close is not a trigger (V40). Found by a probe test in T43, before deploy. User decision: tolerate the lone window|V57

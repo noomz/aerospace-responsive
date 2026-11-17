@@ -226,24 +226,27 @@ pub fn wanted(t: &Template, windows: &[WinInfo]) -> TemplateRecord {
     let mut keys = Vec::new();
     paths(&t.tree, "", &mut keys);
     let a = assign(&t.tree, windows);
-    TemplateRecord { fingerprint: fingerprint(t), slots: keys.into_iter().zip(a.slots).collect(), rest: a.rest }
+    TemplateRecord { fingerprint: fingerprint(t), slots: keys.into_iter().zip(a.slots).collect(), rest: a.rest, stuck: false }
 }
 
-/// Why a pass would rebuild (V40 (a)); the text is explain's `record:` value.
+/// Why a pass would rebuild (V40 (a), (d)); the text is explain's `record:` value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pending {
     FirstRun,
     TemplateChanged,
     WindowsChanged,
+    /// V56: the record is equal but the live tree is not the canonical one.
+    TreeDrifted,
 }
 
 impl Pending {
-    /// The dry-run block's reason: `first run`, `template changed`, `windows changed`.
+    /// The dry-run block's reason: `first run`, `template changed`, `windows changed`, `tree drifted`.
     pub fn reason(self) -> &'static str {
         match self {
             Pending::FirstRun => "first run",
             Pending::TemplateChanged => "template changed",
             Pending::WindowsChanged => "windows changed",
+            Pending::TreeDrifted => "tree drifted",
         }
     }
 }
@@ -254,14 +257,116 @@ impl fmt::Display for Pending {
     }
 }
 
-/// V41 pass rule: no record → rebuild; equal → nothing; differs → rebuild.
+/// V41 pass rule: no record → rebuild; equal → nothing; differs → rebuild. The V56 `stuck`
+/// mark is not compared.
 pub fn pending(have: Option<&TemplateRecord>, want: &TemplateRecord) -> Option<Pending> {
     match have {
         None => Some(Pending::FirstRun),
         Some(h) if h.fingerprint != want.fingerprint => Some(Pending::TemplateChanged),
-        Some(h) if h != want => Some(Pending::WindowsChanged),
+        Some(h) if h.slots != want.slots || h.rest != want.rest => Some(Pending::WindowsChanged),
         Some(_) => None,
     }
+}
+
+/// V56: a tiled window whose live parent layout is not the one the canonical tree gives it.
+/// `app` = its app name, as explain lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Drift {
+    pub id: u32,
+    pub app: String,
+    pub want: String,
+    pub have: String,
+}
+
+impl fmt::Display for Drift {
+    /// `IGCL: v_tiles wanted, h_tiles live` (the id when the app name is empty).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let who = if self.app.is_empty() { self.id.to_string() } else { self.app.clone() };
+        write!(f, "{who}: {} wanted, {} live", self.want, self.have)
+    }
+}
+
+/// The one text every surface shows for why a template rebuilds: `tree drifted (IGCL: v_tiles
+/// wanted, h_tiles live)` names the first drifted window (V56); other reasons as `reason`.
+pub fn reason(why: Pending, first: Option<&Drift>) -> String {
+    match first {
+        Some(d) => format!("{} ({d})", why.reason()),
+        None => why.reason().into(),
+    }
+}
+
+/// The single owner of "would a pass rebuild `t` now" (V40 a, d): the record compare (V41),
+/// else drift (V56) unless the record is marked stuck. `wins` = `t`'s workspace windows,
+/// `want` = `wanted(t, wins)`. Returns the reason and, for drift, the first drifted window in
+/// `drift`'s depth-first order.
+pub fn judge(t: &Template, wins: &[WinInfo], have: Option<&TemplateRecord>, want: &TemplateRecord) -> (Option<Pending>, Option<Drift>) {
+    if let Some(p) = pending(have, want) {
+        return (Some(p), None);
+    }
+    if have.is_some_and(|h| h.stuck) {
+        return (None, None);
+    }
+    match drift(t, wins).into_iter().next() {
+        Some(d) => (Some(Pending::TreeDrifted), Some(d)),
+        None => (None, None),
+    }
+}
+
+/// V56: the tiled windows of `t`'s workspace (`windows`, as `wanted` takes them) whose parent
+/// layout differs from the canonical tree's, depth-first. Finds regrouping, not reordering:
+/// a reorder inside one container or a swap between same-layout containers is not seen.
+pub fn drift(t: &Template, windows: &[WinInfo]) -> Vec<Drift> {
+    let a = assign(&t.tree, windows);
+    let lone = lone_layouts(t.root, &t.tree, &a);
+    layout_drift(&canonical(t.root, &t.tree, &a), windows).into_iter().filter(|d| !lone.contains(&(d.id, d.have.clone()))).collect()
+}
+
+/// V57: the layouts a lone window may show besides its canonical parent's: the `<axis>_tiles` of
+/// each template container below the root that holds it and no other tiled window. V39
+/// collapses such a container, but a close with normalization off leaves it (V41).
+fn lone_layouts(root: Axis, tree: &[Node], a: &Assignment) -> Vec<(u32, String)> {
+    fn go(axis: Axis, nodes: &[Node], a: &Assignment, next: &mut usize, nested: bool, out: &mut Vec<(u32, String)>) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for n in nodes {
+            match n {
+                Node::Slot(_) => {
+                    ids.extend(&a.slots[*next]);
+                    *next += 1;
+                }
+                Node::Container(c) => ids.extend(go(axis.opposite(), c, a, next, true, out)),
+            }
+        }
+        if let ([id], true) = (ids.as_slice(), nested) {
+            out.push((*id, format!("{}_tiles", axis_word(axis))));
+        }
+        ids
+    }
+    let mut out = Vec::new();
+    go(root, tree, a, &mut 0, false, &mut out);
+    out
+}
+
+fn layout_drift(want: &Tree, windows: &[WinInfo]) -> Vec<Drift> {
+    fn walk(t: &Tree, out: &mut Vec<(u32, Axis)>) {
+        if let Tree::Split(axis, kids) = t {
+            for k in kids {
+                match k {
+                    Tree::Win(id) => out.push((*id, *axis)),
+                    split => walk(split, out),
+                }
+            }
+        }
+    }
+    let mut parents = Vec::new();
+    walk(want, &mut parents);
+    parents
+        .into_iter()
+        .filter_map(|(id, axis)| {
+            let w = windows.iter().find(|w| w.id == id && w.tiled())?;
+            let want = format!("{}_tiles", axis_word(axis));
+            (w.layout != want).then(|| Drift { id, app: w.app_name.clone(), want, have: w.layout.clone() })
+        })
+        .collect()
 }
 
 /// V41: runs a rebuild of `ws` so that only a completed one leaves a record. The old record is
@@ -313,11 +418,14 @@ pub fn stale_records(records: &TemplateRecords, windows: &[WinInfo]) -> Vec<Stri
 pub fn forget(records: &mut TemplateRecords, id: u32) -> bool {
     let mut changed = false;
     for rec in records.values_mut() {
+        let mut here = false;
         for list in rec.slots.values_mut().chain([&mut rec.rest]) {
             let before = list.len();
             list.retain(|x| *x != id);
-            changed |= list.len() != before;
+            here |= list.len() != before;
         }
+        rec.stuck &= !here; // V56: a new window set ends the stuck mark
+        changed |= here;
     }
     changed
 }
@@ -335,8 +443,10 @@ pub struct View {
     pub monitor: Option<String>,
     pub applies: bool,
     /// `up to date` | `pending: <reason>` | `not applied: when does not match <monitor>` |
-    /// `not applied: pinned`.
+    /// `not applied: pinned`. Drift reads `pending: tree drifted (IGCL: v_tiles wanted, h_tiles live)`.
     pub record: String,
+    /// V56: the first drifted window while `record` is `pending: tree drifted`.
+    pub drift: Option<Drift>,
     pub tree: Vec<Row>,
     pub rest: Vec<Win>,
 }
@@ -396,12 +506,13 @@ pub fn view(
             let at = monitor_of.get(&t.workspace).copied();
             let name = at.map(|m| displays.iter().find(|x| x.aero_id == m).map_or(format!("monitor {m}"), |x| x.aero_name.clone()));
             let when_ok = at.is_some_and(|m| d.monitors.contains(&m));
-            let record = if !when_ok {
-                format!("not applied: when does not match {}", name.as_deref().unwrap_or("(no monitor)"))
+            let (record, drift) = if !when_ok {
+                (format!("not applied: when does not match {}", name.as_deref().unwrap_or("(no monitor)")), None)
             } else if pinned.contains(&t.workspace) {
-                "not applied: pinned".into()
+                ("not applied: pinned".into(), None)
             } else {
-                pending(records.get(&t.workspace), &want).map_or("up to date".into(), |p| p.to_string())
+                let (why, first) = judge(t, &wins, records.get(&t.workspace), &want);
+                (why.map_or("up to date".into(), |p| format!("pending: {}", reason(p, first.as_ref()))), first)
             };
             let mut tree = vec![];
             let a = assign(&t.tree, &wins); // depth-first, unlike the record's path-keyed map
@@ -414,6 +525,7 @@ pub fn view(
                 monitor: name,
                 applies: when_ok && !pinned.contains(&t.workspace),
                 record,
+                drift,
                 tree,
                 rest: a.rest.iter().map(|&id| win(id)).collect(),
             }
@@ -757,6 +869,113 @@ tree = [{ app = "p" }]
         assert_eq!(f.tree("X"), h(vec![Win(44), v(vec![Win(10), Win(49)])]));
     }
 
+    // --- V56 drift (T42) ---
+
+    /// The live read of `tree`: each window with its parent's layout, the way AeroSpace reports
+    /// `%{window-layout}`. Written apart from `layout_drift`'s walk on purpose.
+    fn live(tree: &Tree, kind: &str) -> Vec<WinInfo> {
+        fn go(t: &Tree, kind: &str, out: &mut Vec<WinInfo>) {
+            let Split(a, kids) = t else { return };
+            let l = format!("{}_{kind}", if *a == Axis::H { "h" } else { "v" });
+            for k in kids {
+                match k {
+                    Win(id) => out.push(win(*id, "app", "", &l)),
+                    s => go(s, "tiles", out),
+                }
+            }
+        }
+        let mut out = Vec::new();
+        go(tree, kind, &mut out);
+        out
+    }
+
+    fn drifted(want: &Tree, ws: &[WinInfo]) -> Vec<(u32, String, String)> {
+        layout_drift(want, ws).into_iter().map(|d| (d.id, d.want, d.have)).collect()
+    }
+
+    #[test]
+    fn v56_b10_tree_drifts_on_the_window_that_left_its_stack() {
+        let t = tpl("h", r#"[{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]"#);
+        // B10 live read: IGCL out of the v-stack, Messenger alone in it.
+        let ws = [win(3, "line", "", "h_tiles"), win(5, "igcl", "", "h_tiles"), win(20, "msgr", "", "v_tiles")];
+        assert_eq!(drift(&t, &ws), [Drift { id: 5, app: "igcl".into(), want: "v_tiles".into(), have: "h_tiles".into() }]);
+        let ok = [win(3, "line", "", "h_tiles"), win(5, "igcl", "", "v_tiles"), win(20, "msgr", "", "v_tiles")];
+        assert!(drift(&t, &ok).is_empty());
+    }
+
+    #[test]
+    fn v56_canonical_tree_built_from_every_start_does_not_drift() {
+        for (want, _) in targets() {
+            let Split(axis, _) = want else { unreachable!() };
+            let leaves = want.leaves();
+            let cmds = plan("X", &want);
+            for order in perms(&leaves) {
+                for start in starts(&order, axis) {
+                    let mut f = fake_with(&leaves);
+                    f.set_tree("X", &start, leaves[0]);
+                    run(&mut f, &cmds).unwrap();
+                    assert_eq!(drifted(&want, &live(&f.tree("X"), "tiles")), [], "built from {start:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v56_rest_windows_want_the_root_and_a_promoted_root_its_axis() {
+        let t = tpl("h", r#"[{ app = "a" }, [{ app = "b" }, { app = "c" }]]"#);
+        let ws = [tiled(1, "a"), win(2, "b", "", "v_tiles"), win(3, "c", "", "v_tiles"), win(9, "z", "", "v_tiles")];
+        assert_eq!(drift(&t, &ws), [Drift { id: 9, app: "z".into(), want: "h_tiles".into(), have: "v_tiles".into() }]);
+        // Root promoted to v (V39 (4)): its direct children want v_tiles.
+        let t = tpl("h", r#"[{ app = "a" }, [{ app = "b" }, [{ app = "c" }, { app = "d" }]]]"#);
+        let ws = [win(2, "b", "", "v_tiles"), win(3, "c", "", "h_tiles"), win(4, "d", "", "h_tiles")];
+        assert!(drift(&t, &ws).is_empty());
+    }
+
+    #[test]
+    fn v56_floating_is_not_compared() {
+        let t = tpl("h", r#"[{ app = "a" }, [{ app = "b" }, { app = "c" }]]"#);
+        let ws = [tiled(1, "a"), win(2, "b", "", "v_tiles"), win(3, "c", "", "v_tiles"), win(4, "b", "", "floating")];
+        assert!(drift(&t, &ws).is_empty());
+    }
+
+    #[test]
+    fn v56_accordion_root_drifts() {
+        let want = h(vec![Win(3), v(vec![Win(5), Win(20)])]);
+        assert_eq!(drifted(&want, &live(&want, "accordion")), [(3, "h_tiles".into(), "h_accordion".into())]);
+    }
+
+    #[test]
+    fn v57_a_close_leaves_a_lone_window_in_its_container_and_that_is_not_drift() {
+        let t = tpl("v", r#"[{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]"#);
+        // Messenger closed: IGCL alone in h[IGCL] (normalization off), or under the root (on).
+        for have in ["h_tiles", "v_tiles"] {
+            assert!(drift(&t, &[win(44, "line", "", "v_tiles"), win(10, "igcl", "", have)]).is_empty(), "{have}");
+        }
+        assert_eq!(drift(&t, &[win(44, "line", "", "v_tiles"), win(10, "igcl", "", "h_accordion")]).len(), 1, "any other layout is drift");
+        // Built with IGCL alone (its container collapsed), then LINE's sibling closed: any lone
+        // template container's axis passes. v[a, h[b, v[c]]] with b gone: c may show h or v.
+        let t = tpl("v", r#"[{ app = "a" }, [{ app = "b" }, [{ app = "c" }]]]"#);
+        for have in ["h_tiles", "v_tiles"] {
+            assert!(drift(&t, &[win(1, "a", "", "v_tiles"), win(3, "c", "", have)]).is_empty(), "{have}");
+        }
+        // b and c share h, so b is not lone there; c is lone in its inner v.
+        let ws = [win(1, "a", "", "v_tiles"), win(2, "b", "", "v_tiles"), win(3, "c", "", "v_tiles")];
+        assert_eq!(drift(&t, &ws), [Drift { id: 2, app: "b".into(), want: "h_tiles".into(), have: "v_tiles".into() }]);
+        // A container holding two windows is not lone: regrouped out of it, both drift.
+        let t = tpl("v", r#"[{ app = "line" }, [{ app = "igcl" }, { app = "msgr" }]]"#);
+        let ws = [win(44, "line", "", "v_tiles"), win(10, "igcl", "", "v_tiles"), win(49, "msgr", "", "v_tiles")];
+        assert_eq!(drift(&t, &ws).len(), 2);
+    }
+
+    /// Documented limit (V56): order is not read (C20), so these pass as up to date.
+    #[test]
+    fn v56_reorder_and_same_layout_swap_are_not_seen() {
+        let want = h(vec![Win(3), v(vec![Win(5), Win(20)])]);
+        assert!(drifted(&want, &live(&h(vec![v(vec![Win(20), Win(5)]), Win(3)]), "tiles")).is_empty());
+        let want = h(vec![v(vec![Win(1), Win(2)]), v(vec![Win(3), Win(4)])]);
+        assert!(drifted(&want, &live(&h(vec![v(vec![Win(1), Win(3)]), v(vec![Win(2), Win(4)])]), "tiles")).is_empty());
+    }
+
     /// Negative control 1 (from source, T31): join from the first leaf toward pos also wraps
     /// both leaves, but leaves the first one most recent, so the next move lands in the wrong slot.
     #[test]
@@ -864,7 +1083,7 @@ tree = [{ app = "p" }]
     }
 
     fn rec(fp: &str) -> TemplateRecord {
-        TemplateRecord { fingerprint: fp.into(), slots: BTreeMap::new(), rest: vec![] }
+        TemplateRecord { fingerprint: fp.into(), slots: BTreeMap::new(), rest: vec![], stuck: false }
     }
 
     /// Runs `execute` for `X` over three commands; `stop_at` = (index, fails?) aborts or fails there.

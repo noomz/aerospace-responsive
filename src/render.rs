@@ -49,13 +49,17 @@ pub struct TemplateStatus {
     pub state: String,
     /// Workspaces whose last rebuild completed (they hold a record).
     pub applied: Vec<String>,
+    /// V56: workspace → the next pass's reason, for each applied tree that drifted
+    /// (`tree drifted (IGCL: v_tiles wanted, h_tiles live)`). Empty when the read failed.
+    pub drifted: BTreeMap<String, String>,
 }
 
 impl TemplateStatus {
-    /// `workspace template: live; C applied`.
+    /// `workspace template: live; C applied`, then `; C pending: tree drifted (…)` per drifted tree.
     pub fn line(&self) -> String {
         let applied = if self.applied.is_empty() { "none".to_string() } else { self.applied.join(" ") };
-        format!("workspace template: {}; {applied} applied", self.state)
+        let drifted: String = self.drifted.iter().map(|(ws, why)| format!("; {ws} pending: {why}")).collect();
+        format!("workspace template: {}; {applied} applied{drifted}", self.state)
     }
 }
 
@@ -520,10 +524,13 @@ exclusive-tiling:
         let text = status(&StatusView { exclusive_tiling: Some(t), ..v.clone() });
         assert!(text.contains("exclusive tiling: live; rule-floated T:2\n"), "{text}");
         assert!(!text.contains("workspace template"), "omitted when no template is configured");
-        let t = TemplateStatus { state: "inert".into(), applied: vec![] };
+        let t = TemplateStatus { state: "inert".into(), applied: vec![], drifted: BTreeMap::new() };
         assert!(status(&StatusView { workspace_template: Some(t), ..v.clone() }).contains("workspace template: inert; none applied\n"));
-        let t = TemplateStatus { state: "live".into(), applied: vec!["C".into(), "D".into()] };
-        assert!(status(&StatusView { workspace_template: Some(t), ..v }).contains("workspace template: live; C D applied\n"));
+        let t = TemplateStatus { state: "live".into(), applied: vec!["C".into(), "D".into()], drifted: BTreeMap::new() };
+        assert!(status(&StatusView { workspace_template: Some(t.clone()), ..v.clone() }).contains("workspace template: live; C D applied\n"));
+        let drifted = BTreeMap::from([("C".to_string(), "tree drifted (IGCL: v_tiles wanted, h_tiles live)".to_string())]);
+        let text = status(&StatusView { workspace_template: Some(TemplateStatus { drifted, ..t }), ..v });
+        assert!(text.contains("workspace template: live; C D applied; C pending: tree drifted (IGCL: v_tiles wanted, h_tiles live)\n"), "{text}");
     }
 
     #[test]
@@ -597,5 +604,17 @@ workspace-template:
         assert_eq!(views(2, &none, &stale)[0].record, "pending: windows changed");
         stale.get_mut("C").unwrap().fingerprint.push('!');
         assert_eq!(views(2, &none, &stale)[0].record, "pending: template changed");
+        // V56: IGCL left its v-stack. The record names it; a stuck record is up to date, as the
+        // pass judges it (no rebuild).
+        let mut moved = wins.clone();
+        moved[1].layout = "h_tiles".into();
+        let v = crate::template::view(&r.templates, &records, &none, &on(2), &ds, &moved);
+        assert_eq!(v[0].record, "pending: tree drifted (IGCL: v_tiles wanted, h_tiles live)");
+        assert_eq!(v[0].drift.as_ref().map(|d| d.id), Some(10));
+        assert!(workspace_template(&v, None).contains("       record: pending: tree drifted (IGCL: v_tiles wanted, h_tiles live)\n"));
+        let mut stuck = records.clone();
+        stuck.get_mut("C").unwrap().stuck = true;
+        let v = crate::template::view(&r.templates, &stuck, &none, &on(2), &ds, &moved);
+        assert_eq!((v[0].record.as_str(), v[0].drift.is_none()), ("up to date", true));
     }
 }
